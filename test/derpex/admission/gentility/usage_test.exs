@@ -46,6 +46,21 @@ defmodule Derpex.Admission.Gentility.UsageTest do
     assert entry.accepted_bytes == 64_000
   end
 
+  test "committing a snapshot preserves counters added while it is being persisted" do
+    table = Usage.new()
+    context = context("node-a")
+    assert Usage.record(table, 1_000, context, 100, :accepted, 1_500) == :ok
+    assert {_batch, rows} = Usage.oldest_closed(table, 1_000, "derpex-1", 17, 2_000)
+
+    assert Usage.record(table, 1_000, context, 25, :accepted, 1_500) == :ok
+    assert Usage.delete_rows(table, rows) == :ok
+
+    assert {batch, _rows} = Usage.oldest_closed(table, 1_000, "derpex-1", 17, 2_000)
+    assert [entry] = batch.entries
+    assert entry.accepted_packets == 1
+    assert entry.accepted_bytes == 25
+  end
+
   defp context(node_id) do
     %{
       node_id: node_id,

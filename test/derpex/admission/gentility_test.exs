@@ -511,6 +511,30 @@ defmodule Derpex.Admission.GentilityTest do
              {:error, :usage_spool_full}
   end
 
+  @tag :tmp_dir
+  test "a stalled usage worker cannot delay revocation or controller telemetry", %{
+    tmp_dir: tmp_dir
+  } do
+    node_key = node_key(23)
+
+    controller =
+      start_controller(
+        authority: fn _request -> {:ok, signed_lease(node_key)} end,
+        close_peer: fn _key -> 0 end,
+        usage: usage_options(tmp_dir, fn _id, _wire -> :ok end)
+      )
+
+    policy = Gentility.policy(controller)
+    :ok = :sys.suspend(policy.usage.server)
+
+    try do
+      assert Gentility.revoke(controller, signed_revocation(node_key, 10)) == {:ok, :applied}
+      assert Gentility.stats(controller).usage.enabled
+    after
+      :ok = :sys.resume(policy.usage.server)
+    end
+  end
+
   defp start_controller(options) do
     defaults = [
       verification_keys: %{@signing_key_id => @public_key},

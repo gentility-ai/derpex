@@ -6,7 +6,7 @@ defmodule Derpex.Admission.Gentility.Usage do
 
   @type outcome :: :accepted | :dropped
 
-  @doc "Creates fixed-window aggregate storage owned by the admission controller."
+  @doc "Creates fixed-window aggregate storage owned by the usage worker."
   @spec new() :: :ets.tid()
   def new do
     :ets.new(__MODULE__, [
@@ -63,10 +63,21 @@ defmodule Derpex.Admission.Gentility.Usage do
     ArgumentError -> nil
   end
 
-  @doc "Deletes precisely the rows that were durably committed to a batch."
+  @doc "Subtracts precisely the counters durably committed to a batch."
   @spec delete_rows(:ets.tid(), [tuple()]) :: :ok
   def delete_rows(table, rows) do
-    Enum.each(rows, &:ets.delete_object(table, &1))
+    Enum.each(rows, fn {key, accepted_packets, accepted_bytes, dropped_packets, dropped_bytes} ->
+      remaining =
+        :ets.update_counter(table, key, [
+          {2, -accepted_packets},
+          {3, -accepted_bytes},
+          {4, -dropped_packets},
+          {5, -dropped_bytes}
+        ])
+
+      if remaining == [0, 0, 0, 0], do: :ets.delete_object(table, {key, 0, 0, 0, 0})
+    end)
+
     :ok
   rescue
     ArgumentError -> :ok
