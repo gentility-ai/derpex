@@ -1,0 +1,11 @@
+.git
+.github
+_build
+deps
+doc
+cover
+native/derpex_crypto/target
+interop
+test
+PLAN-FEEDBACK.md
+erl_crash.dump

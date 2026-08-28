@@ -1,0 +1,38 @@
+# DERPEX
+
+DERPEX is an Elixir implementation of Tailscale's DERP server and the relay
+service for Gentility's overlay. The compatibility and product delivery contract
+is maintained in [`PLAN.md`](PLAN.md).
+
+The packet data path stays on the BEAM. A small Rust NIF is limited to the
+NaCl-compatible cryptography used by the DERP handshake and is distributed with
+`rustler_precompiled` so production deployments contain no compiler toolchain.
+
+## Development
+
+The native crate is built from source for prerelease versions:
+
+```sh
+mix deps.get
+mix quality
+```
+
+Go and the pinned upstream repositories are conformance-test inputs only. They
+must never be copied into an OTP release or runtime image.
+
+## Runtime listener
+
+The release starts with no listener unless explicitly configured. A direct TLS
+1.3 listener requires the identity and certificate paths:
+
+```sh
+DERPEX_LISTEN_PORT=443 \
+DERPEX_IDENTITY_PATH=/var/lib/derpex/derpex.key \
+DERPEX_TLS_CERTFILE=/run/secrets/derpex.crt \
+DERPEX_TLS_KEYFILE=/run/secrets/derpex.key \
+bin/derpex start
+```
+
+The server identity is created atomically with mode `0600` and is stable across
+restarts. Clear HTTP is available only through the explicit
+`DERPEX_CLEAR_HTTP=1` development setting.

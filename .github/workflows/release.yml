@@ -1,0 +1,214 @@
+name: Native and runtime release
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: Version already present in mix.exs (without v)
+        required: true
+        type: string
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: read
+
+jobs:
+  version:
+    name: Validate version
+    runs-on: ubuntu-24.04
+    outputs:
+      value: ${{ steps.version.outputs.value }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+
+      - name: Validate tag/input against mix.exs
+        id: version
+        env:
+          INPUT_VERSION: ${{ inputs.version }}
+        run: |
+          if [[ "$GITHUB_REF" == refs/tags/v* ]]; then
+            VERSION="${GITHUB_REF_NAME#v}"
+          else
+            VERSION="$INPUT_VERSION"
+          fi
+
+          MIX_VERSION="$(sed -n 's/.*@version "\([^"]*\)".*/\1/p' mix.exs)"
+          test -n "$VERSION"
+          test "$MIX_VERSION" = "$VERSION"
+          echo "value=$VERSION" >> "$GITHUB_OUTPUT"
+
+  build-native:
+    name: NIF ${{ matrix.target }}
+    needs: version
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: aarch64-apple-darwin
+            os: macos-15
+          - target: x86_64-apple-darwin
+            os: macos-15
+          - target: x86_64-unknown-linux-gnu
+            os: ubuntu-24.04
+          - target: aarch64-unknown-linux-gnu
+            os: ubuntu-24.04-arm
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c # stable 2026-08-28
+        with:
+          toolchain: "1.98.0"
+          targets: ${{ matrix.target }}
+
+      - name: Build native library
+        run: >-
+          cargo build --locked --release --target ${{ matrix.target }}
+          --manifest-path native/derpex_crypto/Cargo.toml
+
+      - name: Package deterministic archive
+        id: package
+        env:
+          TARGET: ${{ matrix.target }}
+          VERSION: ${{ needs.version.outputs.value }}
+        run: |
+          ARCHIVE="libderpex_crypto-v${VERSION}-nif-2.15-${TARGET}.so.tar.gz"
+
+          if [[ "$TARGET" == *apple* ]]; then
+            SOURCE="native/derpex_crypto/target/${TARGET}/release/libderpex_crypto.dylib"
+          else
+            SOURCE="native/derpex_crypto/target/${TARGET}/release/libderpex_crypto.so"
+          fi
+
+          python3 scripts/package_nif.py "$SOURCE" "$ARCHIVE"
+          echo "archive=$ARCHIVE" >> "$GITHUB_OUTPUT"
+
+      - name: Upload native archive
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: native-${{ matrix.target }}
+          path: ${{ steps.package.outputs.archive }}
+          if-no-files-found: error
+          retention-days: 14
+
+  manifest:
+    name: Generate checksum manifest
+    needs: [version, build-native]
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+
+      - uses: erlef/setup-beam@0f75c29430f34bb5af4cce5e3b7f6a8860fca236 # v1
+        with:
+          otp-version: "29.0.5"
+          elixir-version: "1.20.3"
+
+      - name: Download native archives
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        with:
+          pattern: native-*
+          merge-multiple: true
+          path: artifacts
+
+      - name: Generate manifest from exact archive bytes
+        run: >-
+          elixir scripts/native_manifest.exs ${{ needs.version.outputs.value }} artifacts
+          --output checksum-Elixir.Derpex.Crypto.Native.exs
+
+      - name: Upload checksum manifest
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: native-manifest
+          path: checksum-Elixir.Derpex.Crypto.Native.exs
+          if-no-files-found: error
+          retention-days: 14
+
+  publish-native:
+    name: Publish native release
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: [version, build-native, manifest]
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+
+      - name: Download native archives
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        with:
+          pattern: native-*
+          merge-multiple: true
+          path: artifacts
+
+      - name: Download generated manifest
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        with:
+          name: native-manifest
+          path: generated
+
+      - name: Require the tag to contain the exact manifest
+        run: cmp checksum-Elixir.Derpex.Crypto.Native.exs generated/checksum-Elixir.Derpex.Crypto.Native.exs
+
+      - name: Create GitHub release
+        uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2
+        with:
+          files: |
+            artifacts/*.tar.gz
+            checksum-Elixir.Derpex.Crypto.Native.exs
+          fail_on_unmatched_files: true
+
+  runtime-smoke:
+    name: Verify tagged runtime image
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: [version, publish-native]
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+
+      - name: Build with precompiled native archive
+        run: docker build --load --target runtime --tag derpex:release .
+
+      - name: Prove compiler-free runtime and native load
+        run: |
+          docker run --rm --entrypoint sh derpex:release -ec '
+            for tool in go gofmt cargo rustc rustup mix; do
+              if command -v "$tool" >/dev/null 2>&1; then
+                echo "forbidden runtime tool: $tool" >&2
+                exit 1
+              fi
+            done
+            /opt/derpex/bin/derpex eval "unless Derpex.Crypto.loaded?(), do: System.halt(1)"
+          '
+
+  publish-runtime:
+    name: Publish multi-architecture runtime image
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: [version, runtime-smoke]
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+
+      - uses: docker/setup-qemu-action@c7c53464625b32c7a7e944ae62b3e17d2b600130 # v3
+
+      - uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
+
+      - uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and publish
+        uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6
+        with:
+          context: .
+          target: runtime
+          platforms: linux/amd64,linux/arm64
+          push: true
+          tags: ghcr.io/${{ github.repository }}:${{ needs.version.outputs.value }}

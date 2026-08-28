@@ -1,0 +1,12 @@
+/_build/
+/deps/
+/doc/
+/cover/
+/.elixir_ls/
+/tmp/
+/native/derpex_crypto/target/
+/priv/native/
+/.DS_Store
+/erl_crash.dump
+*.ez
+derpex-*.tar.gz

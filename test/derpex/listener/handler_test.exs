@@ -1,0 +1,111 @@
+defmodule Derpex.Listener.HandlerTest do
+  use ExUnit.Case, async: false
+
+  alias Derpex.ClientInfo
+  alias Derpex.Crypto
+  alias Derpex.Frame
+  alias Derpex.Handshake
+  alias Derpex.Listener.Handler
+
+  test "official-style cleartext HTTP client completes an authenticated handshake" do
+    {server_public, server_private} = Crypto.generate_keypair()
+    {client_public, client_private} = Crypto.generate_keypair()
+    parent = self()
+
+    event_handler = fn event ->
+      send(parent, event)
+      :ok
+    end
+
+    {:ok, server} =
+      ThousandIsland.start_link(
+        port: 0,
+        transport_options: [ip: {127, 0, 0, 1}],
+        num_acceptors: 1,
+        handler_module: Handler,
+        handler_options: [server_private_key: server_private, event_handler: event_handler]
+      )
+
+    stop_server_on_exit(server)
+    {:ok, {_ip, port}} = ThousandIsland.listener_info(server)
+    {:ok, socket} = :gen_tcp.connect({127, 0, 0, 1}, port, [:binary, active: false])
+
+    request =
+      "GET /derp HTTP/1.1\r\nHost: localhost\r\nUpgrade: DERP\r\nConnection: Upgrade\r\n\r\n"
+
+    :ok = :gen_tcp.send(socket, request)
+
+    expected_response =
+      "HTTP/1.1 101 Switching Protocols\r\n" <>
+        "Upgrade: DERP\r\n" <>
+        "Connection: Upgrade\r\n" <>
+        "Derp-Version: 2\r\n" <>
+        "Derp-Public-Key: #{Base.encode16(server_public, case: :lower)}\r\n\r\n"
+
+    assert {:ok, ^expected_response} = :gen_tcp.recv(socket, byte_size(expected_response), 2_000)
+    assert {:ok, <<type, 40::unsigned-big-32>>} = :gen_tcp.recv(socket, 5, 2_000)
+    assert type == Frame.type(:server_key)
+    assert {:ok, greeting} = :gen_tcp.recv(socket, 40, 2_000)
+    assert Handshake.decode_server_key(greeting) == {:ok, server_public}
+
+    client_info = %ClientInfo{version: 2, can_ack_pings: true, app_name: "socket-test"}
+    {:ok, client_frame} = Handshake.client_info_frame(client_private, server_public, client_info)
+    :ok = :gen_tcp.send(socket, client_frame)
+
+    assert_receive {:authenticated, ^client_public, ^client_info}, 2_000
+    assert {:ok, <<server_info_type, length::unsigned-big-32>>} = :gen_tcp.recv(socket, 5, 2_000)
+    assert server_info_type == Frame.type(:server_info)
+    assert {:ok, server_info_body} = :gen_tcp.recv(socket, length, 2_000)
+
+    assert Handshake.decode_server_info(server_info_body, client_private, server_public) ==
+             {:ok, %Derpex.ServerInfo{version: 2}}
+
+    :gen_tcp.close(socket)
+  end
+
+  test "pipelined fast start begins directly with DERP and preserves client info" do
+    {server_public, server_private} = Crypto.generate_keypair()
+    {client_public, client_private} = Crypto.generate_keypair()
+    parent = self()
+
+    event_handler = fn event ->
+      send(parent, event)
+      :ok
+    end
+
+    {:ok, server} =
+      ThousandIsland.start_link(
+        port: 0,
+        transport_options: [ip: {127, 0, 0, 1}],
+        num_acceptors: 1,
+        handler_module: Handler,
+        handler_options: [server_private_key: server_private, event_handler: event_handler]
+      )
+
+    stop_server_on_exit(server)
+    {:ok, {_ip, port}} = ThousandIsland.listener_info(server)
+    {:ok, socket} = :gen_tcp.connect({127, 0, 0, 1}, port, [:binary, active: false])
+
+    request =
+      "GET /derp HTTP/1.1\r\nHost: localhost\r\nUpgrade: DERP\r\nConnection: Upgrade\r\nDerp-Fast-Start: 1\r\n\r\n"
+
+    client_info = %ClientInfo{version: 2}
+    {:ok, client_frame} = Handshake.client_info_frame(client_private, server_public, client_info)
+    :ok = :gen_tcp.send(socket, [request, client_frame])
+
+    assert {:ok, <<type, 40::unsigned-big-32>>} = :gen_tcp.recv(socket, 5, 2_000)
+    assert type == Frame.type(:server_key)
+    assert {:ok, _greeting} = :gen_tcp.recv(socket, 40, 2_000)
+    assert_receive {:authenticated, ^client_public, ^client_info}, 2_000
+    assert {:ok, <<server_info_type, length::unsigned-big-32>>} = :gen_tcp.recv(socket, 5, 2_000)
+    assert server_info_type == Frame.type(:server_info)
+    assert {:ok, _server_info} = :gen_tcp.recv(socket, length, 2_000)
+    :gen_tcp.close(socket)
+  end
+
+  defp stop_server_on_exit(server) do
+    on_exit(fn ->
+      if Process.alive?(server), do: Process.exit(server, :shutdown)
+    end)
+  end
+end

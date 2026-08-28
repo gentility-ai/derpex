@@ -1,0 +1,14 @@
+[package]
+name = "derpex_crypto"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.98"
+publish = false
+
+[lib]
+name = "derpex_crypto"
+crate-type = ["cdylib"]
+
+[dependencies]
+crypto_box = { version = "=0.9.1", features = ["std"] }
+rustler = "=0.38.0"
