@@ -8,6 +8,7 @@ defmodule Derpex.Listener.Handler do
   alias Derpex.Admission.Request, as: AdmissionRequest
   alias Derpex.Clock
   alias Derpex.Crypto
+  alias Derpex.Drain
   alias Derpex.Outbox.Ring
   alias Derpex.RateConfig
   alias Derpex.RateController
@@ -29,6 +30,7 @@ defmodule Derpex.Listener.Handler do
     accept_limiter = Keyword.get(options, :accept_limiter, AcceptLimiter)
     rate_controller = Keyword.get(options, :rate_controller, RateController)
     bootstrap_dns = Keyword.get(options, :bootstrap_dns, Derpex.BootstrapDNS)
+    drain = Keyword.get(options, :drain, Drain)
     home_page = Keyword.get(options, :home_page, [])
     remote_address = remote_address(socket)
 
@@ -101,7 +103,8 @@ defmodule Derpex.Listener.Handler do
         receive_limiter: nil,
         server_public_key: server_public_key,
         remote_address: remote_address,
-        accept_limiter: accept_limiter
+        accept_limiter: accept_limiter,
+        drain: drain
       }
 
       continue_after_actions(socket, state, actions)
@@ -159,6 +162,10 @@ defmodule Derpex.Listener.Handler do
 
   def handle_info({:derpex_admission_close, reason}, {socket, state}) do
     {:stop, {:shutdown, {:admission, reason}}, {socket, state}}
+  end
+
+  def handle_info({:derpex_drain_close, _token}, {socket, state}) do
+    {:stop, {:shutdown, :drain_deadline}, {socket, state}}
   end
 
   def handle_info({:derpex_timeout, name, token}, {socket, state}) do
@@ -334,6 +341,13 @@ defmodule Derpex.Listener.Handler do
     {:ok, state}
   end
 
+  defp handle_client_message(state, {:note_preferred, preferred}) do
+    case Drain.set_preferred(state.drain, self(), preferred) do
+      :ok -> {:ok, state}
+      {:error, :draining} -> {:error, {:connection_close, :draining}, state}
+    end
+  end
+
   defp handle_client_message(
          %{can_mesh: true} = state,
          {:forward_packet, source, destination, packet}
@@ -439,6 +453,7 @@ defmodule Derpex.Listener.Handler do
   defp cleanup(%{timers: _timers} = state) do
     cancel_all_timers(state)
     :ok = AcceptLimiter.release(state[:accept_limiter])
+    :ok = Drain.unregister(state[:drain], self())
     :ok = Admission.release(state[:admission_policy], self())
 
     if state[:client_public_key] && Process.whereis(Router) do
@@ -499,6 +514,8 @@ defmodule Derpex.Listener.Handler do
         state.lifecycle,
         presence
       )
+
+    :ok = Drain.register(state.drain, self(), state.lifecycle, can_mesh)
 
     state
     |> Map.put(:client_public_key, key)

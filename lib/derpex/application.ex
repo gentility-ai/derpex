@@ -44,7 +44,8 @@ defmodule Derpex.Application do
          Derpex.Prober.PacketCache,
          bootstrap_dns,
          rate_controller,
-         accept_limiter
+         accept_limiter,
+         {Derpex.Drain, profile: if(is_nil(gentility), do: :baseline, else: :gentility)}
        ] ++
          gentility_controller_children(gentility) ++
          relay_children ++ stun_children ++ gentility_event_children(gentility)}

@@ -107,3 +107,9 @@ only for isolated contract tests; active revocation is required in production.
 Cached leases and usage batches are atomically persisted with mode `0600`.
 Unknown and expired nodes fail closed during outage. A full usage spool stops
 packet admission instead of dropping accounting data or growing memory.
+
+Graceful regional withdrawal is controlled through `Derpex.Drain.begin_drain/2`
+and `Derpex.Drain.cancel/1`. A drain rejects new home transitions, leaves mesh
+peers and probes available, sends bounded-jitter `FrameRestarting` notices only
+in the Gentility profile, and closes homes that remain at the configured hard
+deadline. Repeating a begin or cancel operation is idempotent.

@@ -25,6 +25,10 @@ proxy or load balancer.
 - Global and per-source pre-authentication rate limits plus a per-source open
   connection cap are configured on every public listener. Source tracking is
   LRU-bounded and its operational counters contain no source-IP labels.
+- Regional withdrawal calls `Derpex.Drain.begin_drain/2`, removes the region
+  from new DERP-map assignments, waits through the hard deadline, and verifies
+  zero remaining targeted homes. `Derpex.Drain.cancel/1` is the idempotent
+  rollback before upgrade; mesh peers and public probes remain available.
 
 ## Milestone 0 launch inputs
 
