@@ -22,6 +22,8 @@ if config_env() == :prod do
     mesh_key_text = System.get_env("DERPEX_MESH_KEY")
     disallowed_app_names_text = System.get_env("DERPEX_DISALLOWED_APP_NAMES")
     rate_config_path = System.get_env("DERPEX_RATE_CONFIG")
+    accept_limit_text = System.get_env("DERPEX_ACCEPT_CONNECTION_LIMIT")
+    accept_burst_text = System.get_env("DERPEX_ACCEPT_CONNECTION_BURST")
     stun_port_text = System.get_env("DERPEX_STUN_PORT", "3478")
 
     mesh_key =
@@ -42,6 +44,24 @@ if config_env() == :prod do
       case Integer.parse(stun_port_text) do
         {stun_port, ""} when stun_port in 1..65_535 -> stun_port
         _invalid -> raise "DERPEX_STUN_PORT must be an integer from 1 through 65535"
+      end
+
+    accept_limit =
+      case {accept_limit_text, accept_burst_text} do
+        {nil, nil} ->
+          nil
+
+        {limit_text, burst_text} when is_binary(limit_text) and is_binary(burst_text) ->
+          with {limit, ""} when limit >= 0 <- Float.parse(limit_text),
+               {burst, ""} when burst > 0 <- Integer.parse(burst_text) do
+            {limit, burst}
+          else
+            _invalid ->
+              raise "DERPEX_ACCEPT_CONNECTION_LIMIT and DERPEX_ACCEPT_CONNECTION_BURST must be non-negative rate and positive integer burst"
+          end
+
+        _incomplete ->
+          raise "set both DERPEX_ACCEPT_CONNECTION_LIMIT and DERPEX_ACCEPT_CONNECTION_BURST"
       end
 
     listener =
@@ -97,6 +117,7 @@ if config_env() == :prod do
         else: Keyword.put(listener, :handler_options, handler_options)
 
     config :derpex,
+      accept_limit: accept_limit,
       identity_path: identity_path,
       listeners: [listener],
       rate_config_path: rate_config_path,

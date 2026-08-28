@@ -15,7 +15,7 @@ defmodule Derpex.RateLimiter do
   @doc "Creates a full token bucket at the current configured-clock instant."
   @spec new(number(), pos_integer()) :: t()
   def new(rate_per_second, burst)
-      when is_number(rate_per_second) and rate_per_second > 0 and is_integer(burst) and burst > 0 do
+      when is_number(rate_per_second) and rate_per_second >= 0 and is_integer(burst) and burst > 0 do
     %__MODULE__{
       rate_per_millisecond: rate_per_second / 1_000,
       burst: burst,

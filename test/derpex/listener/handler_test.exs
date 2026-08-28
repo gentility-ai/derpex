@@ -1,6 +1,7 @@
 defmodule Derpex.Listener.HandlerTest do
   use ExUnit.Case, async: false
 
+  alias Derpex.AcceptLimiter
   alias Derpex.ClientInfo
   alias Derpex.Clock.Manual
   alias Derpex.Crypto
@@ -249,6 +250,30 @@ defmodule Derpex.Listener.HandlerTest do
     Process.exit(server, :shutdown)
     assert_receive {:DOWN, ^monitor, :process, ^handler, _reason}, 2_000
     :gen_tcp.close(socket)
+  end
+
+  test "accept limiting closes excess sockets before HTTP session allocation" do
+    limiter = start_supervised!({AcceptLimiter, name: nil, config: {0, 1}})
+    {_server_public, server_private} = Crypto.generate_keypair()
+
+    {:ok, server} =
+      ThousandIsland.start_link(
+        port: 0,
+        transport_options: [ip: {127, 0, 0, 1}],
+        num_acceptors: 1,
+        handler_module: Handler,
+        handler_options: [server_private_key: server_private, accept_limiter: limiter]
+      )
+
+    stop_server_on_exit(server)
+    {:ok, {_ip, port}} = ThousandIsland.listener_info(server)
+    {:ok, admitted} = :gen_tcp.connect({127, 0, 0, 1}, port, [:binary, active: false])
+    assert {:error, :timeout} = :gen_tcp.recv(admitted, 0, 25)
+
+    {:ok, rejected} = :gen_tcp.connect({127, 0, 0, 1}, port, [:binary, active: false])
+    assert {:error, :closed} = :gen_tcp.recv(rejected, 0, 2_000)
+    :gen_tcp.close(admitted)
+    :gen_tcp.close(rejected)
   end
 
   defp stop_server_on_exit(server) do

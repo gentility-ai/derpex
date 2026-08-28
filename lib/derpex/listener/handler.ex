@@ -3,6 +3,7 @@ defmodule Derpex.Listener.Handler do
 
   use ThousandIsland.Handler
 
+  alias Derpex.AcceptLimiter
   alias Derpex.Admission
   alias Derpex.Admission.Request, as: AdmissionRequest
   alias Derpex.Clock
@@ -23,6 +24,7 @@ defmodule Derpex.Listener.Handler do
     server_private_key = Keyword.fetch!(options, :server_private_key)
     mesh_key = Keyword.get(options, :mesh_key)
     admission_policy = Keyword.get(options, :admission)
+    accept_limiter = Keyword.get(options, :accept_limiter, AcceptLimiter)
     rate_controller = Keyword.get(options, :rate_controller, RateController)
 
     disallowed_app_names =
@@ -32,7 +34,8 @@ defmodule Derpex.Listener.Handler do
 
     event_handler = Keyword.get(options, :event_handler, fn _event -> :ok end)
 
-    with {:ok, server_public_key} <- Crypto.public_key(server_private_key),
+    with true <- AcceptLimiter.allow?(accept_limiter),
+         {:ok, server_public_key} <- Crypto.public_key(server_private_key),
          {:ok, writer} <- Writer.start_link(owner: self(), transport: Transport, socket: socket),
          ordinary =
            Ring.new(32, notifier: writer, wake_message: Writer.wake_message()),
@@ -76,6 +79,9 @@ defmodule Derpex.Listener.Handler do
 
       continue_after_actions(socket, state, actions)
     else
+      false ->
+        {:close, %{session: nil, timers: %{}, event_handler: event_handler}}
+
       {:error, reason} ->
         {:error, reason, %{session: nil, timers: %{}, event_handler: event_handler}}
     end

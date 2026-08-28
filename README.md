@@ -54,3 +54,7 @@ Set `DERPEX_RATE_CONFIG` to an upstream-compatible JSON file containing
 are clamped to hold at least one maximum DERP packet, and live updates through
 `Derpex.RateController.load_and_apply/1` reach every ordinary duplicate
 connection while trusted mesh peers remain exempt.
+
+Set both `DERPEX_ACCEPT_CONNECTION_LIMIT` (connections per second) and
+`DERPEX_ACCEPT_CONNECTION_BURST` to bound unauthenticated connection creation.
+The shared bucket is checked before crypto, ring, or session allocation.

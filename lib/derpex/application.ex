@@ -26,7 +26,13 @@ defmodule Derpex.Application do
           path -> {Derpex.RateController, path: path}
         end
 
-      {:ok, [Derpex.Router, rate_controller | relay_children ++ stun_children]}
+      accept_limiter =
+        case Application.fetch_env!(:derpex, :accept_limit) do
+          nil -> Derpex.AcceptLimiter
+          config -> {Derpex.AcceptLimiter, config: config}
+        end
+
+      {:ok, [Derpex.Router, rate_controller, accept_limiter | relay_children ++ stun_children]}
     end
   end
 

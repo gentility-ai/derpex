@@ -1,6 +1,7 @@
 import Config
 
 config :derpex,
+  accept_limit: nil,
   clock: Derpex.Clock.System,
   identity_path: nil,
   listeners: [],

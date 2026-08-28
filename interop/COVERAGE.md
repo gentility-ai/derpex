@@ -12,8 +12,8 @@ disposition map and review that change together with `interop/upstream.lock`.
 | State | Count |
 | --- | ---: |
 | Total | 69 |
-| Ported | 28 |
-| Pending (release-blocking) | 37 |
+| Ported | 29 |
+| Pending (release-blocking) | 36 |
 | Implementation-specific | 4 |
 
 | Area | Upstream test | Source | Disposition | Gate/notes |
@@ -41,7 +41,7 @@ disposition map and review that change together with `interop/upstream.lock`.
 | DERP server | `TestMetaCert` | `derp/derpserver/derpserver_test.go:405` | `ported` | ported certificate shape plus official TLS fast-start gate |
 | DERP server | `TestModifyTLSConfigToAddMetaCert` | `derp/derpserver/derpserver_test.go:441` | `pending` | release-blocking mapping not yet implemented |
 | DERP server | `TestServerDupClients` | `derp/derpserver/derpserver_test.go:498` | `ported` | ported lifecycle cases and unchanged official last-writer-active client gate |
-| DERP server | `TestLimiter` | `derp/derpserver/derpserver_test.go:747` | `pending` | release-blocking mapping not yet implemented |
+| DERP server | `TestLimiter` | `derp/derpserver/derpserver_test.go:747` | `ported` | ported shared burst, refill, zero-rate, disable, and pre-allocation rejection cases |
 | DERP server | `TestParseSSOutput` | `derp/derpserver/derpserver_test.go:884` | `pending` | release-blocking mapping not yet implemented |
 | DERP server | `TestServeDebugTrafficUniqueSenders` | `derp/derpserver/derpserver_test.go:895` | `pending` | release-blocking mapping not yet implemented |
 | DERP server | `TestGetPerClientSendQueueDepth` | `derp/derpserver/derpserver_test.go:924` | `pending` | release-blocking mapping not yet implemented |
