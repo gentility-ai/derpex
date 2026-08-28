@@ -46,6 +46,16 @@ defmodule Derpex.OperationsTest do
 
     assert is_integer(field!(packet_kinds, "disco"))
     assert is_integer(field!(packet_kinds, "other"))
+
+    before = Derpex.Metrics.snapshot()[{:tcp_rtt, "50ms"}]
+    assert :ok = Derpex.Metrics.observe_tcp_rtt(Derpex.Metrics.default_handle(), 50_000)
+
+    assert Operations.prometheus() =~ ~s(derp_counter_tcp_rtt{le="50ms"} #{before + 1})
+
+    assert {:ok, fields} = Derpex.JSON.decode_object(Operations.expvar_json())
+    assert {:object, derp} = field!(fields, "derp")
+    assert {:object, rtt} = field!(derp, "counter_tcp_rtt")
+    assert field!(rtt, "50ms") == before + 1
   end
 
   defp field!(fields, name), do: fields |> List.keyfind!(name, 0) |> elem(1)

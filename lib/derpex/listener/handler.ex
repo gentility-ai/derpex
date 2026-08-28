@@ -22,6 +22,7 @@ defmodule Derpex.Listener.Handler do
   alias Derpex.SendQueueConfig
   alias Derpex.Session
   alias Derpex.SocketOptions
+  alias Derpex.TCPInfo
   alias Derpex.Transport.ThousandIsland, as: Transport
   alias Derpex.WebSocket.Frame, as: WebSocketFrame
   alias Derpex.Writer
@@ -39,6 +40,7 @@ defmodule Derpex.Listener.Handler do
     metrics = Keyword.get_lazy(options, :metrics, &Metrics.default_handle/0)
     home_page = Keyword.get(options, :home_page, [])
     operations = Keyword.get(options, :operations, [])
+    tcp_rtt_options = Keyword.get(options, :tcp_rtt, [])
     remote_address = remote_address(socket)
 
     debug =
@@ -139,7 +141,9 @@ defmodule Derpex.Listener.Handler do
             :mesh_write_timeout,
             SocketOptions.mesh_write_timeout_ms()
           ),
-        debug_traffic: nil
+        debug_traffic: nil,
+        tcp_rtt: nil,
+        tcp_rtt_options: tcp_rtt_options
       }
 
       continue_after_actions(socket, state, actions)
@@ -242,6 +246,23 @@ defmodule Derpex.Listener.Handler do
     end
   end
 
+  def handle_info(:derpex_tcp_rtt_tick, {socket, %{tcp_rtt: nil} = state}) do
+    {:noreply, {socket, state}}
+  end
+
+  def handle_info(:derpex_tcp_rtt_tick, {socket, state}) do
+    tcp_rtt = %{state.tcp_rtt | timer: nil}
+
+    case TCPInfo.rtt_microseconds(socket, tcp_rtt.options) do
+      {:ok, microseconds} -> :ok = Metrics.observe_tcp_rtt(state.metrics, microseconds)
+      {:error, _reason} -> :ok
+    end
+
+    timer = Clock.send_after(self(), :derpex_tcp_rtt_tick, tcp_rtt.interval_ms)
+    tcp_rtt = %{tcp_rtt | timer: timer}
+    {:noreply, {socket, %{state | tcp_rtt: tcp_rtt}}}
+  end
+
   @impl ThousandIsland.Handler
   def handle_close(_socket, state), do: cleanup(state)
 
@@ -339,13 +360,7 @@ defmodule Derpex.Listener.Handler do
 
     case admit(state, key, info, can_mesh) do
       {:ok, {admission_context, request}} ->
-        case Admission.claim(state.admission_policy, request, admission_context, self()) do
-          {:ok, admission_context} ->
-            register_authenticated(state, key, info, can_mesh, admission_context)
-
-          {:error, reason} ->
-            {:error, {:admission, reason}, state}
-        end
+        claim_and_register(socket, state, key, info, can_mesh, request, admission_context)
 
       {:error, reason} ->
         {:error, {:admission, reason}, state}
@@ -568,6 +583,7 @@ defmodule Derpex.Listener.Handler do
   defp cleanup(%{timers: _timers} = state) do
     cancel_all_timers(state)
     cancel_debug_traffic_timer(state[:debug_traffic])
+    cancel_tcp_rtt_timer(state[:tcp_rtt])
     :ok = AcceptLimiter.release(state[:accept_limiter])
     :ok = Drain.unregister(state[:drain], self())
     :ok = Admission.release(state[:admission_policy], self())
@@ -599,12 +615,61 @@ defmodule Derpex.Listener.Handler do
 
   defp cancel_debug_traffic_timer(_debug), do: :ok
 
+  defp cancel_tcp_rtt_timer(%{timer: timer}) when is_reference(timer) do
+    _remaining = Clock.cancel_timer(timer)
+    :ok
+  end
+
+  defp cancel_tcp_rtt_timer(_tcp_rtt), do: :ok
+
   defp encode_chunk(data) do
     [Integer.to_string(IO.iodata_length(data), 16), "\r\n", data, "\r\n"]
   end
 
   defp debug_error(reason) when is_binary(reason), do: reason
   defp debug_error(reason), do: inspect(reason)
+
+  defp maybe_start_tcp_rtt(_socket, %{tcp_rtt_options: false} = state), do: state
+
+  defp maybe_start_tcp_rtt(socket, state) do
+    options = state.tcp_rtt_options
+
+    if TCPInfo.supported?(options) do
+      initialize_tcp_rtt(socket, state, options)
+    else
+      state
+    end
+  end
+
+  defp initialize_tcp_rtt(socket, state, options) do
+    case TCPInfo.rtt_microseconds(socket, options) do
+      {:ok, _microseconds} ->
+        interval_ms = Keyword.get(options, :interval_ms, 10_000)
+        timer = Clock.send_after(self(), :derpex_tcp_rtt_tick, interval_ms)
+        %{state | tcp_rtt: %{options: options, interval_ms: interval_ms, timer: timer}}
+
+      {:error, :not_tcp} ->
+        :ok = Metrics.observe_tcp_rtt(state.metrics, :non_tcp)
+        state
+
+      {:error, _reason} ->
+        :ok = Metrics.observe_tcp_rtt(state.metrics, :error)
+        state
+    end
+  end
+
+  defp claim_and_register(socket, state, key, info, can_mesh, request, admission_context) do
+    case Admission.claim(state.admission_policy, request, admission_context, self()) do
+      {:ok, admission_context} ->
+        with {:ok, state} <-
+               register_authenticated(state, key, info, can_mesh, admission_context) do
+          {:ok, maybe_start_tcp_rtt(socket, state)}
+        end
+
+      {:error, reason} ->
+        {:error, {:admission, reason}, state}
+    end
+  end
 
   defp admit(state, key, info, can_mesh) do
     request = %AdmissionRequest{

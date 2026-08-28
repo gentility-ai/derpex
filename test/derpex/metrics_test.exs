@@ -45,5 +45,23 @@ defmodule Derpex.MetricsTest do
     assert delta(after_snapshot, before, {:bytes_dropped, :gone_disconnected, :other}) == 10
   end
 
+  test "uses the pinned finite TCP RTT buckets and diagnostic labels" do
+    handle = Metrics.default_handle()
+    before = Metrics.snapshot()
+
+    assert :ok = Metrics.observe_tcp_rtt(handle, 10_000)
+    assert :ok = Metrics.observe_tcp_rtt(handle, 10_001)
+    assert :ok = Metrics.observe_tcp_rtt(handle, 500_001)
+    assert :ok = Metrics.observe_tcp_rtt(handle, :error)
+    assert :ok = Metrics.observe_tcp_rtt(handle, :non_tcp)
+
+    after_snapshot = Metrics.snapshot()
+    assert delta(after_snapshot, before, {:tcp_rtt, "10ms"}) == 1
+    assert delta(after_snapshot, before, {:tcp_rtt, "20ms"}) == 1
+    assert delta(after_snapshot, before, {:tcp_rtt, "inf"}) == 1
+    assert delta(after_snapshot, before, {:tcp_rtt, "error"}) == 1
+    assert delta(after_snapshot, before, {:tcp_rtt, "non-tcp"}) == 1
+  end
+
   defp delta(after_snapshot, before, key), do: after_snapshot[key] - before[key]
 end

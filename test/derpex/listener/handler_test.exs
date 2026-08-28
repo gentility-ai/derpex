@@ -569,6 +569,56 @@ defmodule Derpex.Listener.HandlerTest do
     :gen_tcp.close(socket)
   end
 
+  test "samples authenticated TCP RTT on the pinned ten-second lifecycle" do
+    start_supervised!({Manual, monotonic_time: 0})
+    previous_clock = Application.fetch_env!(:derpex, :clock)
+    Application.put_env(:derpex, :clock, Manual)
+    on_exit(fn -> Application.put_env(:derpex, :clock, previous_clock) end)
+
+    {server_public, server_private} = Crypto.generate_keypair()
+    {_client_public, client_private} = Crypto.generate_keypair()
+    parent = self()
+    before = Metrics.snapshot()[{:tcp_rtt, "10ms"}]
+
+    reader = fn _socket ->
+      send(parent, {:tcp_rtt_read, self()})
+      {:ok, 9_000}
+    end
+
+    {:ok, server} =
+      ThousandIsland.start_link(
+        port: 0,
+        transport_options: [ip: {127, 0, 0, 1}],
+        num_acceptors: 1,
+        handler_module: Handler,
+        handler_options: [
+          server_private_key: server_private,
+          tcp_rtt: [reader: reader, interval_ms: 10_000]
+        ]
+      )
+
+    stop_server_on_exit(server)
+    {:ok, {_ip, port}} = ThousandIsland.listener_info(server)
+    socket = connect_and_send_info(port, server_public, client_private, %ClientInfo{version: 2})
+
+    assert_receive {:tcp_rtt_read, handler}, 2_000
+    assert {:ok, <<_server_info_type, length::unsigned-big-32>>} = :gen_tcp.recv(socket, 5, 2_000)
+    assert {:ok, _server_info} = :gen_tcp.recv(socket, length, 2_000)
+    assert Metrics.snapshot()[{:tcp_rtt, "10ms"}] == before
+
+    assert :ok = Manual.advance(9_999)
+    refute_receive {:tcp_rtt_read, ^handler}, 25
+    assert :ok = Manual.advance(1)
+    assert_receive {:tcp_rtt_read, ^handler}, 2_000
+
+    assert_eventually(fn -> Metrics.snapshot()[{:tcp_rtt, "10ms"}] == before + 1 end)
+
+    monitor = Process.monitor(handler)
+    :gen_tcp.close(socket)
+    assert_receive {:DOWN, ^monitor, :process, ^handler, _reason}, 2_000
+    assert_eventually(fn -> Manual.pending_timer_count() == 0 end)
+  end
+
   defp stop_server_on_exit(server) do
     on_exit(fn ->
       if Process.alive?(server), do: Process.exit(server, :shutdown)

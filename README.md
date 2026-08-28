@@ -169,6 +169,9 @@ and Tailscale-address clients. They reject requests carrying
 operations bearer token is also accepted. Public health and probes do not
 inherit debug authorization. Traffic snapshots retain only the previous
 `ss` counter sample for the lifetime of the requesting connection.
+On Linux, authenticated TCP connections also contribute to the upstream RTT
+buckets every 10 seconds; set `TS_DERP_DISABLE_RTT_STATS=true` to disable the
+syscall and timer overhead at very high connection counts.
 
 ## Capacity measurements
 

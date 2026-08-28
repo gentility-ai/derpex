@@ -51,6 +51,7 @@ if config_env() == :prod do
     debug_key_path = System.get_env("TS_DEBUG_KEY_PATH")
     debug_allow_ip = System.get_env("TS_ALLOW_DEBUG_IP")
     debug_trusted_cidrs_text = System.get_env("TS_DEBUG_TRUSTED_CIDRS")
+    disable_rtt_stats_text = System.get_env("TS_DERP_DISABLE_RTT_STATS", "false")
 
     send_queue_depth_text =
       System.get_env("DERPEX_SEND_QUEUE_DEPTH") ||
@@ -77,6 +78,13 @@ if config_env() == :prod do
         "0" -> false
         "1" -> true
         _invalid -> raise "DERPEX_VERIFY_CLIENTS must be 0 or 1"
+      end
+
+    disable_rtt_stats? =
+      case String.downcase(disable_rtt_stats_text) do
+        value when value in ["1", "t", "true"] -> true
+        value when value in ["0", "f", "false"] -> false
+        _invalid -> raise "TS_DERP_DISABLE_RTT_STATS must be a boolean"
       end
 
     mesh_key =
@@ -401,7 +409,12 @@ if config_env() == :prod do
       end
 
     handler_options =
-      [send_queue_depth: send_queue_depth, operations: operations, debug: debug]
+      [
+        send_queue_depth: send_queue_depth,
+        operations: operations,
+        debug: debug,
+        tcp_rtt: if(disable_rtt_stats?, do: false, else: [])
+      ]
       |> then(fn options ->
         if client_verifiers == [] do
           options

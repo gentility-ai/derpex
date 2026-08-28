@@ -119,6 +119,7 @@ defmodule Derpex.Operations do
         "disco" => Map.get(core, :packets_received_disco, 0),
         "other" => Map.get(core, :packets_received_other, 0)
       },
+      "counter_tcp_rtt" => tcp_rtt_counters(core),
       "counter_total_dup_client_conns" => Map.get(core, :counter_total_dup_client_conns, 0),
       "gauge_clients_local" => Map.get(router, :clients_local, 0),
       "gauge_clients_remote" => Map.get(router, :clients_remote, 0),
@@ -151,6 +152,16 @@ defmodule Derpex.Operations do
       {:ok, stats} -> Map.get(stats, :home_connections, 0)
       {:error, _reason} -> 0
     end
+  end
+
+  defp tcp_rtt_counters(core) do
+    Enum.reduce(core, %{}, fn
+      {{:tcp_rtt, label}, count}, counters when count > 0 ->
+        Map.put(counters, label, count)
+
+      _other, counters ->
+        counters
+    end)
   end
 
   defp version do
@@ -187,14 +198,17 @@ defmodule Derpex.Operations do
   defp merge_core_metrics(metrics) do
     case safe(&Metrics.snapshot/0) do
       {:ok, counters} ->
-        Enum.reduce(counters, metrics, fn {name, value}, metrics ->
-          Map.put(metrics, core_metric_name(name), value)
-        end)
+        Enum.reduce(counters, metrics, &merge_core_metric/2)
 
       {:error, _reason} ->
         metrics
     end
   end
+
+  defp merge_core_metric({{:tcp_rtt, _label}, 0}, metrics), do: metrics
+
+  defp merge_core_metric({name, value}, metrics),
+    do: Map.put(metrics, core_metric_name(name), value)
 
   defp merge_router_metrics(metrics) do
     names = %{
@@ -363,6 +377,9 @@ defmodule Derpex.Operations do
 
   defp core_metric_name(:packets_received_other),
     do: ~s(derp_counter_packets_received_kind{kind="other"})
+
+  defp core_metric_name({:tcp_rtt, label}),
+    do: ~s(derp_counter_tcp_rtt{le="#{label}"})
 
   defp core_metric_name({metric, reason, kind})
        when metric in [:packets_dropped, :bytes_dropped] do

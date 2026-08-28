@@ -40,11 +40,22 @@ defmodule Derpex.Metrics do
     :dup_client
   ]
   @packet_kinds [:disco, :other]
+  @tcp_rtt_buckets [
+    {10_000, "10ms"},
+    {20_000, "20ms"},
+    {50_000, "50ms"},
+    {100_000, "100ms"},
+    {150_000, "150ms"},
+    {250_000, "250ms"},
+    {500_000, "500ms"}
+  ]
+  @tcp_rtt_labels Enum.map(@tcp_rtt_buckets, &elem(&1, 1)) ++ ["inf", "error", "non-tcp"]
   @drop_metric_names for metric <- [:packets_dropped, :bytes_dropped],
                          reason <- @drop_reasons,
                          kind <- @packet_kinds,
                          do: {metric, reason, kind}
-  @metric_names @metric_names ++ @drop_metric_names
+  @tcp_rtt_metric_names Enum.map(@tcp_rtt_labels, &{:tcp_rtt, &1})
+  @metric_names @metric_names ++ @drop_metric_names ++ @tcp_rtt_metric_names
 
   @indexes @metric_names |> Enum.with_index(1) |> Map.new()
   @persistent_key {__MODULE__, :default_handle}
@@ -91,6 +102,24 @@ defmodule Derpex.Metrics do
       when is_integer(microseconds) and microseconds >= 0 do
     update_queue_average(handle.queue_average, microseconds / 1_000)
   end
+
+  @doc "Adds a sample to the pinned Linux TCP RTT bucket set."
+  @spec observe_tcp_rtt(handle() | nil, non_neg_integer() | :error | :non_tcp) :: :ok
+  def observe_tcp_rtt(handle, microseconds)
+      when is_integer(microseconds) and microseconds >= 0 do
+    label =
+      case Enum.find(@tcp_rtt_buckets, fn {upper_bound, _label} ->
+             microseconds <= upper_bound
+           end) do
+        {_upper_bound, label} -> label
+        nil -> "inf"
+      end
+
+    add(handle, {:tcp_rtt, label}, 1)
+  end
+
+  def observe_tcp_rtt(handle, :error), do: add(handle, {:tcp_rtt, "error"}, 1)
+  def observe_tcp_rtt(handle, :non_tcp), do: add(handle, {:tcp_rtt, "non-tcp"}, 1)
 
   @doc "Records one packet drop in the fixed reason/kind matrix."
   @spec add_drop(handle() | nil, atom(), :disco | :other, non_neg_integer()) :: :ok
