@@ -12,8 +12,8 @@ disposition map and review that change together with `interop/upstream.lock`.
 | State | Count |
 | --- | ---: |
 | Total | 69 |
-| Ported | 46 |
-| Pending (release-blocking) | 19 |
+| Ported | 47 |
+| Pending (release-blocking) | 18 |
 | Implementation-specific | 4 |
 
 | Area | Upstream test | Source | Disposition | Gate/notes |
@@ -22,7 +22,7 @@ disposition map and review that change together with `interop/upstream.lock`.
 | DERP framing/client | `TestClientRecvPeerPresent` | `derp/client_test.go:102` | `ported` | ported in test/derpex/frame/body_test.exs with legacy and extension shapes |
 | DERP framing/client | `TestClientSendPing` | `derp/client_test.go:189` | `ported` | ported in test/derpex/frame/body_test.exs; byte-identical vector |
 | DERP framing/client | `TestClientSendPong` | `derp/client_test.go:206` | `ported` | ported in test/derpex/frame/body_test.exs; byte-identical vector |
-| DERP framing/client | `TestClientSendRateLimiting` | `derp/client_test.go:249` | `pending` | release-blocking mapping not yet implemented |
+| DERP framing/client | `TestClientSendRateLimiting` | `derp/client_test.go:249` | `ported` | unchanged official client obeys DERPEX ServerInfo token-bucket limits in test/interop/go_client_test.exs |
 | DERP framing/client | `TestReadFrameHeader` | `derp/derp_test.go:37` | `ported` | ported in test/derpex/frame_test.exs; extension and all chunk boundaries added |
 | DERP framing/client | `TestWriteFrameHeader` | `derp/derp_test.go:96` | `ported` | ported in test/derpex/frame_test.exs; byte-identical vectors |
 | DERP framing/client | `TestClientInfoUnmarshal` | `derp/derp_test.go:196` | `ported` | ported in test/derpex/client_info_test.exs; duplicate and field-type cases added |

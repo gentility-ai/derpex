@@ -24,6 +24,7 @@ defmodule Derpex.Listener.Handler do
   def handle_connection(socket, options) do
     server_private_key = Keyword.fetch!(options, :server_private_key)
     mesh_key = Keyword.get(options, :mesh_key)
+    server_info = Keyword.get(options, :server_info)
     admission_policy = Keyword.get(options, :admission)
     accept_limiter = Keyword.get(options, :accept_limiter, AcceptLimiter)
     rate_controller = Keyword.get(options, :rate_controller, RateController)
@@ -64,7 +65,12 @@ defmodule Derpex.Listener.Handler do
              pong: pong,
              lifecycle: lifecycle
            }),
-         {:ok, session, actions} <- Session.new(server_private_key, mesh_key: mesh_key) do
+         {:ok, session, actions} <-
+           Session.new(
+             server_private_key,
+             [mesh_key: mesh_key, server_info: server_info]
+             |> Enum.reject(fn {_key, value} -> is_nil(value) end)
+           ) do
       state = %{
         session: session,
         timers: %{},

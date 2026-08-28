@@ -56,6 +56,12 @@ defmodule Derpex.Frame.BodyTest do
     assert IO.iodata_to_binary(pong) == <<0x13, 0, 0, 0, 8, @ping::binary>>
   end
 
+  test "omits the source prefix for the special zero-source server packet" do
+    packet = :binary.copy(<<0xA5>>, 40)
+    assert {:ok, encoded} = Body.encode_server({:recv_packet, <<0::256>>, packet})
+    assert IO.iodata_to_binary(encoded) == <<Frame.type(:recv_packet), 40::32, packet::binary>>
+  end
+
   test "enforces inbound packet, ping, and control-frame limits before routing" do
     destination = :binary.copy(<<2>>, 32)
 

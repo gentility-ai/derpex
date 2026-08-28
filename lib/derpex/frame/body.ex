@@ -114,6 +114,11 @@ defmodule Derpex.Frame.Body do
     end
   end
 
+  def encode_server({:recv_packet, <<0::256>>, packet})
+      when is_binary(packet) and byte_size(packet) <= @max_packet_size do
+    {:ok, Frame.encode(:recv_packet, packet)}
+  end
+
   def encode_server({:recv_packet, <<source::binary-size(32)>>, packet})
       when is_binary(packet) and byte_size(packet) <= @max_packet_size do
     {:ok, Frame.encode(:recv_packet, [source, packet])}

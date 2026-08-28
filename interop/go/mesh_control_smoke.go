@@ -50,6 +50,19 @@ func main() {
 		fail("forwarded packet did not preserve its asserted source and payload")
 	}
 
+	// The Go server's special zero source omits the 32-byte source prefix.
+	// An unchanged client consequently interprets the first 32 payload bytes as
+	// its source and exposes only the suffix as packet data.
+	payloadPrefix := key.NewNode().Public()
+	zeroSourcePayload := payloadPrefix.AppendTo(nil)
+	zeroSourcePayload = append(zeroSourcePayload, []byte("zero-source suffix")...)
+	must(mesh.ForwardPacket(key.NodePublic{}, destination.SelfPublicKey(), zeroSourcePayload))
+
+	packet, ok = recvTimeout(destination).(derp.ReceivedPacket)
+	if !ok || packet.Source != payloadPrefix || !bytes.Equal(packet.Data, []byte("zero-source suffix")) {
+		fail("zero-source forwarding did not preserve the upstream prefix omission")
+	}
+
 	unknown := key.NewNode().Public()
 	discoPacket := unknown.AppendTo([]byte(disco.Magic))
 	discoPacket = append(discoPacket, make([]byte, disco.NonceLen)...)

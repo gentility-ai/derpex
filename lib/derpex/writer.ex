@@ -146,6 +146,8 @@ defmodule Derpex.Writer do
     end
   end
 
+  defp maybe_note_send(_state, {:recv_packet, <<0::256>>, _packet}), do: :ok
+
   defp maybe_note_send(state, {:recv_packet, source, _packet}) do
     :ok = Cardinality.insert(state.sender_cardinality, source)
     Derpex.Router.note_send(source, state.owner, state.rings.lifecycle)

@@ -36,6 +36,8 @@ defmodule Derpex.UpstreamInventory do
       "ported in test/derpex/frame/body_test.exs; byte-identical vector",
     {"derp/client_test.go", "TestClientSendPong"} =>
       "ported in test/derpex/frame/body_test.exs; byte-identical vector",
+    {"derp/client_test.go", "TestClientSendRateLimiting"} =>
+      "unchanged official client obeys DERPEX ServerInfo token-bucket limits in test/interop/go_client_test.exs",
     {"derp/derphttp/derphttp_test.go", "TestProbe"} =>
       "ported in test/derpex/http1_test.exs; both probe paths and upgrade-required behavior",
     {"derp/derphttp/derphttp_test.go", "TestPing"} =>

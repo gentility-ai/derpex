@@ -52,7 +52,7 @@ defmodule Derpex.Session do
         server_private_key: server_private_key,
         server_public_key: server_public_key,
         http_parser: Parser.new(Keyword.get(options, :http_parser, [])),
-        connection_options: Keyword.take(options, [:mesh_key]),
+        connection_options: Keyword.take(options, [:mesh_key, :server_info]),
         connection: nil,
         metadata: %{},
         close_reason: nil
