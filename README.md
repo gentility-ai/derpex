@@ -51,6 +51,11 @@ while dialing a private address. A configured mesh requires
 `DERPEX_MESH_KEY`. Connections watch and withdraw remote routes automatically,
 use bounded forwarding queues, and reconnect every five seconds after failure.
 
+`DERPEX_SEND_QUEUE_DEPTH` sets the independent ordinary and discovery packet
+ring capacities for each client (default `32`). The upstream
+`TS_DEBUG_DERP_PER_CLIENT_SEND_QUEUE_DEPTH` name is also accepted for parity.
+Control/lifecycle traffic retains separate fixed rings.
+
 `DERPEX_DISALLOWED_APP_NAMES` is an optional comma-separated list of exact
 client-advertised app names to reject before registration. Trusted mesh peers
 are exempt, matching the baseline server. Embedders can also supply a

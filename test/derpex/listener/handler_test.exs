@@ -8,6 +8,7 @@ defmodule Derpex.Listener.HandlerTest do
   alias Derpex.Frame
   alias Derpex.Handshake
   alias Derpex.Listener.Handler
+  alias Derpex.Outbox.Ring
   alias Derpex.RateConfig
   alias Derpex.RateController
 
@@ -275,6 +276,42 @@ defmodule Derpex.Listener.HandlerTest do
     assert {:error, :closed} = :gen_tcp.recv(rejected, 0, 2_000)
     :gen_tcp.close(admitted)
     :gen_tcp.close(rejected)
+  end
+
+  test "configured packet queue depth applies independently to ordinary and disco rings" do
+    {server_public, server_private} = Crypto.generate_keypair()
+    {_client_public, client_private} = Crypto.generate_keypair()
+    parent = self()
+
+    event_handler = fn event ->
+      send(parent, {:queue_handler_event, self(), event})
+      :ok
+    end
+
+    {:ok, server} =
+      ThousandIsland.start_link(
+        port: 0,
+        transport_options: [ip: {127, 0, 0, 1}],
+        num_acceptors: 1,
+        handler_module: Handler,
+        handler_options: [
+          server_private_key: server_private,
+          send_queue_depth: 64,
+          event_handler: event_handler
+        ]
+      )
+
+    stop_server_on_exit(server)
+    {:ok, {_ip, port}} = ThousandIsland.listener_info(server)
+    socket = connect_and_send_info(port, server_public, client_private, %ClientInfo{version: 2})
+
+    assert_receive {:queue_handler_event, handler, {:authenticated, _key, _info}}, 2_000
+    {_thousand_island_socket, state} = :sys.get_state(handler)
+    assert Ring.stats(state.ordinary).capacity == 64
+    assert Ring.stats(state.disco).capacity == 64
+    assert Ring.stats(state.lifecycle).capacity == 32
+    assert Ring.stats(state.pong).capacity == 1
+    :gen_tcp.close(socket)
   end
 
   defp stop_server_on_exit(server) do

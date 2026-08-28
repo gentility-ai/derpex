@@ -14,6 +14,7 @@ defmodule Derpex.Listener.Handler do
   alias Derpex.RateLimiter
   alias Derpex.ReceiveLimiter
   alias Derpex.Router
+  alias Derpex.SendQueueConfig
   alias Derpex.Session
   alias Derpex.Transport.ThousandIsland, as: Transport
   alias Derpex.WebSocket.Frame, as: WebSocketFrame
@@ -34,13 +35,24 @@ defmodule Derpex.Listener.Handler do
 
     event_handler = Keyword.get(options, :event_handler, fn _event -> :ok end)
 
+    send_queue_depth =
+      options
+      |> Keyword.get(:send_queue_depth, SendQueueConfig.default_depth())
+      |> SendQueueConfig.validate!()
+
     with true <- AcceptLimiter.allow?(accept_limiter),
          {:ok, server_public_key} <- Crypto.public_key(server_private_key),
          {:ok, writer} <- Writer.start_link(owner: self(), transport: Transport, socket: socket),
          ordinary =
-           Ring.new(32, notifier: writer, wake_message: Writer.wake_message()),
+           Ring.new(send_queue_depth,
+             notifier: writer,
+             wake_message: Writer.wake_message()
+           ),
          disco =
-           Ring.new(32, notifier: writer, wake_message: Writer.wake_message()),
+           Ring.new(send_queue_depth,
+             notifier: writer,
+             wake_message: Writer.wake_message()
+           ),
          pong =
            Ring.new(1, notifier: writer, wake_message: Writer.wake_message()),
          lifecycle =

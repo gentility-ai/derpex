@@ -12,8 +12,8 @@ disposition map and review that change together with `interop/upstream.lock`.
 | State | Count |
 | --- | ---: |
 | Total | 69 |
-| Ported | 40 |
-| Pending (release-blocking) | 25 |
+| Ported | 41 |
+| Pending (release-blocking) | 24 |
 | Implementation-specific | 4 |
 
 | Area | Upstream test | Source | Disposition | Gate/notes |
@@ -44,7 +44,7 @@ disposition map and review that change together with `interop/upstream.lock`.
 | DERP server | `TestLimiter` | `derp/derpserver/derpserver_test.go:747` | `ported` | ported shared burst, refill, zero-rate, disable, and pre-allocation rejection cases |
 | DERP server | `TestParseSSOutput` | `derp/derpserver/derpserver_test.go:884` | `pending` | release-blocking mapping not yet implemented |
 | DERP server | `TestServeDebugTrafficUniqueSenders` | `derp/derpserver/derpserver_test.go:895` | `pending` | release-blocking mapping not yet implemented |
-| DERP server | `TestGetPerClientSendQueueDepth` | `derp/derpserver/derpserver_test.go:924` | `pending` | release-blocking mapping not yet implemented |
+| DERP server | `TestGetPerClientSendQueueDepth` | `derp/derpserver/derpserver_test.go:924` | `ported` | ported in test/derpex/send_queue_config_test.exs; empty/default and explicit depths preserved |
 | DERP server | `TestSenderCardinality` | `derp/derpserver/derpserver_test.go:950` | `pending` | release-blocking mapping not yet implemented |
 | DERP server | `TestSenderCardinality100` | `derp/derpserver/derpserver_test.go:995` | `pending` | release-blocking mapping not yet implemented |
 | DERP server | `TestSenderCardinalityTracking` | `derp/derpserver/derpserver_test.go:1019` | `pending` | release-blocking mapping not yet implemented |

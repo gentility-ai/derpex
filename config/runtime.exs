@@ -25,6 +25,11 @@ if config_env() == :prod do
     rate_config_path = System.get_env("DERPEX_RATE_CONFIG")
     accept_limit_text = System.get_env("DERPEX_ACCEPT_CONNECTION_LIMIT")
     accept_burst_text = System.get_env("DERPEX_ACCEPT_CONNECTION_BURST")
+
+    send_queue_depth_text =
+      System.get_env("DERPEX_SEND_QUEUE_DEPTH") ||
+        System.get_env("TS_DEBUG_DERP_PER_CLIENT_SEND_QUEUE_DEPTH")
+
     stun_port_text = System.get_env("DERPEX_STUN_PORT", "3478")
 
     mesh_key =
@@ -74,6 +79,12 @@ if config_env() == :prod do
     if mesh_peers != [] and is_nil(mesh_key) do
       raise "DERPEX_MESH_KEY is required when DERPEX_MESH_WITH is set"
     end
+
+    send_queue_depth =
+      case Derpex.SendQueueConfig.parse(send_queue_depth_text) do
+        {:ok, depth} -> depth
+        {:error, _reason} -> raise "DERPEX_SEND_QUEUE_DEPTH must be a positive integer"
+      end
 
     stun_port =
       case Integer.parse(stun_port_text) do
@@ -134,7 +145,7 @@ if config_env() == :prod do
       end
 
     handler_options =
-      []
+      [send_queue_depth: send_queue_depth]
       |> then(fn options ->
         if mesh_key, do: Keyword.put(options, :mesh_key, mesh_key), else: options
       end)
