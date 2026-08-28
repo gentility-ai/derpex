@@ -12,8 +12,8 @@ disposition map and review that change together with `interop/upstream.lock`.
 | State | Count |
 | --- | ---: |
 | Total | 69 |
-| Ported | 61 |
-| Pending (release-blocking) | 4 |
+| Ported | 65 |
+| Pending (release-blocking) | 0 |
 | Implementation-specific | 4 |
 
 | Area | Upstream test | Source | Disposition | Gate/notes |
@@ -72,15 +72,15 @@ disposition map and review that change together with `interop/upstream.lock`.
 | cmd/derper | `TestUnpublishedDNSEmptyList` | `cmd/derper/bootstrap_dns_test.go:134` | `ported` | ported empty-list miss behavior and exact unpublished hit/miss counters |
 | cmd/derper | `TestLookupMetric` | `cmd/derper/bootstrap_dns_test.go:188` | `ported` | ported distinct queried-domain accounting and the upstream 500-name defensive reset |
 | cmd/derper | `TestRemoteAddrMatchesPercent` | `cmd/derper/bootstrap_dns_test.go:202` | `ported` | ported Go's 128-bit PCG selection with exact vectors and 65,536-address distribution gate |
-| cmd/derper | `TestCertIP` | `cmd/derper/cert_test.go:34` | `pending` | release-blocking mapping not yet implemented |
-| cmd/derper | `TestPinnedCertRawIP` | `cmd/derper/cert_test.go:114` | `pending` | release-blocking mapping not yet implemented |
+| cmd/derper | `TestCertIP` | `cmd/derper/cert_test.go:34` | `ported` | ported pure-OTP self-signed IP SAN generation, loading, validation, and persistent reuse |
+| cmd/derper | `TestPinnedCertRawIP` | `cmd/derper/cert_test.go:114` | `ported` | unchanged official region client dials DERPEX by raw IP using the generated sha256-raw DERP-map pin |
 | cmd/derper | `TestGCPCertMode` | `cmd/derper/cert_test.go:173` | `ported` | ported required EAB/email validation plus padded base64 and unpadded base64url decoding |
 | cmd/derper | `TestProdAutocertHostPolicy` | `cmd/derper/derper_test.go:18` | `ported` | ported exact production derp*.tailscale.com hostname policy vectors |
 | cmd/derper | `TestNoContent` | `cmd/derper/derper_test.go:42` | `ported` | ported all challenge validity cases in test/derpex/http1_test.exs |
 | cmd/derper | `TestDeps` | `cmd/derper/derper_test.go:101` | `implementation-specific` | Go dependency graph; protected behavior maps to the runtime-boundary artifact gate |
 | cmd/derper | `TestTemplate` | `cmd/derper/derper_test.go:116` | `ported` | ported conditional abuse, policy, disabled-status, and debug homepage sections |
-| cmd/derper | `TestIPCertManager` | `cmd/derper/ipcert_test.go:328` | `pending` | release-blocking mapping not yet implemented |
-| cmd/derper | `TestIPCertManagerNextProvider` | `cmd/derper/ipcert_test.go:426` | `pending` | release-blocking mapping not yet implemented |
+| cmd/derper | `TestIPCertManager` | `cmd/derper/ipcert_test.go:328` | `ported` | ported IPv4/IPv6 issuance with shortlived profile, SNI checks, HTTP-01 routing, and disk-cache reuse |
+| cmd/derper | `TestIPCertManagerNextProvider` | `cmd/derper/ipcert_test.go:426` | `ported` | ported DNS-SNI delegation to the next provider without creating an IP certificate order |
 | cmd/derper | `TestCertModeIPCertsGating` | `cmd/derper/ipcert_test.go:448` | `ported` | ported certificate-mode/IP-host gating and optional hostname-provider composition |
 | DERP prober | `TestDerpProber` | `prober/derp_test.go:25` | `ported` | ported dynamic region filtering, probe inventory, and add/remove reconciliation in test/derpex/prober_test.exs |
 | DERP prober | `TestRunDerpProbeNodePair` | `prober/derp_test.go:146` | `ported` | upstream 100 MB transfer and 30-packet in-flight bound run through DERPEX with unchanged official clients |

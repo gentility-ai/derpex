@@ -118,12 +118,20 @@ defmodule Derpex.UpstreamInventory do
       "ported Go's 128-bit PCG selection with exact vectors and 65,536-address distribution gate",
     {"cmd/derper/cert_test.go", "TestGCPCertMode"} =>
       "ported required EAB/email validation plus padded base64 and unpadded base64url decoding",
+    {"cmd/derper/cert_test.go", "TestCertIP"} =>
+      "ported pure-OTP self-signed IP SAN generation, loading, validation, and persistent reuse",
+    {"cmd/derper/cert_test.go", "TestPinnedCertRawIP"} =>
+      "unchanged official region client dials DERPEX by raw IP using the generated sha256-raw DERP-map pin",
     {"cmd/derper/derper_test.go", "TestProdAutocertHostPolicy"} =>
       "ported exact production derp*.tailscale.com hostname policy vectors",
     {"cmd/derper/derper_test.go", "TestTemplate"} =>
       "ported conditional abuse, policy, disabled-status, and debug homepage sections",
     {"cmd/derper/ipcert_test.go", "TestCertModeIPCertsGating"} =>
       "ported certificate-mode/IP-host gating and optional hostname-provider composition",
+    {"cmd/derper/ipcert_test.go", "TestIPCertManager"} =>
+      "ported IPv4/IPv6 issuance with shortlived profile, SNI checks, HTTP-01 routing, and disk-cache reuse",
+    {"cmd/derper/ipcert_test.go", "TestIPCertManagerNextProvider"} =>
+      "ported DNS-SNI delegation to the next provider without creating an IP certificate order",
     {"cmd/derper/derper_test.go", "TestNoContent"} =>
       "ported all challenge validity cases in test/derpex/http1_test.exs",
     {"derp/derp_test.go", "TestClientInfoUnmarshal"} =>

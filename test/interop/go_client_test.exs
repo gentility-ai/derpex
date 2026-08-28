@@ -4,6 +4,7 @@ defmodule Derpex.Interop.GoClientTest do
   @moduletag :go_interop
 
   alias Derpex.Certificates
+  alias Derpex.Certificates.Manual
   alias Derpex.Crypto
   alias Derpex.Listener.Handler
   alias Derpex.ServerInfo
@@ -257,6 +258,58 @@ defmodule Derpex.Interop.GoClientTest do
 
     assert status == 0, output
     assert output =~ "official Go client used TLS 1.3 metacertificate fast start"
+  end
+
+  test "official Go region client accepts a raw-IP certificate pin" do
+    upstream = System.fetch_env!("DERPEX_TAILSCALE_DIR")
+    {server_public, server_private} = Crypto.generate_keypair()
+
+    directory =
+      Path.join(System.tmp_dir!(), "derpex-pinned-#{System.unique_integer([:positive])}")
+
+    on_exit(fn -> File.rm_rf!(directory) end)
+    {:ok, manual} = Manual.load_or_create(directory, "127.0.0.1")
+
+    transport_options =
+      Certificates.transport_options(
+        manual.certificate_path,
+        manual.key_path,
+        server_public
+      ) ++
+        [
+          ip: {127, 0, 0, 1},
+          versions: [:"tlsv1.3"],
+          alpn_preferred_protocols: ["http/1.1"],
+          send_timeout: 2_000,
+          send_timeout_close: true
+        ]
+
+    {:ok, server} =
+      ThousandIsland.start_link(
+        port: 0,
+        transport_module: ThousandIsland.Transports.SSL,
+        transport_options: transport_options,
+        num_acceptors: 1,
+        handler_module: Handler,
+        handler_options: [server_private_key: server_private]
+      )
+
+    on_exit(fn ->
+      if Process.alive?(server), do: Process.exit(server, :shutdown)
+    end)
+
+    {:ok, {_ip, port}} = ThousandIsland.listener_info(server)
+    helper = Path.expand("../../interop/go/pinned_cert_smoke.go", __DIR__)
+
+    {output, status} =
+      System.cmd("go", ["run", helper, Integer.to_string(port), Manual.raw_pin(manual)],
+        cd: upstream,
+        stderr_to_stdout: true,
+        env: [{"GOTOOLCHAIN", "local"}]
+      )
+
+    assert status == 0, output
+    assert output =~ "official Go region client accepted DERPEX raw-IP certificate pin"
   end
 
   test "official low-level client covers unknown and oversize frame edges" do
