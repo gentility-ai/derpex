@@ -32,11 +32,15 @@ defmodule Derpex.Application do
           config -> {Derpex.AcceptLimiter, config: config}
         end
 
+      bootstrap_dns =
+        {Derpex.BootstrapDNS, Application.fetch_env!(:derpex, :bootstrap_dns)}
+
       {:ok,
        [
          Derpex.Router,
          Derpex.Mesh.ClientAddressTable,
          Derpex.Prober.PacketCache,
+         bootstrap_dns,
          rate_controller,
          accept_limiter
        ] ++

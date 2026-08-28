@@ -108,6 +108,14 @@ defmodule Derpex.UpstreamInventory do
       "adapted to the secondary ETS regional-forwarder lookup in test/derpex/router_test.exs",
     {"derp/derpserver/derpserver_test.go", "TestLookupDestHashTrieIgnoresInactiveSet"} =>
       "DERPEX never publishes inactive local routes; unregister-to-forwarder fallback is covered in test/derpex/router_test.exs",
+    {"cmd/derper/bootstrap_dns_test.go", "TestUnpublishedDNS"} =>
+      "ported selective unpublished responses and no-leak fallback through /bootstrap-dns",
+    {"cmd/derper/bootstrap_dns_test.go", "TestUnpublishedDNSEmptyList"} =>
+      "ported empty-list miss behavior and exact unpublished hit/miss counters",
+    {"cmd/derper/bootstrap_dns_test.go", "TestLookupMetric"} =>
+      "ported distinct queried-domain accounting and the upstream 500-name defensive reset",
+    {"cmd/derper/bootstrap_dns_test.go", "TestRemoteAddrMatchesPercent"} =>
+      "ported Go's 128-bit PCG selection with exact vectors and 65,536-address distribution gate",
     {"cmd/derper/derper_test.go", "TestNoContent"} =>
       "ported all challenge validity cases in test/derpex/http1_test.exs",
     {"derp/derp_test.go", "TestClientInfoUnmarshal"} =>

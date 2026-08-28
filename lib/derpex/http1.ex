@@ -5,14 +5,15 @@
 defmodule Derpex.HTTP1 do
   @moduledoc "HTTP routing for DERP upgrade, probes, and captive-portal checks."
 
+  alias Derpex.BootstrapDNS
   alias Derpex.Handshake
   alias Derpex.HTTP1.Request
   alias Derpex.HTTP1.Response
 
   @doc "Routes a parsed request without consuming bytes read past its headers."
-  @spec route(Request.t(), binary()) ::
+  @spec route(Request.t(), binary(), keyword()) ::
           {:upgrade, :derp | :websocket, nil | iodata(), map()} | {:response, iodata()}
-  def route(%Request{} = request, server_public_key) do
+  def route(%Request{} = request, server_public_key, options \\ []) do
     case Request.path(request) do
       path when path in ["/derp/probe", "/derp/latency-check"] ->
         probe(request)
@@ -20,12 +21,29 @@ defmodule Derpex.HTTP1 do
       "/generate_204" ->
         no_content(request)
 
+      "/bootstrap-dns" ->
+        bootstrap_dns(request, options)
+
       path when path == "/derp" or binary_part(path, 0, min(byte_size(path), 6)) == "/derp/" ->
         upgrade(request, server_public_key)
 
       _path ->
         {:response, Response.encode(404, [], "404 page not found\n")}
     end
+  end
+
+  defp bootstrap_dns(request, options) do
+    server = Keyword.get(options, :bootstrap_dns, BootstrapDNS)
+    remote_address = Keyword.get(options, :remote_address, "")
+    query = Request.query_param(request, "q") || ""
+    body = server |> BootstrapDNS.lookup(query, remote_address) |> :json.encode()
+
+    {:response,
+     Response.encode(
+       200,
+       [{"Content-Type", "application/json"}, {"Connection", "close"}],
+       body
+     )}
   end
 
   defp probe(%Request{method: method}) when method in ["GET", "HEAD"] do

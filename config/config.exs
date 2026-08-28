@@ -2,6 +2,7 @@ import Config
 
 config :derpex,
   accept_limit: nil,
+  bootstrap_dns: [],
   clock: Derpex.Clock.System,
   identity_path: nil,
   listeners: [],

@@ -28,6 +28,8 @@ defmodule Derpex.Listener.Handler do
     admission_policy = Keyword.get(options, :admission)
     accept_limiter = Keyword.get(options, :accept_limiter, AcceptLimiter)
     rate_controller = Keyword.get(options, :rate_controller, RateController)
+    bootstrap_dns = Keyword.get(options, :bootstrap_dns, Derpex.BootstrapDNS)
+    remote_address = remote_address(socket)
 
     disallowed_app_names =
       options
@@ -69,6 +71,10 @@ defmodule Derpex.Listener.Handler do
            Session.new(
              server_private_key,
              [mesh_key: mesh_key, server_info: server_info]
+             |> Keyword.merge(
+               bootstrap_dns: bootstrap_dns,
+               remote_address: format_remote_address(remote_address)
+             )
              |> Enum.reject(fn {_key, value} -> is_nil(value) end)
            ) do
       state = %{
@@ -92,7 +98,7 @@ defmodule Derpex.Listener.Handler do
         rate_controller: rate_controller,
         receive_limiter: nil,
         server_public_key: server_public_key,
-        remote_address: remote_address(socket)
+        remote_address: remote_address
       }
 
       continue_after_actions(socket, state, actions)
@@ -525,6 +531,11 @@ defmodule Derpex.Listener.Handler do
       {:ok, {ip, port}} -> {ip, port}
       {:error, _reason} -> {{0, 0, 0, 0}, 0}
     end
+  end
+
+  defp format_remote_address({ip, port}) do
+    address = ip |> :inet.ntoa() |> List.to_string()
+    if tuple_size(ip) == 8, do: "[#{address}]:#{port}", else: "#{address}:#{port}"
   end
 
   defp presence(state, info, can_mesh) do

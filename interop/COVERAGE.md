@@ -12,8 +12,8 @@ disposition map and review that change together with `interop/upstream.lock`.
 | State | Count |
 | --- | ---: |
 | Total | 69 |
-| Ported | 53 |
-| Pending (release-blocking) | 12 |
+| Ported | 57 |
+| Pending (release-blocking) | 8 |
 | Implementation-specific | 4 |
 
 | Area | Upstream test | Source | Disposition | Gate/notes |
@@ -68,10 +68,10 @@ disposition map and review that change together with `interop/upstream.lock`.
 | DERP HTTP | `TestManualDial` | `derp/derphttp/derphttp_test.go:568` | `ported` | adapted in test/derpex/mesh/client_test.exs; private dial host preserves the URL Host and TLS identity |
 | DERP HTTP | `TestURLDial` | `derp/derphttp/derphttp_test.go:595` | `ported` | adapted in test/derpex/mesh/client_test.exs with direct URL parsing, dialing, upgrade, and authentication |
 | DERP HTTP | `TestConnectThroughProxyHonorsDERPPort` | `derp/derphttp/derphttp_test.go:682` | `ported` | adapted with an end-to-end HTTP CONNECT tunnel that records the configured non-default DERP port |
-| cmd/derper | `TestUnpublishedDNS` | `cmd/derper/bootstrap_dns_test.go:82` | `pending` | release-blocking mapping not yet implemented |
-| cmd/derper | `TestUnpublishedDNSEmptyList` | `cmd/derper/bootstrap_dns_test.go:134` | `pending` | release-blocking mapping not yet implemented |
-| cmd/derper | `TestLookupMetric` | `cmd/derper/bootstrap_dns_test.go:188` | `pending` | release-blocking mapping not yet implemented |
-| cmd/derper | `TestRemoteAddrMatchesPercent` | `cmd/derper/bootstrap_dns_test.go:202` | `pending` | release-blocking mapping not yet implemented |
+| cmd/derper | `TestUnpublishedDNS` | `cmd/derper/bootstrap_dns_test.go:82` | `ported` | ported selective unpublished responses and no-leak fallback through /bootstrap-dns |
+| cmd/derper | `TestUnpublishedDNSEmptyList` | `cmd/derper/bootstrap_dns_test.go:134` | `ported` | ported empty-list miss behavior and exact unpublished hit/miss counters |
+| cmd/derper | `TestLookupMetric` | `cmd/derper/bootstrap_dns_test.go:188` | `ported` | ported distinct queried-domain accounting and the upstream 500-name defensive reset |
+| cmd/derper | `TestRemoteAddrMatchesPercent` | `cmd/derper/bootstrap_dns_test.go:202` | `ported` | ported Go's 128-bit PCG selection with exact vectors and 65,536-address distribution gate |
 | cmd/derper | `TestCertIP` | `cmd/derper/cert_test.go:34` | `pending` | release-blocking mapping not yet implemented |
 | cmd/derper | `TestPinnedCertRawIP` | `cmd/derper/cert_test.go:114` | `pending` | release-blocking mapping not yet implemented |
 | cmd/derper | `TestGCPCertMode` | `cmd/derper/cert_test.go:173` | `pending` | release-blocking mapping not yet implemented |

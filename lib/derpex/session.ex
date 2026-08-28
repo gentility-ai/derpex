@@ -18,6 +18,7 @@ defmodule Derpex.Session do
     :server_private_key,
     :server_public_key,
     :http_parser,
+    :http_options,
     :connection_options,
     :connection,
     :metadata,
@@ -37,6 +38,7 @@ defmodule Derpex.Session do
             server_private_key: binary(),
             server_public_key: binary(),
             http_parser: Parser.t(),
+            http_options: keyword(),
             connection_options: keyword(),
             connection: nil | Connection.t(),
             metadata: map(),
@@ -52,6 +54,7 @@ defmodule Derpex.Session do
         server_private_key: server_private_key,
         server_public_key: server_public_key,
         http_parser: Parser.new(Keyword.get(options, :http_parser, [])),
+        http_options: Keyword.take(options, [:bootstrap_dns, :remote_address]),
         connection_options: Keyword.take(options, [:mesh_key, :server_info]),
         connection: nil,
         metadata: %{},
@@ -106,7 +109,12 @@ defmodule Derpex.Session do
 
       {:ok, request, read_ahead, parser} ->
         state = %{state | http_parser: parser}
-        route_http(state, HTTP1.route(request, state.server_public_key), read_ahead)
+
+        route_http(
+          state,
+          HTTP1.route(request, state.server_public_key, state.http_options),
+          read_ahead
+        )
 
       {:error, reason} ->
         close(state, reason, [])

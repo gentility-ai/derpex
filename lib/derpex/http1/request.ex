@@ -29,4 +29,15 @@ defmodule Derpex.HTTP1.Request do
       [] -> target
     end
   end
+
+  @doc "Returns a decoded query parameter, matching Go URL.Query().Get."
+  @spec query_param(t(), binary()) :: binary() | nil
+  def query_param(%__MODULE__{target: target}, name) do
+    case :binary.split(target, "?", [:global]) do
+      [_path, query | _rest] -> query |> URI.decode_query() |> Map.get(name)
+      [_path] -> nil
+    end
+  rescue
+    ArgumentError -> nil
+  end
 end
