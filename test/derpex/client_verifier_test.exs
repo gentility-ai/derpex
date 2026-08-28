@@ -31,6 +31,30 @@ defmodule Derpex.ClientVerifierTest do
     refute_receive :verifier_called
   end
 
+  test "verifier chains run in order and stop at the first denial" do
+    parent = self()
+
+    verifiers = [
+      fn _request ->
+        send(parent, :first_verifier)
+        :ok
+      end,
+      fn _request ->
+        send(parent, :second_verifier)
+        {:error, :denied}
+      end,
+      fn _request ->
+        send(parent, :third_verifier)
+        :ok
+      end
+    ]
+
+    assert ClientVerifier.verify(verifiers, request(false)) == {:error, :denied}
+    assert_receive :first_verifier
+    assert_receive :second_verifier
+    refute_receive :third_verifier
+  end
+
   defp request(mesh_peer?) do
     %Request{
       node_key: :binary.copy(<<7>>, 32),

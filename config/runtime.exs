@@ -46,6 +46,8 @@ if config_env() == :prod do
     gentility_adapter_text = System.get_env("DERPEX_GENTILITY_ADAPTER")
     verify_clients_text = System.get_env("DERPEX_VERIFY_CLIENTS", "0")
     tailscaled_socket = System.get_env("DERPEX_TAILSCALED_SOCKET")
+    verify_client_url_text = System.get_env("DERPEX_VERIFY_CLIENT_URL")
+    verify_client_fail_open_text = System.get_env("DERPEX_VERIFY_CLIENT_URL_FAIL_OPEN", "1")
 
     send_queue_depth_text =
       System.get_env("DERPEX_SEND_QUEUE_DEPTH") ||
@@ -338,24 +340,57 @@ if config_env() == :prod do
         _short -> raise "DERPEX_OPERATIONS_TOKEN must contain at least 16 bytes"
       end
 
+    client_verifiers =
+      if verify_clients? do
+        timeout_ms = parse_milliseconds.("DERPEX_LOCALAPI_TIMEOUT_MS", 5_000, 1)
+
+        max_response_bytes =
+          parse_milliseconds.("DERPEX_LOCALAPI_MAX_RESPONSE_BYTES", 1_048_576, 1)
+
+        verifier_options = [
+          socket_path: tailscaled_socket || Derpex.LocalAPI.default_socket_path(),
+          timeout_ms: timeout_ms,
+          max_response_bytes: max_response_bytes
+        ]
+
+        [{Derpex.LocalAPI, verifier_options}]
+      else
+        []
+      end
+
+    client_verifiers =
+      case verify_client_url_text do
+        nil ->
+          client_verifiers
+
+        url ->
+          fail_open? =
+            case verify_client_fail_open_text do
+              "0" -> false
+              "1" -> true
+              _invalid -> raise "DERPEX_VERIFY_CLIENT_URL_FAIL_OPEN must be 0 or 1"
+            end
+
+          parsed_url =
+            case Derpex.HTTPAdmission.parse_url(url) do
+              {:ok, parsed_url} ->
+                parsed_url
+
+              {:error, _reason} ->
+                raise "DERPEX_VERIFY_CLIENT_URL must be an absolute HTTP(S) URL"
+            end
+
+          client_verifiers ++
+            [{Derpex.HTTPAdmission, [url: parsed_url, fail_open: fail_open?]}]
+      end
+
     handler_options =
       [send_queue_depth: send_queue_depth, operations: operations]
       |> then(fn options ->
-        if verify_clients? do
-          timeout_ms = parse_milliseconds.("DERPEX_LOCALAPI_TIMEOUT_MS", 5_000, 1)
-
-          max_response_bytes =
-            parse_milliseconds.("DERPEX_LOCALAPI_MAX_RESPONSE_BYTES", 1_048_576, 1)
-
-          verifier_options = [
-            socket_path: tailscaled_socket || Derpex.LocalAPI.default_socket_path(),
-            timeout_ms: timeout_ms,
-            max_response_bytes: max_response_bytes
-          ]
-
-          Keyword.put(options, :client_verifier, {Derpex.LocalAPI, verifier_options})
-        else
+        if client_verifiers == [] do
           options
+        else
+          Keyword.put(options, :client_verifier, client_verifiers)
         end
       end)
       |> then(fn options ->

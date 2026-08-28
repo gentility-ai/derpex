@@ -78,6 +78,14 @@ default. The wall timeout and response cap default to 5 seconds and 1 MiB and
 are configurable with `DERPEX_LOCALAPI_TIMEOUT_MS` and
 `DERPEX_LOCALAPI_MAX_RESPONSE_BYTES`.
 
+`DERPEX_VERIFY_CLIENT_URL` adds the pinned HTTP admission-controller check
+after local tailscaled verification. The controller receives
+`{"NodePublic":"nodekey:<hex>","Source":"<ip>"}` and must return HTTP 200
+with `{"Allow":true}` within 5 seconds; response bodies are capped at 4 KiB.
+Transport unavailability fails open by default, matching upstream. Set
+`DERPEX_VERIFY_CLIENT_URL_FAIL_OPEN=0` to fail closed. Denials, non-200
+statuses, malformed responses, and oversized responses always fail closed.
+
 Set `DERPEX_RATE_CONFIG` to an upstream-compatible JSON file containing
 `PerClientRateLimitBytesPerSec` and `PerClientRateBurstBytes`. Enabled buckets
 are clamped to hold at least one maximum DERP packet, and live updates through

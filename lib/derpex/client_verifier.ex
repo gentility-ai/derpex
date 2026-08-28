@@ -3,7 +3,8 @@ defmodule Derpex.ClientVerifier do
 
   alias Derpex.Admission.Request
 
-  @type verifier :: nil | module() | {module(), term()} | (Request.t() -> result())
+  @type verifier ::
+          nil | module() | {module(), term()} | (Request.t() -> result()) | [verifier()]
   @type result :: :ok | {:error, term()}
 
   @callback verify(Request.t(), term()) :: result()
@@ -12,6 +13,15 @@ defmodule Derpex.ClientVerifier do
   @spec verify(verifier(), Request.t()) :: result()
   def verify(_verifier, %Request{mesh_peer?: true}), do: :ok
   def verify(nil, %Request{}), do: :ok
+
+  def verify(verifiers, %Request{} = request) when is_list(verifiers) do
+    Enum.reduce_while(verifiers, :ok, fn verifier, :ok ->
+      case verify(verifier, request) do
+        :ok -> {:cont, :ok}
+        {:error, _reason} = error -> {:halt, error}
+      end
+    end)
+  end
 
   def verify(verifier, %Request{} = request) when is_function(verifier, 1) do
     verifier.(request) |> normalize_result()
