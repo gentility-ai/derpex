@@ -12,8 +12,8 @@ disposition map and review that change together with `interop/upstream.lock`.
 | State | Count |
 | --- | ---: |
 | Total | 69 |
-| Ported | 22 |
-| Pending (release-blocking) | 43 |
+| Ported | 23 |
+| Pending (release-blocking) | 42 |
 | Implementation-specific | 4 |
 
 | Area | Upstream test | Source | Disposition | Gate/notes |
@@ -34,7 +34,7 @@ disposition map and review that change together with `interop/upstream.lock`.
 | DERP framing/client | `TestServerRepliesToPing` | `derp/derp_test.go:992` | `ported` | unchanged official client ping/pong gate in test/interop/go_client_test.exs |
 | DERP server | `TestSetMeshKey` | `derp/derpserver/derpserver_test.go:45` | `ported` | ported parser and validation cases in test/derpex/mesh_key_test.exs |
 | DERP server | `TestIsMeshPeer` | `derp/derpserver/derpserver_test.go:85` | `ported` | ported constant-time trust cases in test/derpex/mesh_key_test.exs |
-| DERP server | `TestVerifyClientDisallowedAppNames` | `derp/derpserver/derpserver_test.go:138` | `pending` | release-blocking mapping not yet implemented |
+| DERP server | `TestVerifyClientDisallowedAppNames` | `derp/derpserver/derpserver_test.go:138` | `ported` | unchanged official clients cover exact app-name rejection and trusted mesh bypass |
 | DERP server | `TestRecvClientKeyAppName` | `derp/derpserver/derpserver_test.go:169` | `ported` | ported encrypted ClientInfo and app-name validation in handshake and client-info tests |
 | DERP server | `TestForwarderRegistration` | `derp/derpserver/derpserver_test.go:221` | `pending` | release-blocking mapping not yet implemented |
 | DERP server | `TestMultiForwarder` | `derp/derpserver/derpserver_test.go:349` | `pending` | release-blocking mapping not yet implemented |

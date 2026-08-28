@@ -3,6 +3,8 @@ defmodule Derpex.Listener.Handler do
 
   use ThousandIsland.Handler
 
+  alias Derpex.Admission
+  alias Derpex.Admission.Request, as: AdmissionRequest
   alias Derpex.Clock
   alias Derpex.Crypto
   alias Derpex.Outbox.Ring
@@ -17,6 +19,13 @@ defmodule Derpex.Listener.Handler do
   def handle_connection(socket, options) do
     server_private_key = Keyword.fetch!(options, :server_private_key)
     mesh_key = Keyword.get(options, :mesh_key)
+    admission_policy = Keyword.get(options, :admission)
+
+    disallowed_app_names =
+      options
+      |> Keyword.get(:disallowed_app_names, [])
+      |> MapSet.new()
+
     event_handler = Keyword.get(options, :event_handler, fn _event -> :ok end)
 
     with {:ok, server_public_key} <- Crypto.public_key(server_private_key),
@@ -52,6 +61,9 @@ defmodule Derpex.Listener.Handler do
         client_public_key: nil,
         client_info: nil,
         can_mesh: false,
+        admission_policy: admission_policy,
+        admission_context: %{},
+        disallowed_app_names: disallowed_app_names,
         server_public_key: server_public_key,
         remote_address: remote_address(socket)
       }
@@ -122,6 +134,7 @@ defmodule Derpex.Listener.Handler do
   defp continue_after_actions(socket, state, actions) do
     case execute_actions(socket, state, actions) do
       {:ok, state} -> {:continue, state}
+      {:error, {:admission, _reason}, state} -> {:close, state}
       {:error, reason, state} -> {:error, reason, state}
     end
   end
@@ -161,23 +174,13 @@ defmodule Derpex.Listener.Handler do
   end
 
   defp execute_action(_socket, state, {:authenticated, key, info, can_mesh}) do
-    presence = presence(state, info, can_mesh)
+    case admit(state, key, info, can_mesh) do
+      {:ok, admission_context} ->
+        register_authenticated(state, key, info, can_mesh, admission_context)
 
-    :ok =
-      Router.register(
-        key,
-        self(),
-        state.ordinary,
-        state.disco,
-        state.lifecycle,
-        presence
-      )
-
-    state
-    |> Map.put(:client_public_key, key)
-    |> Map.put(:client_info, info)
-    |> Map.put(:can_mesh, can_mesh)
-    |> dispatch_event({:authenticated, key, info})
+      {:error, reason} ->
+        {:error, {:admission, reason}, state}
+    end
   end
 
   defp execute_action(_socket, state, {:client_message, message}) do
@@ -297,6 +300,7 @@ defmodule Derpex.Listener.Handler do
       {:ok, session, actions} ->
         case execute_actions(socket, %{state | session: session}, actions) do
           {:ok, state} -> process_websocket_events(socket, state, rest)
+          {:error, {:admission, _reason}, state} -> {:close, state}
           {:error, reason, state} -> {:error, reason, state}
         end
 
@@ -343,6 +347,51 @@ defmodule Derpex.Listener.Handler do
   end
 
   defp close_ring(_ring), do: :ok
+
+  defp admit(state, key, info, can_mesh) do
+    request = %AdmissionRequest{
+      node_key: key,
+      client_info: info,
+      source_ip: elem(state.remote_address, 0),
+      mesh_peer?: can_mesh,
+      metadata: Session.info(state.session).metadata
+    }
+
+    with :ok <- app_name_allowed(state.disallowed_app_names, request) do
+      Admission.authorize(state.admission_policy, request)
+    end
+  end
+
+  defp app_name_allowed(_disallowed, %AdmissionRequest{mesh_peer?: true}), do: :ok
+
+  defp app_name_allowed(disallowed, %AdmissionRequest{client_info: info}) do
+    if MapSet.member?(disallowed, info.app_name) do
+      {:error, {:disallowed_app_name, info.app_name}}
+    else
+      :ok
+    end
+  end
+
+  defp register_authenticated(state, key, info, can_mesh, admission_context) do
+    presence = presence(state, info, can_mesh)
+
+    :ok =
+      Router.register(
+        key,
+        self(),
+        state.ordinary,
+        state.disco,
+        state.lifecycle,
+        presence
+      )
+
+    state
+    |> Map.put(:client_public_key, key)
+    |> Map.put(:client_info, info)
+    |> Map.put(:can_mesh, can_mesh)
+    |> Map.put(:admission_context, admission_context)
+    |> dispatch_event({:authenticated, key, info})
+  end
 
   defp remote_address(socket) do
     case Transport.peername(socket) do

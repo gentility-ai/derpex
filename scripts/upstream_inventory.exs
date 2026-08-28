@@ -50,6 +50,8 @@ defmodule Derpex.UpstreamInventory do
       "ported parser and validation cases in test/derpex/mesh_key_test.exs",
     {"derp/derpserver/derpserver_test.go", "TestIsMeshPeer"} =>
       "ported constant-time trust cases in test/derpex/mesh_key_test.exs",
+    {"derp/derpserver/derpserver_test.go", "TestVerifyClientDisallowedAppNames"} =>
+      "unchanged official clients cover exact app-name rejection and trusted mesh bypass",
     {"derp/derpserver/derpserver_test.go", "TestRecvClientKeyAppName"} =>
       "ported encrypted ClientInfo and app-name validation in handshake and client-info tests",
     {"cmd/derper/derper_test.go", "TestNoContent"} =>

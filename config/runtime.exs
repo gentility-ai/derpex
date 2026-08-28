@@ -20,6 +20,7 @@ if config_env() == :prod do
     keyfile = System.get_env("DERPEX_TLS_KEYFILE")
     clear_http? = System.get_env("DERPEX_CLEAR_HTTP") == "1"
     mesh_key_text = System.get_env("DERPEX_MESH_KEY")
+    disallowed_app_names_text = System.get_env("DERPEX_DISALLOWED_APP_NAMES")
     stun_port_text = System.get_env("DERPEX_STUN_PORT", "3478")
 
     mesh_key =
@@ -69,12 +70,30 @@ if config_env() == :prod do
           raise "set DERPEX_TLS_CERTFILE and DERPEX_TLS_KEYFILE, or explicitly opt into DERPEX_CLEAR_HTTP=1"
       end
 
-    listener =
-      if mesh_key do
-        Keyword.put(listener, :handler_options, mesh_key: mesh_key)
-      else
-        listener
+    disallowed_app_names =
+      case disallowed_app_names_text do
+        nil -> []
+        "" -> []
+        names -> String.split(names, ",", trim: false)
       end
+
+    handler_options =
+      []
+      |> then(fn options ->
+        if mesh_key, do: Keyword.put(options, :mesh_key, mesh_key), else: options
+      end)
+      |> then(fn options ->
+        if disallowed_app_names == [] do
+          options
+        else
+          Keyword.put(options, :disallowed_app_names, disallowed_app_names)
+        end
+      end)
+
+    listener =
+      if handler_options == [],
+        do: listener,
+        else: Keyword.put(listener, :handler_options, handler_options)
 
     config :derpex,
       identity_path: identity_path,

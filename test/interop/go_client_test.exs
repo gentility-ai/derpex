@@ -331,4 +331,45 @@ defmodule Derpex.Interop.GoClientTest do
     assert output =~
              "official Go mesh watcher observed snapshot, app names, flags, and disconnects"
   end
+
+  test "official clients observe app-name admission and mesh bypass" do
+    upstream = System.fetch_env!("DERPEX_TAILSCALE_DIR")
+    {_server_public, server_private} = Crypto.generate_keypair()
+    mesh_key_hex = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+    mesh_key = Base.decode16!(mesh_key_hex, case: :mixed)
+
+    {:ok, server} =
+      ThousandIsland.start_link(
+        port: 0,
+        transport_options: [ip: {127, 0, 0, 1}],
+        num_acceptors: 1,
+        handler_module: Handler,
+        handler_options: [
+          server_private_key: server_private,
+          mesh_key: mesh_key,
+          disallowed_app_names: ["badapp", "worseapp"]
+        ]
+      )
+
+    on_exit(fn ->
+      if Process.alive?(server), do: Process.exit(server, :shutdown)
+    end)
+
+    {:ok, {_ip, port}} = ThousandIsland.listener_info(server)
+    helper = Path.expand("../../interop/go/admission_smoke.go", __DIR__)
+
+    {output, status} =
+      System.cmd(
+        "go",
+        ["run", helper, "http://127.0.0.1:#{port}/derp", mesh_key_hex],
+        cd: upstream,
+        stderr_to_stdout: true,
+        env: [{"GOTOOLCHAIN", "local"}]
+      )
+
+    assert status == 0, output
+
+    assert output =~
+             "official Go clients observed disallowed app rejection and trusted mesh bypass"
+  end
 end

@@ -43,3 +43,8 @@ Regional connection watching is disabled unless `DERPEX_MESH_KEY` contains a
 64-digit hexadecimal key. Trusted clients advertise the same key in their
 encrypted `ClientInfo`; comparisons are constant-time and untrusted clients
 cannot subscribe to presence updates.
+
+`DERPEX_DISALLOWED_APP_NAMES` is an optional comma-separated list of exact
+client-advertised app names to reject before registration. Trusted mesh peers
+are exempt, matching the baseline server. Embedders can also supply a
+`Derpex.Admission` policy in listener handler options for product authorization.

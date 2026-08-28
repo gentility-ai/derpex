@@ -103,9 +103,96 @@ defmodule Derpex.Listener.HandlerTest do
     :gen_tcp.close(socket)
   end
 
+  test "admission runs before registration while trusted mesh peers bypass it" do
+    {server_public, server_private} = Crypto.generate_keypair()
+    mesh_key = :binary.copy(<<7>>, 32)
+    parent = self()
+
+    admission = fn request ->
+      send(parent, {:admission_called, request.node_key})
+      {:error, :policy_denied}
+    end
+
+    {:ok, server} =
+      ThousandIsland.start_link(
+        port: 0,
+        transport_options: [ip: {127, 0, 0, 1}],
+        num_acceptors: 1,
+        handler_module: Handler,
+        handler_options: [
+          server_private_key: server_private,
+          mesh_key: mesh_key,
+          admission: admission,
+          disallowed_app_names: ["badapp"]
+        ]
+      )
+
+    stop_server_on_exit(server)
+    {:ok, {_ip, port}} = ThousandIsland.listener_info(server)
+
+    {bad_public, bad_private} = Crypto.generate_keypair()
+
+    bad_socket =
+      connect_and_send_info(port, server_public, bad_private, %ClientInfo{app_name: "badapp"})
+
+    assert {:error, :closed} = :gen_tcp.recv(bad_socket, 0, 2_000)
+    refute_receive {:admission_called, ^bad_public}
+
+    {denied_public, denied_private} = Crypto.generate_keypair()
+    denied_socket = connect_and_send_info(port, server_public, denied_private, %ClientInfo{})
+    assert_receive {:admission_called, ^denied_public}, 2_000
+    assert {:error, :closed} = :gen_tcp.recv(denied_socket, 0, 2_000)
+
+    {mesh_public, mesh_private} = Crypto.generate_keypair()
+
+    mesh_socket =
+      connect_and_send_info(port, server_public, mesh_private, %ClientInfo{
+        app_name: "badapp",
+        mesh_key: mesh_key
+      })
+
+    assert {:ok, <<server_info_type, length::unsigned-big-32>>} =
+             :gen_tcp.recv(mesh_socket, 5, 2_000)
+
+    assert server_info_type == Frame.type(:server_info)
+    assert {:ok, _server_info_body} = :gen_tcp.recv(mesh_socket, length, 2_000)
+    refute_receive {:admission_called, ^mesh_public}
+
+    :gen_tcp.close(bad_socket)
+    :gen_tcp.close(denied_socket)
+    :gen_tcp.close(mesh_socket)
+  end
+
   defp stop_server_on_exit(server) do
     on_exit(fn ->
       if Process.alive?(server), do: Process.exit(server, :shutdown)
     end)
+  end
+
+  defp connect_and_send_info(port, server_public, client_private, client_info) do
+    {:ok, socket} = :gen_tcp.connect({127, 0, 0, 1}, port, [:binary, active: false])
+
+    request =
+      "GET /derp HTTP/1.1\r\nHost: localhost\r\nUpgrade: DERP\r\nConnection: Upgrade\r\n\r\n"
+
+    :ok = :gen_tcp.send(socket, request)
+
+    expected_response =
+      "HTTP/1.1 101 Switching Protocols\r\n" <>
+        "Upgrade: DERP\r\n" <>
+        "Connection: Upgrade\r\n" <>
+        "Derp-Version: 2\r\n" <>
+        "Derp-Public-Key: #{Base.encode16(server_public, case: :lower)}\r\n\r\n"
+
+    assert {:ok, ^expected_response} =
+             :gen_tcp.recv(socket, byte_size(expected_response), 2_000)
+
+    assert {:ok, <<server_key_type, 40::unsigned-big-32>>} = :gen_tcp.recv(socket, 5, 2_000)
+    assert server_key_type == Frame.type(:server_key)
+    assert {:ok, _greeting} = :gen_tcp.recv(socket, 40, 2_000)
+
+    {:ok, client_frame} = Handshake.client_info_frame(client_private, server_public, client_info)
+    :ok = :gen_tcp.send(socket, client_frame)
+    socket
   end
 end
