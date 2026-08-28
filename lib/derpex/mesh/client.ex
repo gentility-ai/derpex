@@ -345,7 +345,12 @@ defmodule Derpex.Mesh.Client do
         last_error: reason
     }
 
-    if was_connected?, do: dispatch_event(state, {:disconnected, reason})
+    if was_connected? do
+      dispatch_event(state, {:disconnected, reason})
+    else
+      dispatch_event(state, {:connect_error, reason})
+    end
+
     schedule_reconnect(state)
   end
 

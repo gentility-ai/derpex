@@ -12,8 +12,8 @@ disposition map and review that change together with `interop/upstream.lock`.
 | State | Count |
 | --- | ---: |
 | Total | 69 |
-| Ported | 37 |
-| Pending (release-blocking) | 28 |
+| Ported | 40 |
+| Pending (release-blocking) | 25 |
 | Implementation-specific | 4 |
 
 | Area | Upstream test | Source | Disposition | Gate/notes |
@@ -64,9 +64,9 @@ disposition map and review that change together with `interop/upstream.lock`.
 | DERP HTTP | `TestRunWatchConnectionLoopServeConnect` | `derp/derphttp/derphttp_test.go:443` | `ported` | adapted in test/derpex/mesh/client_test.exs; authenticated watch and permanent self-connect detection covered |
 | DERP HTTP | `TestLocalAddrNoMutex` | `derp/derphttp/derphttp_test.go:489` | `pending` | release-blocking mapping not yet implemented |
 | DERP HTTP | `TestProbe` | `derp/derphttp/derphttp_test.go:498` | `ported` | ported in test/derpex/http1_test.exs; both probe paths and upgrade-required behavior |
-| DERP HTTP | `TestNotifyError` | `derp/derphttp/derphttp_test.go:519` | `pending` | release-blocking mapping not yet implemented |
-| DERP HTTP | `TestManualDial` | `derp/derphttp/derphttp_test.go:568` | `pending` | release-blocking mapping not yet implemented |
-| DERP HTTP | `TestURLDial` | `derp/derphttp/derphttp_test.go:595` | `pending` | release-blocking mapping not yet implemented |
+| DERP HTTP | `TestNotifyError` | `derp/derphttp/derphttp_test.go:519` | `ported` | adapted in test/derpex/mesh/client_test.exs; initial dial errors are reported before retry |
+| DERP HTTP | `TestManualDial` | `derp/derphttp/derphttp_test.go:568` | `ported` | adapted in test/derpex/mesh/client_test.exs; private dial host preserves the URL Host and TLS identity |
+| DERP HTTP | `TestURLDial` | `derp/derphttp/derphttp_test.go:595` | `ported` | adapted in test/derpex/mesh/client_test.exs with direct URL parsing, dialing, upgrade, and authentication |
 | DERP HTTP | `TestConnectThroughProxyHonorsDERPPort` | `derp/derphttp/derphttp_test.go:682` | `pending` | release-blocking mapping not yet implemented |
 | cmd/derper | `TestUnpublishedDNS` | `cmd/derper/bootstrap_dns_test.go:82` | `pending` | release-blocking mapping not yet implemented |
 | cmd/derper | `TestUnpublishedDNSEmptyList` | `cmd/derper/bootstrap_dns_test.go:134` | `pending` | release-blocking mapping not yet implemented |

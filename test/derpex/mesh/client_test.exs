@@ -40,7 +40,8 @@ defmodule Derpex.Mesh.ClientTest do
     client =
       start_supervised!(
         {Client,
-         url: "http://127.0.0.1:#{port}/derp",
+         url: "http://mesh.example.test:#{port}/derp",
+         dial_host: "127.0.0.1",
          private_key: local_private,
          mesh_key: mesh_key,
          reconnect_interval: 25,
@@ -143,6 +144,33 @@ defmodule Derpex.Mesh.ClientTest do
     refute_receive {:self_event, {:connected, _key}}, 100
   end
 
+  test "reports an initial dial failure before scheduling a retry" do
+    parent = self()
+    {_public_key, private_key} = Crypto.generate_keypair()
+    mesh_key = :crypto.strong_rand_bytes(32)
+
+    {:ok, listener} =
+      :gen_tcp.listen(0, [:binary, packet: :raw, active: false, reuseaddr: true])
+
+    {:ok, {_ip, unavailable_port}} = :inet.sockname(listener)
+    :gen_tcp.close(listener)
+
+    client =
+      start_supervised!(
+        {Client,
+         url: "http://127.0.0.1:#{unavailable_port}/derp",
+         private_key: private_key,
+         mesh_key: mesh_key,
+         connect_timeout: 250,
+         reconnect_interval: 60_000,
+         event_handler: fn event -> send(parent, {:dial_event, event}) end}
+      )
+
+    assert_receive {:dial_event, {:connect_error, {:connect, reason}}}, 2_000
+    assert reason in [:econnrefused, :timeout]
+    assert %{connected?: false, last_error: {:connect, ^reason}} = Client.status(client)
+  end
+
   defp fake_server(listener, server_private, mesh_key, remote_peer, parent) do
     fake_generation(listener, server_private, mesh_key, remote_peer, parent, 1)
     fake_generation(listener, server_private, mesh_key, remote_peer, parent, 2)
@@ -152,7 +180,8 @@ defmodule Derpex.Mesh.ClientTest do
 
   defp fake_generation(listener, server_private, mesh_key, remote_peer, parent, generation) do
     {:ok, socket} = :gen_tcp.accept(listener)
-    {:ok, _request, read_ahead} = receive_http_head(socket, "")
+    {:ok, request, read_ahead} = receive_http_head(socket, "")
+    true = request =~ "\r\nHost: mesh.example.test:"
     {:ok, server_key} = Handshake.server_key_frame(server_private)
 
     :ok =
