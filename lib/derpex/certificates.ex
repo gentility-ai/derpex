@@ -10,7 +10,18 @@ defmodule Derpex.Certificates do
     private_key = decode_private_key!(keyfile)
     meta_certificate = MetaCertificate.generate(server_public_key)
 
-    [certs_keys: [%{cert: certificates ++ [meta_certificate], key: private_key}]]
+    [
+      certs_keys: [
+        %{cert: append_meta_certificate(certificates, meta_certificate), key: private_key}
+      ]
+    ]
+  end
+
+  @doc "Returns a fresh provider chain with the DERP metacertificate appended."
+  @spec append_meta_certificate([binary()], binary()) :: [binary()]
+  def append_meta_certificate(certificates, meta_certificate)
+      when is_list(certificates) and is_binary(meta_certificate) do
+    certificates ++ [meta_certificate]
   end
 
   defp decode_certificates!(path) do

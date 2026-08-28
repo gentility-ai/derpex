@@ -56,12 +56,16 @@ defmodule Derpex.UpstreamInventory do
       "adapted in test/derpex/mesh/client_test.exs with direct URL parsing, dialing, upgrade, and authentication",
     {"derp/derpserver/derpserver_test.go", "TestMetaCert"} =>
       "ported certificate shape plus official TLS fast-start gate",
+    {"derp/derpserver/derpserver_test.go", "TestModifyTLSConfigToAddMetaCert"} =>
+      "adapted in test/derpex/certificates_test.exs; concurrent augmentation returns fresh chains without provider mutation",
     {"derp/derpserver/derpserver_test.go", "TestServerDupClients"} =>
       "ported lifecycle cases and unchanged official last-writer-active client gate",
     {"derp/derpserver/derpserver_test.go", "TestLimiter"} =>
       "ported shared burst, refill, zero-rate, disable, and pre-allocation rejection cases",
     {"derp/derpserver/derpserver_test.go", "TestGetPerClientSendQueueDepth"} =>
       "ported in test/derpex/send_queue_config_test.exs; empty/default and explicit depths preserved",
+    {"derp/derpserver/derpserver_test.go", "TestParseSSOutput"} =>
+      "ported in test/derpex/debug/ss_test.exs with IPv4, IPv6, counters, service names, and malformed rows",
     {"derp/derpserver/derpserver_test.go", "TestSenderCardinality"} =>
       "adapted in test/derpex/cardinality_test.exs with duplicate suppression and small-set estimates",
     {"derp/derpserver/derpserver_test.go", "TestSenderCardinality100"} =>
