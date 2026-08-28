@@ -95,8 +95,13 @@ jobs:
       - name: Fetch Elixir dependencies
         run: mix deps.get --only test
 
-      - name: Run unchanged official Go client smoke
-        run: mix test test/interop/go_client_test.exs --trace
+      - name: Check Go interoperability helpers
+        run: |
+          diff="$(gofmt -d interop/go)"
+          test -z "$diff" || { printf '%s\n' "$diff"; exit 1; }
+
+      - name: Run unchanged official Go client and tsnet-stack smokes
+        run: mix test test/interop/go_client_test.exs test/interop/tsnet_stack_test.exs --trace
 
   rust-interop:
     name: Official Rust client interoperability
