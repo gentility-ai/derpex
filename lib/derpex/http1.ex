@@ -7,6 +7,7 @@ defmodule Derpex.HTTP1 do
 
   alias Derpex.BootstrapDNS
   alias Derpex.Handshake
+  alias Derpex.HomePage
   alias Derpex.HTTP1.Request
   alias Derpex.HTTP1.Response
 
@@ -24,12 +25,20 @@ defmodule Derpex.HTTP1 do
       "/bootstrap-dns" ->
         bootstrap_dns(request, options)
 
+      "/" ->
+        home_page(options)
+
       path when path == "/derp" or binary_part(path, 0, min(byte_size(path), 6)) == "/derp/" ->
         upgrade(request, server_public_key)
 
       _path ->
         {:response, Response.encode(404, [], "404 page not found\n")}
     end
+  end
+
+  defp home_page(options) do
+    body = options |> Keyword.get(:home_page, []) |> HomePage.render()
+    {:response, Response.encode(200, [{"Content-Type", "text/html; charset=utf-8"}], body)}
   end
 
   defp bootstrap_dns(request, options) do

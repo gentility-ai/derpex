@@ -29,6 +29,7 @@ defmodule Derpex.Listener.Handler do
     accept_limiter = Keyword.get(options, :accept_limiter, AcceptLimiter)
     rate_controller = Keyword.get(options, :rate_controller, RateController)
     bootstrap_dns = Keyword.get(options, :bootstrap_dns, Derpex.BootstrapDNS)
+    home_page = Keyword.get(options, :home_page, [])
     remote_address = remote_address(socket)
 
     disallowed_app_names =
@@ -73,6 +74,7 @@ defmodule Derpex.Listener.Handler do
              [mesh_key: mesh_key, server_info: server_info]
              |> Keyword.merge(
                bootstrap_dns: bootstrap_dns,
+               home_page: home_page,
                remote_address: format_remote_address(remote_address)
              )
              |> Enum.reject(fn {_key, value} -> is_nil(value) end)
