@@ -12,8 +12,8 @@ disposition map and review that change together with `interop/upstream.lock`.
 | State | Count |
 | --- | ---: |
 | Total | 69 |
-| Ported | 50 |
-| Pending (release-blocking) | 15 |
+| Ported | 52 |
+| Pending (release-blocking) | 13 |
 | Implementation-specific | 4 |
 
 | Area | Upstream test | Source | Disposition | Gate/notes |
@@ -62,12 +62,12 @@ disposition map and review that change together with `interop/upstream.lock`.
 | DERP HTTP | `TestBreakWatcherConnRecv` | `derp/derphttp/derphttp_test.go:275` | `ported` | adapted in test/derpex/mesh/client_test.exs; a broken watch socket withdraws routes and reconnects |
 | DERP HTTP | `TestBreakWatcherConn` | `derp/derphttp/derphttp_test.go:356` | `ported` | adapted in test/derpex/mesh/client_test.exs; reconnect restores bounded forwarding |
 | DERP HTTP | `TestRunWatchConnectionLoopServeConnect` | `derp/derphttp/derphttp_test.go:443` | `ported` | adapted in test/derpex/mesh/client_test.exs; authenticated watch and permanent self-connect detection covered |
-| DERP HTTP | `TestLocalAddrNoMutex` | `derp/derphttp/derphttp_test.go:489` | `pending` | release-blocking mapping not yet implemented |
+| DERP HTTP | `TestLocalAddrNoMutex` | `derp/derphttp/derphttp_test.go:489` | `ported` | adapted with a lock-free ETS local-address snapshot and suspended-client regression test |
 | DERP HTTP | `TestProbe` | `derp/derphttp/derphttp_test.go:498` | `ported` | ported in test/derpex/http1_test.exs; both probe paths and upgrade-required behavior |
 | DERP HTTP | `TestNotifyError` | `derp/derphttp/derphttp_test.go:519` | `ported` | adapted in test/derpex/mesh/client_test.exs; initial dial errors are reported before retry |
 | DERP HTTP | `TestManualDial` | `derp/derphttp/derphttp_test.go:568` | `ported` | adapted in test/derpex/mesh/client_test.exs; private dial host preserves the URL Host and TLS identity |
 | DERP HTTP | `TestURLDial` | `derp/derphttp/derphttp_test.go:595` | `ported` | adapted in test/derpex/mesh/client_test.exs with direct URL parsing, dialing, upgrade, and authentication |
-| DERP HTTP | `TestConnectThroughProxyHonorsDERPPort` | `derp/derphttp/derphttp_test.go:682` | `pending` | release-blocking mapping not yet implemented |
+| DERP HTTP | `TestConnectThroughProxyHonorsDERPPort` | `derp/derphttp/derphttp_test.go:682` | `ported` | adapted with an end-to-end HTTP CONNECT tunnel that records the configured non-default DERP port |
 | cmd/derper | `TestUnpublishedDNS` | `cmd/derper/bootstrap_dns_test.go:82` | `pending` | release-blocking mapping not yet implemented |
 | cmd/derper | `TestUnpublishedDNSEmptyList` | `cmd/derper/bootstrap_dns_test.go:134` | `pending` | release-blocking mapping not yet implemented |
 | cmd/derper | `TestLookupMetric` | `cmd/derper/bootstrap_dns_test.go:188` | `pending` | release-blocking mapping not yet implemented |

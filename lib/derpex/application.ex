@@ -33,7 +33,13 @@ defmodule Derpex.Application do
         end
 
       {:ok,
-       [Derpex.Router, Derpex.Prober.PacketCache, rate_controller, accept_limiter] ++
+       [
+         Derpex.Router,
+         Derpex.Mesh.ClientAddressTable,
+         Derpex.Prober.PacketCache,
+         rate_controller,
+         accept_limiter
+       ] ++
          relay_children ++ stun_children}
     end
   end

@@ -50,12 +50,16 @@ defmodule Derpex.UpstreamInventory do
       "adapted in test/derpex/mesh/client_test.exs; reconnect restores bounded forwarding",
     {"derp/derphttp/derphttp_test.go", "TestRunWatchConnectionLoopServeConnect"} =>
       "adapted in test/derpex/mesh/client_test.exs; authenticated watch and permanent self-connect detection covered",
+    {"derp/derphttp/derphttp_test.go", "TestLocalAddrNoMutex"} =>
+      "adapted with a lock-free ETS local-address snapshot and suspended-client regression test",
     {"derp/derphttp/derphttp_test.go", "TestNotifyError"} =>
       "adapted in test/derpex/mesh/client_test.exs; initial dial errors are reported before retry",
     {"derp/derphttp/derphttp_test.go", "TestManualDial"} =>
       "adapted in test/derpex/mesh/client_test.exs; private dial host preserves the URL Host and TLS identity",
     {"derp/derphttp/derphttp_test.go", "TestURLDial"} =>
       "adapted in test/derpex/mesh/client_test.exs with direct URL parsing, dialing, upgrade, and authentication",
+    {"derp/derphttp/derphttp_test.go", "TestConnectThroughProxyHonorsDERPPort"} =>
+      "adapted with an end-to-end HTTP CONNECT tunnel that records the configured non-default DERP port",
     {"derp/derpserver/derpserver_test.go", "TestMetaCert"} =>
       "ported certificate shape plus official TLS fast-start gate",
     {"derp/derpserver/derpserver_test.go", "TestModifyTLSConfigToAddMetaCert"} =>

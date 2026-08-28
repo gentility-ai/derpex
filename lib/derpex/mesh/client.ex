@@ -16,6 +16,7 @@ defmodule Derpex.Mesh.Client do
   alias Derpex.Frame.Body
   alias Derpex.Frame.Decoder
   alias Derpex.Handshake
+  alias Derpex.Mesh.ClientAddressTable
   alias Derpex.Outbox.Ring
   alias Derpex.Router
 
@@ -44,6 +45,11 @@ defmodule Derpex.Mesh.Client do
   @spec status(GenServer.server()) :: status()
   def status(client), do: GenServer.call(client, :status)
 
+  @doc "Returns the cached local socket address without calling the client process."
+  @spec local_address(pid()) ::
+          {:ok, {:inet.ip_address(), :inet.port_number()}} | {:error, :not_connected}
+  def local_address(client) when is_pid(client), do: ClientAddressTable.fetch(client)
+
   @doc "Closes the active socket so tests and operators can force reconnection."
   @spec break_connection(GenServer.server()) :: :ok
   def break_connection(client), do: GenServer.call(client, :break_connection)
@@ -51,6 +57,7 @@ defmodule Derpex.Mesh.Client do
   @impl true
   def init(options) do
     with {:ok, endpoint} <- parse_endpoint(Keyword.fetch!(options, :url)),
+         {:ok, proxy} <- parse_proxy(Keyword.get(options, :proxy_url)),
          <<private_key::binary-size(32)>> <- Keyword.fetch!(options, :private_key),
          <<mesh_key::binary-size(32)>> <- Keyword.fetch!(options, :mesh_key),
          {:ok, local_public_key} <- Crypto.public_key(private_key) do
@@ -58,6 +65,7 @@ defmodule Derpex.Mesh.Client do
 
       state = %{
         endpoint: endpoint,
+        proxy: proxy,
         private_key: private_key,
         local_public_key: local_public_key,
         mesh_key: mesh_key,
@@ -142,6 +150,7 @@ defmodule Derpex.Mesh.Client do
 
   @impl true
   def terminate(_reason, state) do
+    ClientAddressTable.delete(self())
     _state = withdraw_remote_peers(state)
     close_socket(state.socket)
     cancel_reconnect(state.reconnect_timer)
@@ -157,7 +166,8 @@ defmodule Derpex.Mesh.Client do
         state = cancel_reconnect_timer(state)
 
         with {:ok, state} <- process_server_data(state, read_ahead),
-             :ok <- active_once(state.socket) do
+             :ok <- active_once(state.socket),
+             :ok <- cache_local_address(state.socket) do
           dispatch_event(state, {:connected, state.remote_server_key})
           {:noreply, %{state | last_error: nil}}
         else
@@ -332,6 +342,7 @@ defmodule Derpex.Mesh.Client do
 
   defp disconnect_and_retry(state, reason) do
     was_connected? = state.socket != nil
+    ClientAddressTable.delete(self())
     close_socket(state.socket)
     state = withdraw_remote_peers(state)
     close_ring(state.ring)
@@ -403,7 +414,7 @@ defmodule Derpex.Mesh.Client do
     ArgumentError -> :ok
   end
 
-  defp open_socket(state) do
+  defp open_socket(%{proxy: nil} = state) do
     endpoint = state.endpoint
     host = String.to_charlist(endpoint.dial_host)
     tcp_options = [:binary, packet: :raw, active: false, nodelay: true]
@@ -416,28 +427,119 @@ defmodule Derpex.Mesh.Client do
         end
 
       "https" ->
-        tls_options =
-          [
-            verify: :verify_peer,
-            cacerts: :public_key.cacerts_get(),
-            server_name_indication: String.to_charlist(endpoint.host),
-            customize_hostname_check: [
-              match_fun: :public_key.pkix_verify_hostname_match_fun(:https)
-            ],
-            versions: [:"tlsv1.3"],
-            alpn_advertised_protocols: ["http/1.1"]
-          ]
-          |> Keyword.merge(state.tls_options)
-          |> Keyword.put(:mode, :binary)
-          |> Keyword.put(:packet, :raw)
-          |> Keyword.put(:active, false)
-          |> Keyword.put(:nodelay, true)
-
-        case :ssl.connect(host, endpoint.port, tls_options, state.connect_timeout) do
+        case :ssl.connect(host, endpoint.port, tls_options(state), state.connect_timeout) do
           {:ok, socket} -> {:ok, {:ssl, socket}}
           {:error, reason} -> {:error, reason}
         end
     end
+  end
+
+  defp open_socket(state) do
+    proxy = state.proxy
+    tcp_options = [:binary, packet: :raw, active: false, nodelay: true]
+
+    case :gen_tcp.connect(
+           String.to_charlist(proxy.host),
+           proxy.port,
+           tcp_options,
+           state.connect_timeout
+         ) do
+      {:ok, socket} -> open_proxy_tunnel(state, socket)
+      {:error, reason} -> {:error, {:proxy_connect, reason}}
+    end
+  end
+
+  defp open_proxy_tunnel(state, socket) do
+    target = host_and_port(state.endpoint.host, state.endpoint.port)
+
+    result =
+      with :ok <- :gen_tcp.send(socket, proxy_connect_request(target, state.proxy)),
+           :ok <- receive_proxy_response(socket, "", state.connect_timeout) do
+        case state.endpoint.scheme do
+          "http" -> {:ok, {:tcp, socket}}
+          "https" -> wrap_proxy_tls(state, socket)
+        end
+      end
+
+    case result do
+      {:ok, _socket} = connected ->
+        connected
+
+      {:error, _reason} = error ->
+        :gen_tcp.close(socket)
+        error
+    end
+  end
+
+  defp wrap_proxy_tls(state, socket) do
+    case :ssl.connect(socket, tls_options(state), state.connect_timeout) do
+      {:ok, tls_socket} -> {:ok, {:ssl, tls_socket}}
+      {:error, reason} -> {:error, {:proxy_tls, reason}}
+    end
+  end
+
+  defp receive_proxy_response(_socket, buffer, _timeout)
+       when byte_size(buffer) > @max_http_head_bytes,
+       do: {:error, :proxy_response_too_large}
+
+  defp receive_proxy_response(socket, buffer, timeout) do
+    case :binary.match(buffer, "\r\n\r\n") do
+      {head_length, 4} ->
+        <<head::binary-size(^head_length), "\r\n\r\n", _read_ahead::binary>> = buffer
+
+        case :binary.split(head, "\r\n") do
+          [status_line | _headers] -> validate_proxy_status(status_line)
+        end
+
+      :nomatch ->
+        case :gen_tcp.recv(socket, 0, timeout) do
+          {:ok, data} -> receive_proxy_response(socket, buffer <> data, timeout)
+          {:error, reason} -> {:error, {:proxy_response, reason}}
+        end
+    end
+  end
+
+  defp validate_proxy_status(status_line) do
+    case :binary.split(status_line, " ", [:global]) do
+      [version, "200" | _rest] when version in ["HTTP/1.0", "HTTP/1.1"] -> :ok
+      _other -> {:error, {:proxy_status, status_line}}
+    end
+  end
+
+  defp proxy_connect_request(target, proxy) do
+    [
+      "CONNECT ",
+      target,
+      " HTTP/1.1\r\nHost: ",
+      target,
+      "\r\n",
+      proxy_authorization(proxy.userinfo),
+      "\r\n"
+    ]
+  end
+
+  defp proxy_authorization(nil), do: []
+
+  defp proxy_authorization(userinfo) do
+    ["Proxy-Authorization: Basic ", Base.encode64(URI.decode(userinfo)), "\r\n"]
+  end
+
+  defp tls_options(state) do
+    [
+      verify: :verify_peer,
+      cacerts: :public_key.cacerts_get(),
+      server_name_indication: String.to_charlist(state.endpoint.host),
+      customize_hostname_check: [
+        match_fun: :public_key.pkix_verify_hostname_match_fun(:https)
+      ],
+      versions: [:"tlsv1.3"],
+      alpn_advertised_protocols: ["http/1.1"]
+    ]
+    |> Keyword.merge(state.tls_options)
+    |> Keyword.put(:mode, :binary)
+    |> Keyword.put(:packet, :raw)
+    |> Keyword.put(:active, false)
+    |> Keyword.put(:nodelay, true)
   end
 
   defp receive_http_upgrade(socket, timeout),
@@ -537,6 +639,26 @@ defmodule Derpex.Mesh.Client do
 
   defp parse_endpoint(_url), do: {:error, :invalid_url}
 
+  defp parse_proxy(nil), do: {:ok, nil}
+
+  defp parse_proxy(url) when is_binary(url) do
+    uri = URI.parse(url)
+
+    with "http" <- uri.scheme,
+         host when is_binary(host) and host != "" <- uri.host,
+         port when port in 1..65_535 <- uri.port do
+      {:ok, %{host: host, port: port, userinfo: uri.userinfo}}
+    else
+      _invalid -> {:error, :invalid_proxy_url}
+    end
+  end
+
+  defp parse_proxy(_url), do: {:error, :invalid_proxy_url}
+
+  defp host_and_port(host, port) do
+    if String.contains?(host, ":"), do: "[#{host}]:#{port}", else: "#{host}:#{port}"
+  end
+
   defp socket_send({:tcp, socket}, data), do: :gen_tcp.send(socket, data)
   defp socket_send({:ssl, socket}, data), do: :ssl.send(socket, data)
 
@@ -545,6 +667,28 @@ defmodule Derpex.Mesh.Client do
 
   defp active_once({:tcp, socket}), do: :inet.setopts(socket, active: :once)
   defp active_once({:ssl, socket}), do: :ssl.setopts(socket, active: :once)
+
+  defp cache_local_address({:tcp, socket}) do
+    case :inet.sockname(socket) do
+      {:ok, address} ->
+        ClientAddressTable.put(self(), address)
+        :ok
+
+      {:error, reason} ->
+        {:error, {:local_address, reason}}
+    end
+  end
+
+  defp cache_local_address({:ssl, socket}) do
+    case :ssl.sockname(socket) do
+      {:ok, address} ->
+        ClientAddressTable.put(self(), address)
+        :ok
+
+      {:error, reason} ->
+        {:error, {:local_address, reason}}
+    end
+  end
 
   defp close_socket(nil), do: :ok
   defp close_socket({:tcp, socket}), do: :gen_tcp.close(socket)

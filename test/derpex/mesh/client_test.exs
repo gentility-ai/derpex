@@ -56,6 +56,21 @@ defmodule Derpex.Mesh.ClientTest do
     assert_receive {:mesh_event, {:connected, ^server_public}}, 2_000
     assert_receive {:fake_pong, 1, "12345678"}, 2_000
 
+    assert {:ok, {{127, 0, 0, 1}, local_port}} = Client.local_address(client)
+    assert local_port in 1..65_535
+
+    :ok = :sys.suspend(client)
+
+    try do
+      started_at = System.monotonic_time()
+      assert Client.local_address(client) == {:ok, {{127, 0, 0, 1}, local_port}}
+
+      assert System.monotonic_time() - started_at <
+               System.convert_time_unit(100, :millisecond, :native)
+    after
+      :ok = :sys.resume(client)
+    end
+
     source = :crypto.strong_rand_bytes(32)
     assert Router.route(source, remote_peer, "first hop") in [{:ok, :wake}, {:ok, :coalesced}]
     assert_receive {:fake_forward, 1, ^source, ^remote_peer, "first hop"}, 2_000
@@ -169,6 +184,52 @@ defmodule Derpex.Mesh.ClientTest do
     assert_receive {:dial_event, {:connect_error, {:connect, reason}}}, 2_000
     assert reason in [:econnrefused, :timeout]
     assert %{connected?: false, last_error: {:connect, ^reason}} = Client.status(client)
+    assert Client.local_address(client) == {:error, :not_connected}
+  end
+
+  test "CONNECT proxy targets the configured non-default DERP port" do
+    parent = self()
+    {_server_public, server_private} = Crypto.generate_keypair()
+    {_local_public, local_private} = Crypto.generate_keypair()
+    mesh_key = :crypto.strong_rand_bytes(32)
+
+    {:ok, derp_listener} =
+      :gen_tcp.listen(0, [:binary, packet: :raw, active: false, reuseaddr: true])
+
+    {:ok, {_ip, derp_port}} = :inet.sockname(derp_listener)
+
+    derp_server =
+      spawn(fn ->
+        fake_proxy_derp_server(derp_listener, server_private, mesh_key, parent)
+      end)
+
+    {:ok, proxy_listener} =
+      :gen_tcp.listen(0, [:binary, packet: :raw, active: false, reuseaddr: true])
+
+    {:ok, {_ip, proxy_port}} = :inet.sockname(proxy_listener)
+    proxy = spawn(fn -> fake_connect_proxy(proxy_listener, parent) end)
+
+    on_exit(fn ->
+      :gen_tcp.close(derp_listener)
+      :gen_tcp.close(proxy_listener)
+      if Process.alive?(derp_server), do: Process.exit(derp_server, :kill)
+      if Process.alive?(proxy), do: Process.exit(proxy, :kill)
+    end)
+
+    client =
+      start_supervised!(
+        {Client,
+         url: "http://127.0.0.1:#{derp_port}/derp",
+         proxy_url: "http://127.0.0.1:#{proxy_port}",
+         private_key: local_private,
+         mesh_key: mesh_key,
+         reconnect_interval: 60_000}
+      )
+
+    expected_target = "127.0.0.1:#{derp_port}"
+    assert_receive {:proxy_target, ^expected_target}, 2_000
+    assert_receive :proxy_derp_authenticated, 2_000
+    assert %{connected?: true} = Client.status(client)
   end
 
   defp fake_server(listener, server_private, mesh_key, remote_peer, parent) do
@@ -176,6 +237,86 @@ defmodule Derpex.Mesh.ClientTest do
     fake_generation(listener, server_private, mesh_key, remote_peer, parent, 2)
   rescue
     error -> send(parent, {:fake_error, error, __STACKTRACE__})
+  end
+
+  defp fake_proxy_derp_server(listener, server_private, mesh_key, parent) do
+    {:ok, socket} = :gen_tcp.accept(listener)
+    {:ok, _request, read_ahead} = receive_http_head(socket, "")
+    {:ok, server_key} = Handshake.server_key_frame(server_private)
+
+    :ok =
+      :gen_tcp.send(socket, [
+        "HTTP/1.1 101 Switching Protocols\r\nUpgrade: DERP\r\nConnection: Upgrade\r\n\r\n",
+        server_key
+      ])
+
+    {:ok, client_type, client_body, read_ahead} = receive_frame(socket, read_ahead)
+    true = client_type == Frame.type(:client_info)
+
+    {:ok, client_public, %ClientInfo{mesh_key: ^mesh_key}} =
+      Handshake.decode_client_info(client_body, server_private)
+
+    {:ok, watch_type, watch_body, ""} = receive_frame(socket, read_ahead)
+    {:ok, :watch_connections} = Body.decode_client(watch_type, watch_body)
+
+    {:ok, server_info} =
+      Handshake.server_info_frame(server_private, client_public, %ServerInfo{version: 2})
+
+    :ok = :gen_tcp.send(socket, server_info)
+    send(parent, :proxy_derp_authenticated)
+
+    receive do
+      :stop -> :gen_tcp.close(socket)
+    end
+  rescue
+    error -> send(parent, {:proxy_derp_error, error, __STACKTRACE__})
+  end
+
+  defp fake_connect_proxy(listener, parent) do
+    {:ok, client} = :gen_tcp.accept(listener)
+    {:ok, request, read_ahead} = receive_http_head(client, "")
+    [request_line | _headers] = :binary.split(request, "\r\n", [:global])
+    ["CONNECT", target, _version] = :binary.split(request_line, " ", [:global])
+    send(parent, {:proxy_target, target})
+
+    uri = URI.parse("http://#{target}")
+
+    {:ok, upstream} =
+      :gen_tcp.connect(String.to_charlist(uri.host), uri.port, [
+        :binary,
+        packet: :raw,
+        active: false
+      ])
+
+    :ok = :gen_tcp.send(client, "HTTP/1.1 200 OK\r\n\r\n")
+    if read_ahead != "", do: :ok = :gen_tcp.send(upstream, read_ahead)
+    proxy_relay(client, upstream)
+  rescue
+    error -> send(parent, {:proxy_error, error, __STACKTRACE__})
+  end
+
+  defp proxy_relay(client, upstream) do
+    :ok = :inet.setopts(client, active: :once)
+    :ok = :inet.setopts(upstream, active: :once)
+    proxy_relay_loop(client, upstream)
+  end
+
+  defp proxy_relay_loop(client, upstream) do
+    receive do
+      {:tcp, ^client, data} ->
+        :ok = :gen_tcp.send(upstream, data)
+        :ok = :inet.setopts(client, active: :once)
+        proxy_relay_loop(client, upstream)
+
+      {:tcp, ^upstream, data} ->
+        :ok = :gen_tcp.send(client, data)
+        :ok = :inet.setopts(upstream, active: :once)
+        proxy_relay_loop(client, upstream)
+
+      {:tcp_closed, socket} when socket in [client, upstream] ->
+        :gen_tcp.close(client)
+        :gen_tcp.close(upstream)
+    end
   end
 
   defp fake_generation(listener, server_private, mesh_key, remote_peer, parent, generation) do
