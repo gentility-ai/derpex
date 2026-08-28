@@ -171,3 +171,6 @@ jobs:
             test ! -e /opt/derpex/test
             /opt/derpex/bin/derpex eval "unless Derpex.Crypto.loaded?(), do: System.halt(1)"
           '
+
+      - name: Boot production TLS and hot-reload its certificate
+        run: scripts/runtime_smoke.sh derpex:ci
