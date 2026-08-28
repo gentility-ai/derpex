@@ -15,7 +15,12 @@ The native crate is built from source for prerelease versions:
 ```sh
 mix deps.get
 mix quality
+mix artifact.check
 ```
+
+`mix artifact.check` assembles the production OTP release, removes Rustler's
+build-time project templates, rejects Go/Rust source or toolchain files, and
+boots the packaged crypto NIF through the release executable.
 
 Go, Rust, and the pinned upstream repositories are conformance-test inputs
 only. Separate CI jobs exercise the unchanged Go clients, two real `tsnet`

@@ -49,6 +49,15 @@ defmodule Derpex.RuntimeVerifier do
 
     unless File.regular?(executable), do: abort("release executable is missing: #{executable}")
     unless Path.wildcard(nif_pattern) != [], do: abort("precompiled crypto NIF is missing")
+
+    {output, status} =
+      System.cmd(
+        executable,
+        ["eval", "unless Derpex.Crypto.loaded?(), do: System.halt(1)"],
+        stderr_to_stdout: true
+      )
+
+    unless status == 0, do: abort("release failed to load its crypto NIF:\n#{output}")
   end
 
   defp abort(message) do

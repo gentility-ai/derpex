@@ -29,6 +29,7 @@ defmodule Derpex.MixProject do
   def cli do
     [
       preferred_envs: [
+        "artifact.check": :prod,
         bench: :dev,
         quality: :test,
         "test.diff": :test,
@@ -53,6 +54,10 @@ defmodule Derpex.MixProject do
 
   defp aliases do
     [
+      "artifact.check": [
+        "release derpex --overwrite",
+        "run --no-start scripts/verify_runtime.exs _build/prod/rel/derpex"
+      ],
       bench: ["run bench/relay.exs"],
       "test.diff": ["test --include go_interop test/interop/differential_test.exs"],
       "test.interop": [
@@ -77,8 +82,18 @@ defmodule Derpex.MixProject do
     [
       derpex: [
         include_executables_for: [:unix],
-        strip_beams: Mix.env() == :prod
+        strip_beams: Mix.env() == :prod,
+        steps: [:assemble, &strip_build_only_release_files/1]
       ]
     ]
+  end
+
+  defp strip_build_only_release_files(release) do
+    release.path
+    |> Path.join("lib/rustler-*/priv/templates")
+    |> Path.wildcard()
+    |> Enum.each(&File.rm_rf!/1)
+
+    release
   end
 end

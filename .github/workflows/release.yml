@@ -180,6 +180,13 @@ jobs:
                 exit 1
               fi
             done
+            test ! -e /opt/derpex/native
+            test ! -e /opt/derpex/interop
+            test ! -e /opt/derpex/test
+            if find /opt/derpex -type f \( -name "*.go" -o -name "*.rs" \) | grep -q .; then
+              echo "forbidden Go/Rust source in runtime image" >&2
+              exit 1
+            fi
             /opt/derpex/bin/derpex eval "unless Derpex.Crypto.loaded?(), do: System.halt(1)"
           '
 
