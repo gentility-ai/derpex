@@ -32,7 +32,9 @@ defmodule Derpex.Application do
           config -> {Derpex.AcceptLimiter, config: config}
         end
 
-      {:ok, [Derpex.Router, rate_controller, accept_limiter | relay_children ++ stun_children]}
+      {:ok,
+       [Derpex.Router, Derpex.Prober.PacketCache, rate_controller, accept_limiter] ++
+         relay_children ++ stun_children}
     end
   end
 

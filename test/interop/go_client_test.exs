@@ -123,6 +123,37 @@ defmodule Derpex.Interop.GoClientTest do
     assert output =~ "official Go client obeyed DERPEX send limit"
   end
 
+  test "official DERP prober relays its bounded 100 MB transfer" do
+    upstream = System.fetch_env!("DERPEX_TAILSCALE_DIR")
+    {_server_public, server_private} = Crypto.generate_keypair()
+
+    {:ok, server} =
+      ThousandIsland.start_link(
+        port: 0,
+        transport_options: [ip: {127, 0, 0, 1}],
+        num_acceptors: 1,
+        handler_module: Handler,
+        handler_options: [server_private_key: server_private]
+      )
+
+    on_exit(fn ->
+      if Process.alive?(server), do: Process.exit(server, :shutdown)
+    end)
+
+    {:ok, {_ip, port}} = ThousandIsland.listener_info(server)
+    helper = Path.expand("../../interop/go/prober_smoke.go", __DIR__)
+
+    {output, status} =
+      System.cmd("go", ["run", helper, "http://127.0.0.1:#{port}/derp"],
+        cd: upstream,
+        stderr_to_stdout: true,
+        env: [{"GOTOOLCHAIN", "local"}]
+      )
+
+    assert status == 0, output
+    assert output =~ "official DERP prober relayed 100000000 bytes through DERPEX"
+  end
+
   test "duplicate official Go clients use last-writer-active routing" do
     upstream = System.fetch_env!("DERPEX_TAILSCALE_DIR")
     {_server_public, server_private} = Crypto.generate_keypair()

@@ -80,6 +80,41 @@ defmodule Derpex.Outbox.RingTest do
     assert Ring.stats(ring).tail_drops == 1
   end
 
+  test "producer and consumer contention does not drop below capacity" do
+    ring = Ring.new(32, wake_message: :ready)
+    parent = self()
+
+    consumer =
+      spawn(fn ->
+        Enum.each(1..10_000, fn expected ->
+          item = take_when_ready(ring)
+          send(parent, {:taken, item})
+
+          if item != expected do
+            exit({:out_of_order, expected, item})
+          end
+        end)
+      end)
+
+    monitor = Process.monitor(consumer)
+
+    Enum.each(1..10_000, fn sequence ->
+      if sequence > 30 do
+        assert_receive {:taken, expected} when expected == sequence - 30
+      end
+
+      assert Ring.enqueue(ring, sequence) in [{:ok, :wake}, {:ok, :coalesced}]
+    end)
+
+    Enum.each(9_971..10_000, fn expected ->
+      assert_receive {:taken, ^expected}
+    end)
+
+    assert_receive {:DOWN, ^monitor, :process, ^consumer, :normal}
+    assert Ring.stats(ring).tail_drops == 0
+    assert Ring.stats(ring).head_drops == 0
+  end
+
   test "recovers a producer killed before or after slot publication" do
     assert_stale_producer_recovery(:after_journal, :empty)
     assert_stale_producer_recovery(:after_publish, {:ok, :packet})
@@ -128,6 +163,13 @@ defmodule Derpex.Outbox.RingTest do
     else
       Process.sleep(1)
       eventually(fun, attempts - 1)
+    end
+  end
+
+  defp take_when_ready(ring) do
+    case Ring.take(ring) do
+      {:ok, item} -> item
+      _empty_or_busy -> take_when_ready(ring)
     end
   end
 end
