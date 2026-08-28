@@ -44,6 +44,8 @@ if config_env() == :prod do
       System.get_env("DERPEX_ACCEPT_MAX_TRACKED_IPS", "16384")
 
     gentility_adapter_text = System.get_env("DERPEX_GENTILITY_ADAPTER")
+    verify_clients_text = System.get_env("DERPEX_VERIFY_CLIENTS", "0")
+    tailscaled_socket = System.get_env("DERPEX_TAILSCALED_SOCKET")
 
     send_queue_depth_text =
       System.get_env("DERPEX_SEND_QUEUE_DEPTH") ||
@@ -64,6 +66,13 @@ if config_env() == :prod do
     tcp_keepalive_ms = parse_milliseconds.("DERPEX_TCP_KEEPALIVE_MS", 600_000, 1)
     tcp_user_timeout_ms = parse_milliseconds.("DERPEX_TCP_USER_TIMEOUT_MS", 15_000, 0)
     tcp_write_timeout_ms = parse_milliseconds.("DERPEX_TCP_WRITE_TIMEOUT_MS", 2_000, 0)
+
+    verify_clients? =
+      case verify_clients_text do
+        "0" -> false
+        "1" -> true
+        _invalid -> raise "DERPEX_VERIFY_CLIENTS must be 0 or 1"
+      end
 
     mesh_key =
       case mesh_key_text do
@@ -331,6 +340,24 @@ if config_env() == :prod do
 
     handler_options =
       [send_queue_depth: send_queue_depth, operations: operations]
+      |> then(fn options ->
+        if verify_clients? do
+          timeout_ms = parse_milliseconds.("DERPEX_LOCALAPI_TIMEOUT_MS", 5_000, 1)
+
+          max_response_bytes =
+            parse_milliseconds.("DERPEX_LOCALAPI_MAX_RESPONSE_BYTES", 1_048_576, 1)
+
+          verifier_options = [
+            socket_path: tailscaled_socket || Derpex.LocalAPI.default_socket_path(),
+            timeout_ms: timeout_ms,
+            max_response_bytes: max_response_bytes
+          ]
+
+          Keyword.put(options, :client_verifier, {Derpex.LocalAPI, verifier_options})
+        else
+          options
+        end
+      end)
       |> then(fn options ->
         if mesh_key, do: Keyword.put(options, :mesh_key, mesh_key), else: options
       end)

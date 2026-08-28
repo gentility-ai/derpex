@@ -6,6 +6,7 @@ defmodule Derpex.Listener.Handler do
   alias Derpex.AcceptLimiter
   alias Derpex.Admission
   alias Derpex.Admission.Request, as: AdmissionRequest
+  alias Derpex.ClientVerifier
   alias Derpex.Clock
   alias Derpex.Crypto
   alias Derpex.Disco
@@ -116,6 +117,7 @@ defmodule Derpex.Listener.Handler do
         connected_at: Clock.monotonic_time(:millisecond),
         admission_policy: admission_policy,
         admission_context: %{},
+        client_verifier: Keyword.get(options, :client_verifier),
         disallowed_app_names: disallowed_app_names,
         rate_controller: rate_controller,
         receive_limiter: nil,
@@ -546,6 +548,7 @@ defmodule Derpex.Listener.Handler do
     }
 
     with :ok <- app_name_allowed(state.disallowed_app_names, request),
+         :ok <- ClientVerifier.verify(state.client_verifier, request),
          {:ok, context} <- Admission.authorize(state.admission_policy, request) do
       {:ok, {context, request}}
     end

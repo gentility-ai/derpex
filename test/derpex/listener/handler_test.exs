@@ -155,6 +155,11 @@ defmodule Derpex.Listener.HandlerTest do
       {:error, :policy_denied}
     end
 
+    verifier = fn request ->
+      send(parent, {:verifier_called, request.node_key})
+      :ok
+    end
+
     {:ok, server} =
       ThousandIsland.start_link(
         port: 0,
@@ -164,6 +169,7 @@ defmodule Derpex.Listener.HandlerTest do
         handler_options: [
           server_private_key: server_private,
           mesh_key: mesh_key,
+          client_verifier: verifier,
           admission: admission,
           disallowed_app_names: ["badapp"]
         ]
@@ -178,10 +184,12 @@ defmodule Derpex.Listener.HandlerTest do
       connect_and_send_info(port, server_public, bad_private, %ClientInfo{app_name: "badapp"})
 
     assert {:error, :closed} = :gen_tcp.recv(bad_socket, 0, 2_000)
+    refute_receive {:verifier_called, ^bad_public}
     refute_receive {:admission_called, ^bad_public}
 
     {denied_public, denied_private} = Crypto.generate_keypair()
     denied_socket = connect_and_send_info(port, server_public, denied_private, %ClientInfo{})
+    assert_receive {:verifier_called, ^denied_public}, 2_000
     assert_receive {:admission_called, ^denied_public}, 2_000
     assert {:error, :closed} = :gen_tcp.recv(denied_socket, 0, 2_000)
 
@@ -198,6 +206,7 @@ defmodule Derpex.Listener.HandlerTest do
 
     assert server_info_type == Frame.type(:server_info)
     assert {:ok, _server_info_body} = :gen_tcp.recv(mesh_socket, length, 2_000)
+    refute_receive {:verifier_called, ^mesh_public}
     refute_receive {:admission_called, ^mesh_public}
 
     :gen_tcp.close(bad_socket)

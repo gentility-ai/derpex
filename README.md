@@ -69,6 +69,15 @@ upstream 30-second privileged timeout. Override the first three values with
 `DERPEX_TCP_WRITE_TIMEOUT_MS`; a write timeout of `0` disables that deadline.
 `TCP_USER_TIMEOUT` is a logged no-op outside Linux.
 
+Set `DERPEX_VERIFY_CLIENTS=1` to require every ordinary node key to exist in a
+local tailscaled peer map before product admission. DERPEX queries only
+`/localapi/v0/whois` over the tailscaled Unix socket and fails closed on a
+missing peer, timeout, malformed response, or unavailable daemon; trusted mesh
+peers bypass the check. `DERPEX_TAILSCALED_SOCKET` overrides the platform
+default. The wall timeout and response cap default to 5 seconds and 1 MiB and
+are configurable with `DERPEX_LOCALAPI_TIMEOUT_MS` and
+`DERPEX_LOCALAPI_MAX_RESPONSE_BYTES`.
+
 Set `DERPEX_RATE_CONFIG` to an upstream-compatible JSON file containing
 `PerClientRateLimitBytesPerSec` and `PerClientRateBurstBytes`. Enabled buckets
 are clamped to hold at least one maximum DERP packet, and live updates through
