@@ -34,5 +34,7 @@ bin/derpex start
 ```
 
 The server identity is created atomically with mode `0600` and is stable across
-restarts. Clear HTTP is available only through the explicit
-`DERPEX_CLEAR_HTTP=1` development setting.
+restarts. The UDP STUN service listens on port `3478` by default whenever the
+DERP listener is enabled. Set `DERPEX_STUN_PORT` to change it or
+`DERPEX_STUN=0` to disable it. Clear HTTP is available only through the
+explicit `DERPEX_CLEAR_HTTP=1` development setting.

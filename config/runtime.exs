@@ -19,6 +19,13 @@ if config_env() == :prod do
     certfile = System.get_env("DERPEX_TLS_CERTFILE")
     keyfile = System.get_env("DERPEX_TLS_KEYFILE")
     clear_http? = System.get_env("DERPEX_CLEAR_HTTP") == "1"
+    stun_port_text = System.get_env("DERPEX_STUN_PORT", "3478")
+
+    stun_port =
+      case Integer.parse(stun_port_text) do
+        {stun_port, ""} when stun_port in 1..65_535 -> stun_port
+        _invalid -> raise "DERPEX_STUN_PORT must be an integer from 1 through 65535"
+      end
 
     listener =
       cond do
@@ -49,6 +56,11 @@ if config_env() == :prod do
 
     config :derpex,
       identity_path: identity_path,
-      listeners: [listener]
+      listeners: [listener],
+      stun_listeners:
+        if(System.get_env("DERPEX_STUN") == "0",
+          do: [],
+          else: [[port: stun_port]]
+        )
   end
 end

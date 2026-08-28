@@ -6,6 +6,7 @@ defmodule Derpex.Interop.GoClientTest do
   alias Derpex.Certificates
   alias Derpex.Crypto
   alias Derpex.Listener.Handler
+  alias Derpex.STUN
 
   test "unchanged official derphttp.Client authenticates to DERPEX" do
     upstream =
@@ -275,5 +276,22 @@ defmodule Derpex.Interop.GoClientTest do
 
     assert relay_output =~
              "official Go clients relayed packet boundaries and observed both peer-gone reasons"
+  end
+
+  test "official STUN client observes its XOR-mapped UDP address" do
+    upstream = System.fetch_env!("DERPEX_TAILSCALE_DIR")
+    server = start_supervised!({STUN, ip: {127, 0, 0, 1}, port: 0})
+    {:ok, {{127, 0, 0, 1}, port}} = STUN.local_address(server)
+    helper = Path.expand("../../interop/go/stun_smoke.go", __DIR__)
+
+    {output, status} =
+      System.cmd("go", ["run", helper, "127.0.0.1:#{port}"],
+        cd: upstream,
+        stderr_to_stdout: true,
+        env: [{"GOTOOLCHAIN", "local"}]
+      )
+
+    assert status == 0, output
+    assert output =~ "official Go STUN client observed its XOR-mapped UDP address"
   end
 end
