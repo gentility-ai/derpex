@@ -48,6 +48,9 @@ if config_env() == :prod do
     tailscaled_socket = System.get_env("DERPEX_TAILSCALED_SOCKET")
     verify_client_url_text = System.get_env("DERPEX_VERIFY_CLIENT_URL")
     verify_client_fail_open_text = System.get_env("DERPEX_VERIFY_CLIENT_URL_FAIL_OPEN", "1")
+    debug_key_path = System.get_env("TS_DEBUG_KEY_PATH")
+    debug_allow_ip = System.get_env("TS_ALLOW_DEBUG_IP")
+    debug_trusted_cidrs_text = System.get_env("TS_DEBUG_TRUSTED_CIDRS")
 
     send_queue_depth_text =
       System.get_env("DERPEX_SEND_QUEUE_DEPTH") ||
@@ -340,6 +343,19 @@ if config_env() == :prod do
         _short -> raise "DERPEX_OPERATIONS_TOKEN must contain at least 16 bytes"
       end
 
+    debug_trusted_cidrs =
+      case Derpex.Debug.Access.parse_trusted_cidrs(debug_trusted_cidrs_text) do
+        {:ok, prefixes} ->
+          prefixes
+
+        {:error, {cidr, _reason}} ->
+          raise "invalid CIDR in TS_DEBUG_TRUSTED_CIDRS: #{inspect(cidr)}"
+      end
+
+    debug =
+      [key_path: debug_key_path, allow_ip: debug_allow_ip, trusted_cidrs: debug_trusted_cidrs]
+      |> Enum.reject(fn {_key, value} -> value in [nil, []] end)
+
     client_verifiers =
       if verify_clients? do
         timeout_ms = parse_milliseconds.("DERPEX_LOCALAPI_TIMEOUT_MS", 5_000, 1)
@@ -385,7 +401,7 @@ if config_env() == :prod do
       end
 
     handler_options =
-      [send_queue_depth: send_queue_depth, operations: operations]
+      [send_queue_depth: send_queue_depth, operations: operations, debug: debug]
       |> then(fn options ->
         if client_verifiers == [] do
           options

@@ -98,6 +98,69 @@ defmodule Derpex.Operations do
     |> Enum.map_join(fn {name, value} -> "#{name} #{numeric(value)}\n" end)
   end
 
+  @doc "Renders the bounded DERP expvar-compatible JSON object."
+  @spec expvar_json() :: binary()
+  def expvar_json do
+    core = safe(&Metrics.snapshot/0)
+    router = safe(&Router.stats/0)
+
+    %{"derp" => expvar_derp(core, router)}
+    |> :json.encode()
+    |> IO.iodata_to_binary()
+  end
+
+  defp expvar_derp({:ok, core}, {:ok, router}) do
+    %{
+      "accepts" => Map.get(core, :accepts, 0),
+      "average_queue_duration_ms" => Map.get(core, :average_queue_duration_ms, 0),
+      "bytes_received" => Map.get(core, :bytes_received, 0),
+      "bytes_sent" => Map.get(core, :bytes_sent, 0),
+      "counter_packets_received_kind" => %{
+        "disco" => Map.get(core, :packets_received_disco, 0),
+        "other" => Map.get(core, :packets_received_other, 0)
+      },
+      "counter_total_dup_client_conns" => Map.get(core, :counter_total_dup_client_conns, 0),
+      "gauge_clients_local" => Map.get(router, :clients_local, 0),
+      "gauge_clients_remote" => Map.get(router, :clients_remote, 0),
+      "gauge_clients_total" => Map.get(router, :clients_total, 0),
+      "gauge_current_connections" => Map.get(router, :current_connections, 0),
+      "gauge_current_dup_client_conns" => Map.get(router, :current_duplicate_connections, 0),
+      "gauge_current_dup_client_keys" => Map.get(router, :current_duplicate_client_keys, 0),
+      "gauge_current_home_connections" => drain_home_connections(),
+      "gauge_current_notideal_connections" => Map.get(router, :current_not_ideal_connections, 0),
+      "gauge_watchers" => Map.get(router, :watchers, 0),
+      "got_ping" => Map.get(core, :got_ping, 0),
+      "home_moves_in" => Map.get(core, :home_moves_in, 0),
+      "home_moves_out" => Map.get(core, :home_moves_out, 0),
+      "packets_forwarded_in" => Map.get(core, :packets_forwarded_in, 0),
+      "packets_forwarded_out" => Map.get(core, :packets_forwarded_out, 0),
+      "packets_received" => Map.get(core, :packets_received, 0),
+      "packets_sent" => Map.get(core, :packets_sent, 0),
+      "peer_gone_disconnected_frames" => Map.get(core, :peer_gone_disconnected_frames, 0),
+      "peer_gone_not_here_frames" => Map.get(core, :peer_gone_not_here_frames, 0),
+      "sent_pong" => Map.get(core, :sent_pong, 0),
+      "unknown_frames" => Map.get(core, :unknown_frames, 0),
+      "version" => version()
+    }
+  end
+
+  defp expvar_derp(_core, _router), do: %{"version" => version()}
+
+  defp drain_home_connections do
+    case safe(&Drain.stats/0) do
+      {:ok, stats} -> Map.get(stats, :home_connections, 0)
+      {:error, _reason} -> 0
+    end
+  end
+
+  defp version do
+    case Application.spec(:derpex, :vsn) do
+      version when is_list(version) -> List.to_string(version)
+      version when is_binary(version) -> version
+      _unknown -> "unknown"
+    end
+  end
+
   defp gentility_ready do
     case Process.whereis(Gentility) do
       nil ->

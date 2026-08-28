@@ -6,6 +6,7 @@ defmodule Derpex.HTTP1 do
   @moduledoc "HTTP routing for DERP upgrade, probes, and captive-portal checks."
 
   alias Derpex.BootstrapDNS
+  alias Derpex.Debug.Access
   alias Derpex.Handshake
   alias Derpex.HomePage
   alias Derpex.HTTP1.Request
@@ -38,7 +39,16 @@ defmodule Derpex.HTTP1 do
     do: protected(request, options, &metrics/0)
 
   defp route_path("/debug/check", request, _server_public_key, options),
-    do: protected(request, options, &consistency_check/0)
+    do: debug_protected(request, options, &consistency_check/0)
+
+  defp route_path("/debug/vars", request, _server_public_key, options),
+    do: debug_protected(request, options, &expvar/0)
+
+  defp route_path("/debug/varz", request, _server_public_key, options),
+    do: debug_protected(request, options, &metrics/0)
+
+  defp route_path("/debug/", request, _server_public_key, options),
+    do: debug_protected(request, options, &debug_index/0)
 
   defp route_path("/robots.txt", request, _server_public_key, _options), do: robots(request)
 
@@ -142,12 +152,51 @@ defmodule Derpex.HTTP1 do
 
   defp protected(_request, _options, _callback), do: method_not_allowed()
 
+  defp debug_protected(%Request{} = request, options, callback) do
+    debug = Keyword.get(options, :debug, [])
+    operations = Keyword.get(options, :operations, [])
+
+    case Access.authorize(request, debug, operations) do
+      :authorized -> callback.()
+      :unauthorized -> debug_forbidden()
+    end
+  end
+
   defp metrics do
     {:response,
      Response.encode(
        200,
        [{"Content-Type", "text/plain; version=0.0.4; charset=utf-8"}],
        Operations.prometheus()
+     )}
+  end
+
+  defp expvar do
+    {:response,
+     Response.encode(
+       200,
+       [{"Content-Type", "application/json; charset=utf-8"}],
+       Operations.expvar_json()
+     )}
+  end
+
+  defp debug_index do
+    body =
+      "<html><body><h1>derpex debug</h1><ul>" <>
+        "<li><a href=\"/debug/vars\">/debug/vars</a> (Metrics (Go))</li>" <>
+        "<li><a href=\"/debug/varz\">/debug/varz</a> (Metrics (Prometheus))</li>" <>
+        "<li><a href=\"/debug/check\">/debug/check</a> (Consistency check)</li>" <>
+        "</ul></body></html>"
+
+    {:response, Response.encode(200, [{"Content-Type", "text/html; charset=utf-8"}], body)}
+  end
+
+  defp debug_forbidden do
+    {:response,
+     Response.encode(
+       403,
+       [{"Content-Type", "text/plain; charset=utf-8"}, {"X-Content-Type-Options", "nosniff"}],
+       "debug access denied\n"
      )}
   end
 

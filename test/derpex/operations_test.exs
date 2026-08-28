@@ -35,5 +35,18 @@ defmodule Derpex.OperationsTest do
     refute metrics =~ "node_id"
     refute metrics =~ "organization_id"
     refute metrics =~ "source_ip"
+
+    assert {:ok, fields} = Derpex.JSON.decode_object(Operations.expvar_json())
+    assert {:object, derp} = field!(fields, "derp")
+    assert is_binary(field!(derp, "version"))
+    assert is_integer(field!(derp, "gauge_current_connections"))
+
+    assert {:object, packet_kinds} =
+             field!(derp, "counter_packets_received_kind")
+
+    assert is_integer(field!(packet_kinds, "disco"))
+    assert is_integer(field!(packet_kinds, "other"))
   end
+
+  defp field!(fields, name), do: fields |> List.keyfind!(name, 0) |> elem(1)
 end

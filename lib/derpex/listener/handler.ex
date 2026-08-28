@@ -40,6 +40,11 @@ defmodule Derpex.Listener.Handler do
     operations = Keyword.get(options, :operations, [])
     remote_address = remote_address(socket)
 
+    debug =
+      options
+      |> Keyword.get(:debug, [])
+      |> Keyword.put(:remote_ip, elem(remote_address, 0))
+
     disallowed_app_names =
       options
       |> Keyword.get(:disallowed_app_names, [])
@@ -94,6 +99,7 @@ defmodule Derpex.Listener.Handler do
                bootstrap_dns: bootstrap_dns,
                home_page: home_page,
                operations: operations,
+               debug: debug,
                remote_address: format_remote_address(remote_address)
              )
              |> Enum.reject(fn {_key, value} -> is_nil(value) end)

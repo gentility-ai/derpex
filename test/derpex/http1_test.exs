@@ -160,6 +160,57 @@ defmodule Derpex.HTTP1Test do
     assert IO.iodata_to_binary(check) =~ "derp.Server ConsistencyCheck okay"
   end
 
+  test "protects each baseline debug route with upstream source rules" do
+    local_options = [debug: [remote_ip: {127, 0, 0, 1}]]
+
+    for path <- ["/debug/", "/debug/vars", "/debug/varz", "/debug/check"] do
+      assert {:response, response} =
+               HTTP1.route(request("GET", path), @server_public, local_options)
+
+      assert IO.iodata_to_binary(response) =~ "HTTP/1.1 200 OK\r\n"
+
+      assert {:response, response} =
+               HTTP1.route(request("POST", path), @server_public, local_options)
+
+      assert IO.iodata_to_binary(response) =~ "HTTP/1.1 200 OK\r\n"
+    end
+
+    public_options = [debug: [remote_ip: {203, 0, 113, 8}]]
+
+    assert {:response, forbidden} =
+             HTTP1.route(request("GET", "/debug/vars"), @server_public, public_options)
+
+    forbidden = IO.iodata_to_binary(forbidden)
+    assert forbidden =~ "HTTP/1.1 403 Forbidden\r\n"
+    assert forbidden =~ "\r\n\r\ndebug access denied\n"
+
+    forwarded = [{"x-forwarded-for", "198.51.100.9"}]
+
+    assert {:response, forbidden} =
+             HTTP1.route(request("GET", "/debug/check", forwarded), @server_public, local_options)
+
+    assert IO.iodata_to_binary(forbidden) =~ "HTTP/1.1 403 Forbidden\r\n"
+  end
+
+  test "accepts the product operations bearer on every baseline debug route" do
+    options = [
+      debug: [remote_ip: {203, 0, 113, 8}],
+      operations: [enabled: true, token: @operations_token]
+    ]
+
+    headers = [
+      {"authorization", "Bearer " <> @operations_token},
+      {"x-forwarded-for", "198.51.100.9"}
+    ]
+
+    for path <- ["/debug/", "/debug/vars", "/debug/varz", "/debug/check"] do
+      assert {:response, response} =
+               HTTP1.route(request("GET", path, headers), @server_public, options)
+
+      assert IO.iodata_to_binary(response) =~ "HTTP/1.1 200 OK\r\n"
+    end
+  end
+
   test "serves the upstream robots exclusion body" do
     assert {:response, response} = HTTP1.route(request("GET", "/robots.txt"), @server_public)
     assert IO.iodata_to_binary(response) =~ "User-agent: *\nDisallow: /\n"

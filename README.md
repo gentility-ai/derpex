@@ -160,6 +160,14 @@ and `GET /debug/check`, then send it as `Authorization: Bearer <token>`.
 Metrics use a fixed schema with only protocol-defined finite labels; relay
 identity, organization, peer, and source-IP values are never metric labels.
 
+The baseline-compatible `/debug/`, `/debug/vars`, `/debug/varz`, and
+`/debug/check` routes permit direct loopback and Tailscale-address clients.
+They reject requests carrying `X-Forwarded-For`. The upstream
+`TS_ALLOW_DEBUG_IP`, `TS_DEBUG_TRUSTED_CIDRS`, and GET-only
+`TS_DEBUG_KEY_PATH`/`?debugkey=` mechanisms are supported; the Gentility
+operations bearer token is also accepted. Public health and probes do not
+inherit debug authorization.
+
 ## Capacity measurements
 
 `mix bench` runs the local relay data-path benchmark and slow-client isolation
