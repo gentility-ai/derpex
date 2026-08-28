@@ -31,6 +31,8 @@ defmodule Derpex.MixProject do
       preferred_envs: [
         bench: :dev,
         quality: :test,
+        "test.diff": :test,
+        "test.interop": :test,
         "test.all": :test,
         "release.check": :test
       ]
@@ -52,6 +54,10 @@ defmodule Derpex.MixProject do
   defp aliases do
     [
       bench: ["run bench/relay.exs"],
+      "test.diff": ["test --include go_interop test/interop/differential_test.exs"],
+      "test.interop": [
+        "test --include go_interop --include rust_interop test/interop"
+      ],
       quality: [
         "format --check-formatted",
         "compile --warnings-as-errors",

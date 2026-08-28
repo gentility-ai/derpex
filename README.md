@@ -19,18 +19,23 @@ mix quality
 
 Go, Rust, and the pinned upstream repositories are conformance-test inputs
 only. Separate CI jobs exercise the unchanged Go clients, two real `tsnet`
-nodes using Tailscale's LocalBackend/magicsock/WireGuard stack, and the official
-`tailscale-rs` client. None of those toolchains or checkouts is copied into an
-OTP release or runtime image.
+nodes using Tailscale's LocalBackend/magicsock/WireGuard stack, a normalized
+Go-server-versus-DERPEX differential trace, and the official `tailscale-rs`
+client. None of those toolchains or checkouts is copied into an OTP release or
+runtime image.
 
 The local official-client gates use sibling pinned checkouts:
 
 ```sh
 DERPEX_TAILSCALE_DIR=../tailscale DERPEX_GO_INTEROP=1 \
-  mix test test/interop/go_client_test.exs test/interop/tsnet_stack_test.exs
+  mix test test/interop/go_client_test.exs test/interop/differential_test.exs \
+  test/interop/tsnet_stack_test.exs
 DERPEX_TAILSCALE_RS_DIR=../tailscale-rs DERPEX_RUST_INTEROP=1 \
   mix test test/interop/rust_client_test.exs
 ```
+
+With `DERPEX_TAILSCALE_DIR` set, `mix test.diff` runs just the normalized
+semantic comparison against the pinned Go server.
 
 The `tsnet` smoke advertises DERPEX from Tailscale's own in-memory test control
 server, pins DERPEX's raw-IP TLS certificate, forces the two nodes off direct
