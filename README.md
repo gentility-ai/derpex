@@ -121,3 +121,20 @@ random `DERPEX_OPERATIONS_TOKEN` of at least 16 bytes to enable `GET /metrics`
 and `GET /debug/check`, then send it as `Authorization: Bearer <token>`.
 Metrics use a fixed schema with only protocol-defined finite labels; relay
 identity, organization, peer, and source-IP values are never metric labels.
+
+## Capacity measurements
+
+`mix bench` runs the local relay data-path benchmark and slow-client isolation
+soak. It emits a versioned JSON report with packet throughput, p50/p95/p99
+in-process relay latency, queue and mailbox high-water marks, memory deltas, and
+the bounded-state result. For a shorter development run:
+
+```sh
+mix bench -- --packets 250 --slow-packets 1000
+```
+
+This harness deliberately applies no numeric pass/fail thresholds. Hardware,
+regional network, TLS/native/WebSocket connection, and bandwidth-cost targets
+must be supplied by the joint Gentility launch profile and measured from the
+final OTP artifact; the local report is a repeatable diagnostic, not a claim of
+production capacity.

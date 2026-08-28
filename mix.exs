@@ -29,6 +29,7 @@ defmodule Derpex.MixProject do
   def cli do
     [
       preferred_envs: [
+        bench: :dev,
         quality: :test,
         "test.all": :test,
         "release.check": :test
@@ -50,6 +51,7 @@ defmodule Derpex.MixProject do
 
   defp aliases do
     [
+      bench: ["run bench/relay.exs"],
       quality: [
         "format --check-formatted",
         "compile --warnings-as-errors",

@@ -1,0 +1,61 @@
+name: Relay benchmark
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "17 3 * * 1"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  relay:
+    name: Relay data path and slow-client soak
+    runs-on: ubuntu-24.04
+    env:
+      DERPEX_BUILD: "1"
+      MIX_ENV: test
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+
+      - name: Set up Erlang and Elixir
+        uses: erlef/setup-beam@0f75c29430f34bb5af4cce5e3b7f6a8860fca236 # v1
+        with:
+          otp-version: "29.0.5"
+          elixir-version: "1.20.3"
+
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c # stable 2026-08-28
+        with:
+          toolchain: "1.98.0"
+
+      - name: Cache build inputs
+        uses: actions/cache@caa296126883cff596d87d8935842f9db880ef25 # v5
+        with:
+          path: |
+            deps
+            _build
+            ~/.cargo/git
+            ~/.cargo/registry
+            native/derpex_crypto/target
+          key: benchmark-${{ runner.os }}-${{ hashFiles('mix.lock', 'native/derpex_crypto/Cargo.lock') }}
+
+      - name: Fetch dependencies
+        run: mix deps.get --only test
+
+      - name: Produce benchmark report
+        run: >-
+          mix bench -- --packets 10000 --slow-packets 100000
+          --slow-delay-ms 5000 --output relay-benchmark.json
+
+      - name: Upload benchmark report
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: relay-benchmark-${{ github.run_id }}
+          path: relay-benchmark.json
+          if-no-files-found: error
+          retention-days: 30

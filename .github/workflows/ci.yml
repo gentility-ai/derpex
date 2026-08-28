@@ -53,6 +53,9 @@ jobs:
       - name: Run Rust tests
         run: cargo test --locked --manifest-path native/derpex_crypto/Cargo.toml --all-targets
 
+      - name: Smoke relay benchmark harness
+        run: mix bench -- --packets 50 --sizes 64,1200 --slow-packets 200 --slow-delay-ms 50
+
   go-interop:
     name: Official Go client interoperability
     needs: quality
