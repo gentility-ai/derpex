@@ -72,6 +72,8 @@ defmodule Derpex.UpstreamInventory do
       "ported in test/derpex/send_queue_config_test.exs; empty/default and explicit depths preserved",
     {"derp/derpserver/derpserver_test.go", "TestParseSSOutput"} =>
       "ported in test/derpex/debug/ss_test.exs with IPv4, IPv6, counters, service names, and malformed rows",
+    {"derp/derpserver/derpserver_test.go", "TestServeDebugTrafficUniqueSenders"} =>
+      "ported active-route debug lookup and unique-sender reporting in test/derpex/debug/traffic_test.exs",
     {"derp/derpserver/derpserver_test.go", "TestSenderCardinality"} =>
       "adapted in test/derpex/cardinality_test.exs with duplicate suppression and small-set estimates",
     {"derp/derpserver/derpserver_test.go", "TestSenderCardinality100"} =>

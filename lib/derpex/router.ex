@@ -181,6 +181,21 @@ defmodule Derpex.Router do
   @spec route_count() :: non_neg_integer()
   def route_count, do: :ets.info(@table, :size)
 
+  @doc "Returns the active route's writer without calling the topology process."
+  @spec active_writer(binary()) :: {:ok, pid()} | {:error, :not_connected}
+  def active_writer(<<key::binary-size(32)>>) do
+    case :ets.lookup(@table, key) do
+      [{^key, _connection, %Ring{notifier: writer}, _disco, _lifecycle}]
+      when is_pid(writer) ->
+        {:ok, writer}
+
+      [] ->
+        {:error, :not_connected}
+    end
+  rescue
+    ArgumentError -> {:error, :not_connected}
+  end
+
   @impl true
   def init(_options) do
     table =

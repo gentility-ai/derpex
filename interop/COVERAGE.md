@@ -12,8 +12,8 @@ disposition map and review that change together with `interop/upstream.lock`.
 | State | Count |
 | --- | ---: |
 | Total | 69 |
-| Ported | 52 |
-| Pending (release-blocking) | 13 |
+| Ported | 53 |
+| Pending (release-blocking) | 12 |
 | Implementation-specific | 4 |
 
 | Area | Upstream test | Source | Disposition | Gate/notes |
@@ -43,7 +43,7 @@ disposition map and review that change together with `interop/upstream.lock`.
 | DERP server | `TestServerDupClients` | `derp/derpserver/derpserver_test.go:498` | `ported` | ported lifecycle cases and unchanged official last-writer-active client gate |
 | DERP server | `TestLimiter` | `derp/derpserver/derpserver_test.go:747` | `ported` | ported shared burst, refill, zero-rate, disable, and pre-allocation rejection cases |
 | DERP server | `TestParseSSOutput` | `derp/derpserver/derpserver_test.go:884` | `ported` | ported in test/derpex/debug/ss_test.exs with IPv4, IPv6, counters, service names, and malformed rows |
-| DERP server | `TestServeDebugTrafficUniqueSenders` | `derp/derpserver/derpserver_test.go:895` | `pending` | release-blocking mapping not yet implemented |
+| DERP server | `TestServeDebugTrafficUniqueSenders` | `derp/derpserver/derpserver_test.go:895` | `ported` | ported active-route debug lookup and unique-sender reporting in test/derpex/debug/traffic_test.exs |
 | DERP server | `TestGetPerClientSendQueueDepth` | `derp/derpserver/derpserver_test.go:924` | `ported` | ported in test/derpex/send_queue_config_test.exs; empty/default and explicit depths preserved |
 | DERP server | `TestSenderCardinality` | `derp/derpserver/derpserver_test.go:950` | `ported` | adapted in test/derpex/cardinality_test.exs with duplicate suppression and small-set estimates |
 | DERP server | `TestSenderCardinality100` | `derp/derpserver/derpserver_test.go:995` | `ported` | adapted in test/derpex/cardinality_test.exs with the upstream 100-sender tolerance |
