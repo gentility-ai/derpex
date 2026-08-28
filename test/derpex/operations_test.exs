@@ -28,6 +28,8 @@ defmodule Derpex.OperationsTest do
     assert metrics =~ "derp_gauge_current_connections "
     assert metrics =~ "derp_gauge_current_home_connections "
     assert metrics =~ ~s(derp_counter_packets_received_kind{kind="disco"} )
+    assert metrics =~ ~s(derp_packets_dropped{kind="other",reason="queue_head"} )
+    assert metrics =~ ~s(derp_bytes_dropped{kind="disco",reason="write_error"} )
     assert metrics =~ "derpex_accept_tracked_ips "
     assert metrics =~ "derpex_vm_memory_bytes "
     refute metrics =~ "node_id"

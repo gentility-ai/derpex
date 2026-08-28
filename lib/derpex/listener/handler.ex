@@ -62,12 +62,16 @@ defmodule Derpex.Listener.Handler do
          ordinary =
            Ring.new(send_queue_depth,
              notifier: writer,
-             wake_message: Writer.wake_message()
+             wake_message: Writer.wake_message(),
+             metrics: metrics,
+             metric_kind: :other
            ),
          disco =
            Ring.new(send_queue_depth,
              notifier: writer,
-             wake_message: Writer.wake_message()
+             wake_message: Writer.wake_message(),
+             metrics: metrics,
+             metric_kind: :disco
            ),
          pong =
            Ring.new(1, notifier: writer, wake_message: Writer.wake_message()),
@@ -384,6 +388,14 @@ defmodule Derpex.Listener.Handler do
 
     case Router.route_local(source, destination, packet) do
       {:dropped, :unknown_destination} ->
+        :ok =
+          Metrics.add_drop(
+            state.metrics,
+            :unknown_dest_on_fwd,
+            packet_kind(packet),
+            byte_size(packet)
+          )
+
         maybe_notify_unknown_destination(state, destination, packet)
 
       _routed_or_queue_drop ->
@@ -414,13 +426,19 @@ defmodule Derpex.Listener.Handler do
 
   defp handle_client_message(state, _message), do: {:ok, state}
 
-  defp handle_route_result(state, destination, packet, {:dropped, :unknown_destination}),
-    do: maybe_notify_unknown_destination(state, destination, packet)
+  defp handle_route_result(state, destination, packet, {:dropped, :unknown_destination}) do
+    :ok = Metrics.add_drop(state.metrics, :unknown_dest, packet_kind(packet), byte_size(packet))
+    maybe_notify_unknown_destination(state, destination, packet)
+  end
 
   defp handle_route_result(state, _destination, _packet, _result), do: {:ok, state}
 
   defp usage_outcome({:ok, _result}), do: :accepted
   defp usage_outcome({:dropped, _reason}), do: :dropped
+
+  defp packet_kind(packet) do
+    if Disco.looks_like_wrapper?(packet), do: :disco, else: :other
+  end
 
   defp maybe_notify_unknown_destination(state, destination, packet) do
     if Derpex.Disco.looks_like_wrapper?(packet) do

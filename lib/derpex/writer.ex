@@ -107,15 +107,17 @@ defmodule Derpex.Writer do
 
   defp drain(state) do
     case take_next(state.rings) do
-      {:ok, message} ->
+      {:ok, message, queue_age_microseconds} ->
         with {:ok, frame} <- Body.encode_server(message),
              :ok <- send_data(state, frame) do
+          record_queue_duration(state.metrics, message, queue_age_microseconds)
           record_send(state.metrics, message)
           maybe_note_send(state, message)
           drain(state)
         else
           {:error, reason} ->
             :ok = Metrics.add(state.metrics, :write_errors, 1)
+            record_write_drop(state.metrics, message)
             {:error, reason, state}
         end
 
@@ -132,17 +134,17 @@ defmodule Derpex.Writer do
   end
 
   defp take_next(%{lifecycle: lifecycle} = rings) do
-    case Ring.take(lifecycle) do
+    case Ring.take_with_age(lifecycle) do
       :empty -> take_packet(rings)
       result -> result
     end
   end
 
   defp take_packet(%{ordinary: ordinary, disco: disco, pong: pong}) do
-    case Ring.take(ordinary) do
+    case Ring.take_with_age(ordinary) do
       :empty ->
-        case Ring.take(disco) do
-          :empty -> Ring.take(pong)
+        case Ring.take_with_age(disco) do
+          :empty -> Ring.take_with_age(pong)
           result -> result
         end
 
@@ -174,6 +176,18 @@ defmodule Derpex.Writer do
     do: Metrics.add(metrics, :peer_gone_not_here_frames, 1)
 
   defp record_send(_metrics, _message), do: :ok
+
+  defp record_write_drop(metrics, {:recv_packet, _source, packet}) do
+    kind = if Derpex.Disco.looks_like_wrapper?(packet), do: :disco, else: :other
+    Metrics.add_drop(metrics, :write_error, kind, byte_size(packet))
+  end
+
+  defp record_write_drop(_metrics, _message), do: :ok
+
+  defp record_queue_duration(metrics, {:recv_packet, _source, _packet}, microseconds),
+    do: Metrics.observe_queue_duration(metrics, microseconds)
+
+  defp record_queue_duration(_metrics, _message, _microseconds), do: :ok
 
   defp send_data(%{wire_mode: :native} = state, data),
     do: state.transport.send(state.socket, data)

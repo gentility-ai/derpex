@@ -30,11 +30,30 @@ defmodule Derpex.Metrics do
     :write_errors
   ]
 
+  @drop_reasons [
+    :unknown_dest,
+    :unknown_dest_on_fwd,
+    :gone_disconnected,
+    :queue_head,
+    :queue_tail,
+    :write_error,
+    :dup_client
+  ]
+  @packet_kinds [:disco, :other]
+  @drop_metric_names for metric <- [:packets_dropped, :bytes_dropped],
+                         reason <- @drop_reasons,
+                         kind <- @packet_kinds,
+                         do: {metric, reason, kind}
+  @metric_names @metric_names ++ @drop_metric_names
+
   @indexes @metric_names |> Enum.with_index(1) |> Map.new()
   @persistent_key {__MODULE__, :default_handle}
 
-  @type key :: unquote(Enum.reduce(@metric_names, &{:|, [], [&1, &2]}))
-  @opaque handle :: :counters.counters_ref()
+  @type key :: atom() | {atom(), atom(), atom()}
+  @opaque handle :: %{
+            counters: :counters.counters_ref(),
+            queue_average: :atomics.atomics_ref()
+          }
 
   @doc false
   def start_link(options \\ []) do
@@ -60,8 +79,25 @@ defmodule Derpex.Metrics do
   def add(nil, _key, _delta), do: :ok
 
   def add(handle, key, delta) when is_integer(delta) and delta >= 0 do
-    :counters.add(handle, Map.fetch!(@indexes, key), delta)
+    :counters.add(handle.counters, Map.fetch!(@indexes, key), delta)
     :ok
+  end
+
+  @doc "Observes packet queue residence using Go's alpha-0.1 moving average."
+  @spec observe_queue_duration(handle() | nil, non_neg_integer()) :: :ok
+  def observe_queue_duration(nil, _microseconds), do: :ok
+
+  def observe_queue_duration(handle, microseconds)
+      when is_integer(microseconds) and microseconds >= 0 do
+    update_queue_average(handle.queue_average, microseconds / 1_000)
+  end
+
+  @doc "Records one packet drop in the fixed reason/kind matrix."
+  @spec add_drop(handle() | nil, atom(), :disco | :other, non_neg_integer()) :: :ok
+  def add_drop(handle, reason, kind, bytes)
+      when reason in @drop_reasons and kind in @packet_kinds and is_integer(bytes) and bytes >= 0 do
+    :ok = add(handle, {:packets_dropped, reason, kind}, 1)
+    add(handle, {:bytes_dropped, reason, kind}, bytes)
   end
 
   @doc "Returns all fixed counters by their stable names."
@@ -70,34 +106,63 @@ defmodule Derpex.Metrics do
 
   @doc false
   @spec metric_names() :: [key()]
-  def metric_names, do: @metric_names
+  def metric_names, do: [:average_queue_duration_ms | @metric_names]
 
   @impl true
   def init(_options) do
-    counters = :counters.new(length(@metric_names), [:write_concurrency])
-    :persistent_term.put(@persistent_key, {self(), counters})
-    {:ok, counters}
+    handle = %{
+      counters: :counters.new(length(@metric_names), [:write_concurrency]),
+      queue_average: :atomics.new(1, signed: false)
+    }
+
+    :persistent_term.put(@persistent_key, {self(), handle})
+    {:ok, handle}
   end
 
   @impl true
-  def handle_call(:handle, _from, counters), do: {:reply, counters, counters}
+  def handle_call(:handle, _from, handle), do: {:reply, handle, handle}
 
-  def handle_call(:snapshot, _from, counters) do
+  def handle_call(:snapshot, _from, handle) do
     snapshot =
       Map.new(@indexes, fn {name, index} ->
-        {name, :counters.get(counters, index)}
+        {name, :counters.get(handle.counters, index)}
       end)
+      |> Map.put(
+        :average_queue_duration_ms,
+        handle.queue_average |> :atomics.get(1) |> bits_to_float()
+      )
 
-    {:reply, snapshot, counters}
+    {:reply, snapshot, handle}
   end
 
   @impl true
-  def terminate(_reason, counters) do
+  def terminate(_reason, handle) do
     case :persistent_term.get(@persistent_key, nil) do
-      {owner, ^counters} when owner == self() -> :persistent_term.erase(@persistent_key)
+      {owner, ^handle} when owner == self() -> :persistent_term.erase(@persistent_key)
       _different -> :ok
     end
 
     :ok
+  end
+
+  defp update_queue_average(average, observed_ms) do
+    old_bits = :atomics.get(average, 1)
+    old_average = bits_to_float(old_bits)
+    new_bits = float_to_bits(0.1 * observed_ms + 0.9 * old_average)
+
+    case :atomics.compare_exchange(average, 1, old_bits, new_bits) do
+      :ok -> :ok
+      _changed -> update_queue_average(average, observed_ms)
+    end
+  end
+
+  defp float_to_bits(value) do
+    <<bits::unsigned-native-64>> = <<value::float-native-64>>
+    bits
+  end
+
+  defp bits_to_float(bits) do
+    <<value::float-native-64>> = <<bits::unsigned-native-64>>
+    value
   end
 end

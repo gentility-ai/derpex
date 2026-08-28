@@ -11,6 +11,9 @@ defmodule Derpex.Outbox.Ring do
   producer or consumer. It contains indices and counters, never the packet.
   """
 
+  alias Derpex.Clock
+  alias Derpex.Metrics
+
   @head 1
   @size 2
   @wake_pending 3
@@ -21,7 +24,16 @@ defmodule Derpex.Outbox.Ring do
   @lock_retries 1_024
   @producer_wait_attempts 5
 
-  defstruct [:table, :state, :capacity, :notifier, :wake_message, :test_hook]
+  defstruct [
+    :table,
+    :state,
+    :capacity,
+    :notifier,
+    :wake_message,
+    :test_hook,
+    :metrics,
+    :metric_kind
+  ]
 
   @opaque t :: %__MODULE__{
             table: :ets.tid(),
@@ -29,7 +41,9 @@ defmodule Derpex.Outbox.Ring do
             capacity: pos_integer(),
             notifier: pid(),
             wake_message: atom(),
-            test_hook: nil | (atom() -> term())
+            test_hook: nil | (atom() -> term()),
+            metrics: Metrics.handle() | nil,
+            metric_kind: :disco | :other | nil
           }
 
   @type enqueue_result :: {:ok, :wake | :coalesced | :replaced} | {:dropped, atom()}
@@ -45,7 +59,7 @@ defmodule Derpex.Outbox.Ring do
         write_concurrency: true
       ])
 
-    true = :ets.insert(table, for(index <- 0..(capacity - 1), do: {index, 0, nil}))
+    true = :ets.insert(table, for(index <- 0..(capacity - 1), do: {index, 0, 0, nil}))
 
     %__MODULE__{
       table: table,
@@ -53,7 +67,9 @@ defmodule Derpex.Outbox.Ring do
       capacity: capacity,
       notifier: Keyword.get(options, :notifier, self()),
       wake_message: Keyword.get(options, :wake_message, :derpex_outbox_ready),
-      test_hook: Keyword.get(options, :test_hook)
+      test_hook: Keyword.get(options, :test_hook),
+      metrics: Keyword.get(options, :metrics),
+      metric_kind: Keyword.get(options, :metric_kind)
     }
   end
 
@@ -61,6 +77,7 @@ defmodule Derpex.Outbox.Ring do
   @spec enqueue(t(), term()) :: enqueue_result()
   def enqueue(%__MODULE__{} = ring, item) do
     if atomic_get(ring, @closed) == 1 do
+      record_drop(ring, item, :gone_disconnected)
       {:dropped, :closed}
     else
       case acquire_producer(ring) do
@@ -74,6 +91,7 @@ defmodule Derpex.Outbox.Ring do
 
         :busy ->
           :atomics.add_get(ring.state, @tail_drops, 1)
+          record_drop(ring, item, :queue_tail)
           {:dropped, :contention}
       end
     end
@@ -82,6 +100,15 @@ defmodule Derpex.Outbox.Ring do
   @doc "Takes the next item for the single writer."
   @spec take(t()) :: {:ok, term()} | :empty | :closed | :busy
   def take(%__MODULE__{} = ring) do
+    case take_with_age(ring) do
+      {:ok, item, _age_microseconds} -> {:ok, item}
+      other -> other
+    end
+  end
+
+  @doc "Takes the next item with its non-negative queue residence time."
+  @spec take_with_age(t()) :: {:ok, term(), non_neg_integer()} | :empty | :closed | :busy
+  def take_with_age(%__MODULE__{} = ring) do
     case acquire_consumer(ring) do
       {:ok, lock_token} ->
         try do
@@ -103,6 +130,7 @@ defmodule Derpex.Outbox.Ring do
       {:ok, lock_token} ->
         try do
           recover(ring)
+          record_retained_drops(ring)
           :atomics.put(ring.state, @closed, 1)
           clear_slots(ring)
           :atomics.put(ring.state, @size, 0)
@@ -146,6 +174,7 @@ defmodule Derpex.Outbox.Ring do
 
   defp enqueue_locked(ring, item, lock_token) do
     if atomic_get(ring, @closed) == 1 do
+      record_drop(ring, item, :gone_disconnected)
       {:dropped, :closed}
     else
       enqueue_open_locked(ring, item, lock_token)
@@ -163,10 +192,12 @@ defmodule Derpex.Outbox.Ring do
     new_size = if full?, do: size, else: size + 1
     new_head_drops = if full?, do: head_drops + 1, else: head_drops
     operation_token = unique_token()
+    enqueued_at = Clock.monotonic_time(:microsecond)
 
     journal(ring, lock_token, operation_token, index, new_head, new_size, new_head_drops)
     run_hook(ring, :after_journal)
-    true = :ets.insert(ring.table, {index, operation_token, item})
+    if full?, do: record_replaced_drop(ring, index)
+    true = :ets.insert(ring.table, {index, operation_token, enqueued_at, item})
     run_hook(ring, :after_publish)
     commit(ring, new_head, new_size, new_head_drops)
     run_hook(ring, :after_commit)
@@ -198,19 +229,20 @@ defmodule Derpex.Outbox.Ring do
     head = atomic_get(ring, @head)
     size = atomic_get(ring, @size)
     head_drops = atomic_get(ring, @head_drops)
-    [{^head, _slot_token, item}] = :ets.lookup(ring.table, head)
+    [{^head, _slot_token, enqueued_at, item}] = :ets.lookup(ring.table, head)
     operation_token = unique_token()
     new_head = rem(head + 1, ring.capacity)
     new_size = size - 1
 
     journal(ring, lock_token, operation_token, head, new_head, new_size, head_drops)
     run_hook(ring, :after_journal)
-    true = :ets.insert(ring.table, {head, operation_token, nil})
+    true = :ets.insert(ring.table, {head, operation_token, 0, nil})
     run_hook(ring, :after_publish)
     commit(ring, new_head, new_size, head_drops)
     run_hook(ring, :after_commit)
     :ets.delete(ring.table, :journal)
-    {:ok, item}
+    age_microseconds = max(Clock.monotonic_time(:microsecond) - enqueued_at, 0)
+    {:ok, item, age_microseconds}
   end
 
   defp signal_writer(ring) do
@@ -240,8 +272,11 @@ defmodule Derpex.Outbox.Ring do
     case :ets.lookup(ring.table, :journal) do
       [{:journal, _old_lock, operation_token, index, head, size, head_drops}] ->
         case :ets.lookup(ring.table, index) do
-          [{^index, ^operation_token, _item}] -> commit(ring, head, size, head_drops)
-          _not_published -> :ok
+          [{^index, ^operation_token, _enqueued_at, _item}] ->
+            commit(ring, head, size, head_drops)
+
+          _not_published ->
+            :ok
         end
 
         :ets.delete(ring.table, :journal)
@@ -338,7 +373,7 @@ defmodule Derpex.Outbox.Ring do
     operation_token = unique_token()
 
     for index <- 0..(ring.capacity - 1) do
-      true = :ets.insert(ring.table, {index, operation_token, nil})
+      true = :ets.insert(ring.table, {index, operation_token, 0, nil})
     end
 
     :ok
@@ -347,13 +382,53 @@ defmodule Derpex.Outbox.Ring do
   defp packet_slot_count(ring) do
     :ets.foldl(
       fn
-        {index, _token, item}, count when is_integer(index) and item != nil -> count + 1
-        _record, count -> count
+        {index, _token, _enqueued_at, item}, count when is_integer(index) and item != nil ->
+          count + 1
+
+        _record, count ->
+          count
       end,
       0,
       ring.table
     )
   end
+
+  defp record_replaced_drop(ring, index) do
+    case :ets.lookup(ring.table, index) do
+      [{^index, _slot_token, _enqueued_at, item}] -> record_drop(ring, item, :queue_head)
+      [] -> :ok
+    end
+  end
+
+  defp record_retained_drops(%{metric_kind: nil}), do: :ok
+
+  defp record_retained_drops(ring) do
+    Enum.each(0..(ring.capacity - 1), fn index ->
+      case :ets.lookup(ring.table, index) do
+        [{^index, _slot_token, _enqueued_at, nil}] ->
+          :ok
+
+        [{^index, _slot_token, _enqueued_at, item}] ->
+          record_drop(ring, item, :gone_disconnected)
+
+        [] ->
+          :ok
+      end
+    end)
+  end
+
+  defp record_drop(%{metric_kind: nil}, _item, _reason), do: :ok
+
+  defp record_drop(ring, item, reason) do
+    Metrics.add_drop(ring.metrics, reason, ring.metric_kind, packet_size(item))
+  end
+
+  defp packet_size({:recv_packet, _source, packet}) when is_binary(packet), do: byte_size(packet)
+
+  defp packet_size({:forward_packet, _source, _destination, packet}) when is_binary(packet),
+    do: byte_size(packet)
+
+  defp packet_size(_non_packet), do: 0
 
   defp atomic_get(ring, index), do: :atomics.get(ring.state, index)
   defp unique_token, do: :erlang.unique_integer([:positive, :monotonic])

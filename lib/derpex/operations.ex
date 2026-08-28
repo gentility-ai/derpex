@@ -299,6 +299,11 @@ defmodule Derpex.Operations do
   defp core_metric_name(:packets_received_other),
     do: ~s(derp_counter_packets_received_kind{kind="other"})
 
+  defp core_metric_name({metric, reason, kind})
+       when metric in [:packets_dropped, :bytes_dropped] do
+    ~s(derp_#{metric}{kind="#{kind}",reason="#{reason}"})
+  end
+
   defp core_metric_name(name), do: "derp_#{name}"
 
   defp alive?(name) do

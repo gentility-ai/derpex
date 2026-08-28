@@ -470,12 +470,21 @@ defmodule Derpex.Listener.HandlerTest do
     assert pong_type == Frame.type(:pong)
     assert {:ok, "12345678"} = :gen_tcp.recv(socket, 8, 2_000)
 
+    {:ok, packet_frame} =
+      Body.encode_client({:send_packet, :binary.copy(<<9>>, 32), "unroutable"})
+
+    :ok = :gen_tcp.send(socket, packet_frame)
+
     assert_eventually(fn ->
       current = Metrics.snapshot()
 
       current.accepts == before.accepts + 1 and
         current.got_ping == before.got_ping + 1 and
-        current.sent_pong == before.sent_pong + 1
+        current.sent_pong == before.sent_pong + 1 and
+        current.packets_received == before.packets_received + 1 and
+        current.bytes_received == before.bytes_received + byte_size("unroutable") and
+        current[{:packets_dropped, :unknown_dest, :other}] ==
+          before[{:packets_dropped, :unknown_dest, :other}] + 1
     end)
 
     :gen_tcp.close(socket)
