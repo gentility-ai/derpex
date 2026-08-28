@@ -220,6 +220,116 @@ defmodule Derpex.Admission.GentilityTest do
              {:error, {:unknown_signing_key, @signing_key_id}}
   end
 
+  test "claims and releases exact per-node and per-organization connection allocations" do
+    node_a = node_key(14)
+    node_b = node_key(15)
+
+    controller =
+      start_controller(
+        authority: fn request ->
+          {:ok,
+           signed_lease(request.node_key,
+             node_connection_limit: 2,
+             organization_connection_limit: 2
+           )}
+        end
+      )
+
+    policy = Gentility.policy(controller)
+    {:ok, context_a} = Gentility.authorize(request(node_a), policy)
+    {:ok, context_b} = Gentility.authorize(request(node_b), policy)
+    [first, second, third] = connections(3)
+
+    assert Gentility.claim(request(node_a), context_a, first, policy) == {:ok, context_a}
+    assert Gentility.claim(request(node_a), context_a, second, policy) == {:ok, context_a}
+
+    assert Gentility.claim(request(node_a), context_a, third, policy) ==
+             {:error, :node_connection_limit}
+
+    assert Gentility.claim(request(node_b), context_b, third, policy) ==
+             {:error, :organization_connection_limit}
+
+    assert Gentility.stats(controller).active_connections == 2
+    assert Gentility.release(first, policy) == :ok
+    assert Gentility.claim(request(node_b), context_b, third, policy) == {:ok, context_b}
+    assert Gentility.stats(controller).active_connections == 2
+
+    Enum.each([first, second, third], &Process.exit(&1, :kill))
+    eventually(fn -> Gentility.stats(controller).active_connections == 0 end)
+  end
+
+  test "a live quota revision closes only the newest excess connections" do
+    parent = self()
+    node_key = node_key(16)
+
+    {:ok, authority} =
+      Agent.start_link(fn ->
+        signed_lease(node_key,
+          quota_revision: 3,
+          node_connection_limit: 4,
+          organization_connection_limit: 10
+        )
+      end)
+
+    controller =
+      start_controller(
+        authority: fn _request -> {:ok, Agent.get(authority, & &1)} end,
+        close_connection: fn connection, reason ->
+          send(parent, {:quota_close, connection, reason})
+        end
+      )
+
+    policy = Gentility.policy(controller)
+    {:ok, context} = Gentility.authorize(request(node_key), policy)
+    [oldest, middle, newest] = connections(3)
+
+    Enum.each([oldest, middle, newest], fn connection ->
+      assert {:ok, ^context} = Gentility.claim(request(node_key), context, connection, policy)
+    end)
+
+    Agent.update(authority, fn _wire ->
+      signed_lease(node_key,
+        quota_revision: 4,
+        node_connection_limit: 1,
+        organization_connection_limit: 10
+      )
+    end)
+
+    assert {:ok, %{gentility: %{quota_revision: 4}}} =
+             Gentility.authorize(request(node_key), policy)
+
+    assert_receive {:quota_close, ^newest, :quota_revision}
+    assert_receive {:quota_close, ^middle, :quota_revision}
+    refute_receive {:quota_close, ^oldest, :quota_revision}
+
+    Enum.each([oldest, middle, newest], &Process.exit(&1, :kill))
+  end
+
+  test "will not roll a cached policy or quota revision backwards" do
+    node_key = node_key(17)
+
+    {:ok, authority} =
+      Agent.start_link(fn -> signed_lease(node_key, policy_revision: 20, quota_revision: 8) end)
+
+    controller =
+      start_controller(authority: fn _request -> {:ok, Agent.get(authority, & &1)} end)
+
+    policy = Gentility.policy(controller)
+    assert {:ok, _context} = Gentility.authorize(request(node_key), policy)
+
+    Agent.update(authority, fn _wire ->
+      signed_lease(node_key, policy_revision: 19, quota_revision: 9)
+    end)
+
+    assert Gentility.authorize(request(node_key), policy) == {:error, :stale_lease}
+
+    Agent.update(authority, fn _wire ->
+      signed_lease(node_key, policy_revision: 20, quota_revision: 7)
+    end)
+
+    assert Gentility.authorize(request(node_key), policy) == {:error, :stale_lease}
+  end
+
   defp start_controller(options) do
     defaults = [
       verification_keys: %{@signing_key_id => @public_key},
@@ -241,11 +351,11 @@ defmodule Derpex.Admission.GentilityTest do
       deployment_id: "dep_01",
       region_id: 17,
       policy_revision: Keyword.get(options, :policy_revision, 9),
-      quota_revision: 3,
+      quota_revision: Keyword.get(options, :quota_revision, 3),
       issued_at_ms: 1_000,
       expires_at_ms: 2_000,
-      node_connection_limit: 4,
-      organization_connection_limit: 20,
+      node_connection_limit: Keyword.get(options, :node_connection_limit, 4),
+      organization_connection_limit: Keyword.get(options, :organization_connection_limit, 20),
       node_bytes_per_second: 10_000,
       node_byte_burst: 20_000,
       organization_bytes_per_second: 100_000,
@@ -280,4 +390,20 @@ defmodule Derpex.Admission.GentilityTest do
   end
 
   defp node_key(byte), do: :binary.copy(<<byte>>, 32)
+
+  defp connections(count) do
+    Enum.map(1..count, fn _index -> spawn(fn -> Process.sleep(:infinity) end) end)
+  end
+
+  defp eventually(assertion, attempts \\ 100)
+  defp eventually(assertion, 0), do: assert(assertion.())
+
+  defp eventually(assertion, attempts) do
+    if assertion.() do
+      :ok
+    else
+      Process.sleep(5)
+      eventually(assertion, attempts - 1)
+    end
+  end
 end

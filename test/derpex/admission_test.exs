@@ -16,6 +16,25 @@ defmodule Derpex.AdmissionTest do
     end
   end
 
+  defmodule AccountingPolicy do
+    @behaviour Derpex.Admission
+
+    @impl true
+    def authorize(_request, parent), do: {:ok, %{parent: parent}}
+
+    @impl true
+    def claim(request, context, connection, parent) do
+      send(parent, {:claimed, request.node_key, connection})
+      {:ok, Map.put(context, :claimed?, true)}
+    end
+
+    @impl true
+    def release(connection, parent) do
+      send(parent, {:released, connection})
+      :ok
+    end
+  end
+
   test "dispatches authenticated request data to configured policy" do
     key = :binary.copy(<<1>>, 32)
     request = request(key)
@@ -36,6 +55,21 @@ defmodule Derpex.AdmissionTest do
 
     assert Admission.authorize(fn _request -> {:error, :must_not_run} end, request) ==
              {:ok, %{mesh_peer?: true}}
+  end
+
+  test "dispatches optional connection claims and releases while preserving simple policies" do
+    request = request(:binary.copy(<<3>>, 32))
+
+    assert Admission.claim({AccountingPolicy, self()}, request, %{authorized?: true}, self()) ==
+             {:ok, %{authorized?: true, claimed?: true}}
+
+    node_key = request.node_key
+    assert_receive {:claimed, ^node_key, connection}
+    assert connection == self()
+    assert Admission.release({AccountingPolicy, self()}, self()) == :ok
+    assert_receive {:released, ^connection}
+
+    assert Admission.claim(fn _request -> {:ok, %{}} end, request, %{}, self()) == {:ok, %{}}
   end
 
   defp request(key) do

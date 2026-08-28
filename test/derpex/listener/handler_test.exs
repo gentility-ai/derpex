@@ -12,6 +12,28 @@ defmodule Derpex.Listener.HandlerTest do
   alias Derpex.RateConfig
   alias Derpex.RateController
 
+  defmodule LifecyclePolicy do
+    @behaviour Derpex.Admission
+
+    @impl true
+    def authorize(request, parent) do
+      send(parent, {:authorized_connection, request.node_key, self()})
+      {:ok, %{organization_id: "org_01"}}
+    end
+
+    @impl true
+    def claim(request, context, connection, parent) do
+      send(parent, {:claimed_connection, request.node_key, connection})
+      {:ok, context}
+    end
+
+    @impl true
+    def release(connection, parent) do
+      send(parent, {:released_connection, connection})
+      :ok
+    end
+  end
+
   test "official-style cleartext HTTP client completes an authenticated handshake" do
     {server_public, server_private} = Crypto.generate_keypair()
     {client_public, client_private} = Crypto.generate_keypair()
@@ -166,6 +188,35 @@ defmodule Derpex.Listener.HandlerTest do
     :gen_tcp.close(bad_socket)
     :gen_tcp.close(denied_socket)
     :gen_tcp.close(mesh_socket)
+  end
+
+  test "connection-scoped admission claims are released when the socket closes" do
+    {server_public, server_private} = Crypto.generate_keypair()
+    {client_public, client_private} = Crypto.generate_keypair()
+
+    {:ok, server} =
+      ThousandIsland.start_link(
+        port: 0,
+        transport_options: [ip: {127, 0, 0, 1}],
+        num_acceptors: 1,
+        handler_module: Handler,
+        handler_options: [
+          server_private_key: server_private,
+          admission: {LifecyclePolicy, self()}
+        ]
+      )
+
+    stop_server_on_exit(server)
+    {:ok, {_ip, port}} = ThousandIsland.listener_info(server)
+    socket = connect_and_send_info(port, server_public, client_private, %ClientInfo{})
+
+    assert_receive {:authorized_connection, ^client_public, handler}, 2_000
+    assert_receive {:claimed_connection, ^client_public, ^handler}, 2_000
+    assert {:ok, <<_server_info_type, length::unsigned-big-32>>} = :gen_tcp.recv(socket, 5, 2_000)
+    assert {:ok, _server_info} = :gen_tcp.recv(socket, length, 2_000)
+
+    :ok = :gen_tcp.close(socket)
+    assert_receive {:released_connection, ^handler}, 2_000
   end
 
   test "receive-byte limiting paces frame handling and leaves the socket under backpressure" do

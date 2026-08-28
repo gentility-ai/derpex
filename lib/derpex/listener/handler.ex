@@ -148,6 +148,10 @@ defmodule Derpex.Listener.Handler do
     {:noreply, {socket, state}}
   end
 
+  def handle_info({:derpex_admission_close, reason}, {socket, state}) do
+    {:stop, {:shutdown, {:admission, reason}}, {socket, state}}
+  end
+
   def handle_info({:derpex_timeout, name, token}, {socket, state}) do
     case state.timers[name] do
       {^token, _timer} -> handle_protocol_timeout(socket, state, name)
@@ -232,8 +236,14 @@ defmodule Derpex.Listener.Handler do
 
   defp execute_action(_socket, state, {:authenticated, key, info, can_mesh}) do
     case admit(state, key, info, can_mesh) do
-      {:ok, admission_context} ->
-        register_authenticated(state, key, info, can_mesh, admission_context)
+      {:ok, {admission_context, request}} ->
+        case Admission.claim(state.admission_policy, request, admission_context, self()) do
+          {:ok, admission_context} ->
+            register_authenticated(state, key, info, can_mesh, admission_context)
+
+          {:error, reason} ->
+            {:error, {:admission, reason}, state}
+        end
 
       {:error, reason} ->
         {:error, {:admission, reason}, state}
@@ -402,6 +412,7 @@ defmodule Derpex.Listener.Handler do
 
   defp cleanup(%{timers: _timers} = state) do
     cancel_all_timers(state)
+    :ok = Admission.release(state[:admission_policy], self())
 
     if state[:client_public_key] && Process.whereis(Router) do
       Router.unregister(state.client_public_key, self())
@@ -432,8 +443,9 @@ defmodule Derpex.Listener.Handler do
       metadata: Session.info(state.session).metadata
     }
 
-    with :ok <- app_name_allowed(state.disallowed_app_names, request) do
-      Admission.authorize(state.admission_policy, request)
+    with :ok <- app_name_allowed(state.disallowed_app_names, request),
+         {:ok, context} <- Admission.authorize(state.admission_policy, request) do
+      {:ok, {context, request}}
     end
   end
 

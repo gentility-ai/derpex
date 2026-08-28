@@ -72,6 +72,29 @@ defmodule Derpex.Admission.Gentility do
     :exit, _reason -> {:error, :admission_unavailable}
   end
 
+  @impl Derpex.Admission
+  def claim(%Request{} = request, context, connection, %Policy{} = policy)
+      when is_map(context) and is_pid(connection) do
+    controller_call(policy.server, {:claim, request.node_key, context, connection})
+  end
+
+  def claim(%Request{} = request, context, connection, server) do
+    claim(request, context, connection, policy(server))
+  catch
+    :exit, _reason -> {:error, :admission_unavailable}
+  end
+
+  @impl Derpex.Admission
+  def release(connection, %Policy{} = policy) when is_pid(connection) do
+    _result = controller_call(policy.server, {:release, connection})
+    :ok
+  end
+
+  def release(connection, server) when is_pid(connection) do
+    _result = controller_call(server, {:release, connection})
+    :ok
+  end
+
   @doc "Applies an authenticated revocation and closes all affected local duplicates."
   @spec revoke(GenServer.server(), binary()) :: {:ok, :applied | :stale} | {:error, term()}
   def revoke(server, signed_revocation) when is_binary(signed_revocation) do
@@ -109,6 +132,9 @@ defmodule Derpex.Admission.Gentility do
     reply = %{
       cache_entries: map_size(state.leases),
       revocations: map_size(state.revocations),
+      active_connections: map_size(state.claims),
+      active_nodes: map_size(state.node_connections),
+      active_organizations: map_size(state.organization_connections),
       active_requests: :atomics.get(state.policy.gate, 1),
       max_cache_entries: state.max_cache_entries,
       max_revocations: state.max_revocations,
@@ -149,6 +175,15 @@ defmodule Derpex.Admission.Gentility do
     end
   end
 
+  def handle_call({:claim, node_key, context, connection}, _from, state) do
+    state = purge_expired(state)
+    claim_connection(state, node_key, context, connection)
+  end
+
+  def handle_call({:release, connection}, _from, state) do
+    {:reply, :ok, release_connection(state, connection, true)}
+  end
+
   def handle_call({:revoke, wire}, _from, state) do
     case Contract.verify_revocation(wire, state.verification_keys) do
       {:ok, revocation} -> apply_one_revocation(state, wire, revocation)
@@ -182,6 +217,13 @@ defmodule Derpex.Admission.Gentility do
   end
 
   def handle_info({__MODULE__, :expire, _stale}, state), do: {:noreply, state}
+
+  def handle_info({:DOWN, monitor, :process, connection, _reason}, state) do
+    case state.claims[connection] do
+      %{monitor: ^monitor} -> {:noreply, release_connection(state, connection, false)}
+      _unknown -> {:noreply, state}
+    end
+  end
 
   @impl GenServer
   def terminate(_reason, state) do
@@ -227,8 +269,18 @@ defmodule Derpex.Admission.Gentility do
          max_future_skew_ms: max_future_skew_ms,
          clock: Keyword.get(options, :clock, Clock),
          close_peer: Keyword.get(options, :close_peer, &Router.close_peer/1),
+         close_connection:
+           Keyword.get(options, :close_connection, fn connection, reason ->
+             send(connection, {:derpex_admission_close, reason})
+           end),
          leases: %{},
          revocations: %{},
+         claims: %{},
+         node_connections: %{},
+         organization_connections: %{},
+         node_budgets: %{},
+         organization_budgets: %{},
+         closing_connections: MapSet.new(),
          sequence: 0,
          expiry_timer: nil,
          expiry_token: nil,
@@ -312,28 +364,48 @@ defmodule Derpex.Admission.Gentility do
     revoked_revision =
       state.revocations |> Map.get(lease.node_key, %{}) |> Map.get(:policy_revision, -1)
 
-    if lease.policy_revision <= revoked_revision do
-      {:reply, {:error, :lease_revoked}, state}
-    else
-      sequence = state.sequence + 1
-      entry = %{wire: wire, lease: lease, accessed: sequence}
+    cond do
+      lease.policy_revision <= revoked_revision ->
+        {:reply, {:error, :lease_revoked}, state}
 
-      {leases, evicted} =
-        put_bounded(state.leases, lease.node_key, entry, state.max_cache_entries)
+      stale_lease?(state.leases[lease.node_key], lease) ->
+        {:reply, {:error, :stale_lease}, state}
 
-      revocations = Map.delete(state.revocations, lease.node_key)
-      candidate = %{state | leases: leases, revocations: revocations, sequence: sequence}
-
-      case persist(candidate) do
-        :ok ->
-          close_evicted(state, evicted)
-          state = %{candidate | persist_error: nil} |> reschedule_expiry()
-          {:reply, {:ok, context(lease, :live)}, state}
-
-        {:error, reason} ->
-          {:reply, {:error, {:cache_persist, reason}}, %{state | persist_error: reason}}
-      end
+      true ->
+        install_live_lease(state, wire, lease)
     end
+  end
+
+  defp install_live_lease(state, wire, lease) do
+    sequence = state.sequence + 1
+    entry = %{wire: wire, lease: lease, accessed: sequence}
+    {leases, evicted} = put_bounded(state.leases, lease.node_key, entry, state.max_cache_entries)
+    revocations = Map.delete(state.revocations, lease.node_key)
+
+    candidate =
+      %{state | leases: leases, revocations: revocations, sequence: sequence}
+      |> rebuild_budgets()
+
+    close_evicted(candidate, evicted)
+    candidate = enforce_revised_budgets(candidate)
+
+    case persist(candidate) do
+      :ok ->
+        state = %{candidate | persist_error: nil} |> reschedule_expiry()
+        {:reply, {:ok, context(lease, :live)}, state}
+
+      {:error, reason} ->
+        state = %{candidate | persist_error: reason} |> reschedule_expiry()
+        {:reply, {:error, {:cache_persist, reason}}, state}
+    end
+  end
+
+  defp stale_lease?(nil, _lease), do: false
+
+  defp stale_lease?(%{lease: current}, lease) do
+    current.policy_revision > lease.policy_revision or
+      (current.policy_revision == lease.policy_revision and
+         current.quota_revision > lease.quota_revision)
   end
 
   defp apply_one_revocation(state, wire, revocation) do
@@ -397,7 +469,7 @@ defmodule Derpex.Admission.Gentility do
         & &1.revoked_at_ms
       )
 
-    {%{state | leases: leases, revocations: revocations}, close?}
+    {%{state | leases: leases, revocations: revocations} |> rebuild_budgets(), close?}
   end
 
   defp verify_revocations(wires, keys, maximum) when length(wires) <= maximum do
@@ -442,6 +514,189 @@ defmodule Derpex.Admission.Gentility do
     }
   end
 
+  defp claim_connection(state, node_key, context, connection) do
+    case state.claims[connection] do
+      %{node_key: ^node_key} ->
+        {:reply, {:ok, context}, state}
+
+      nil ->
+        claim_unregistered_connection(state, node_key, context, connection)
+
+      _different_claim ->
+        {:reply, {:error, :connection_already_claimed}, state}
+    end
+  end
+
+  defp claim_unregistered_connection(state, node_key, context, connection) do
+    with {:ok, lease} <- claim_lease(state, node_key, context),
+         :ok <- connection_budget_available(state, lease) do
+      sequence = state.sequence + 1
+
+      claim = %{
+        monitor: Process.monitor(connection),
+        node_key: node_key,
+        organization_id: lease.organization_id,
+        sequence: sequence,
+        node_budget: node_budget(lease),
+        organization_budget: organization_budget(lease)
+      }
+
+      state = %{
+        state
+        | claims: Map.put(state.claims, connection, claim),
+          node_connections: increment(state.node_connections, node_key),
+          organization_connections:
+            increment(state.organization_connections, lease.organization_id),
+          sequence: sequence
+      }
+
+      {:reply, {:ok, context}, rebuild_budgets(state)}
+    else
+      {:error, _reason} = error -> {:reply, error, state}
+    end
+  end
+
+  defp claim_lease(state, node_key, %{gentility: %{organization_id: organization_id}}) do
+    case state.leases[node_key] do
+      %{lease: %Lease{organization_id: ^organization_id} = lease} -> {:ok, lease}
+      %{lease: %Lease{}} -> {:error, :admission_context_mismatch}
+      nil -> {:error, :lease_not_cached}
+    end
+  end
+
+  defp claim_lease(_state, _node_key, _context), do: {:error, :invalid_admission_context}
+
+  defp connection_budget_available(state, lease) do
+    node_limit = state.node_budgets[lease.node_key].connection_limit
+    organization_limit = state.organization_budgets[lease.organization_id].connection_limit
+    node_count = Map.get(state.node_connections, lease.node_key, 0)
+    organization_count = Map.get(state.organization_connections, lease.organization_id, 0)
+
+    cond do
+      node_count >= node_limit -> {:error, :node_connection_limit}
+      organization_count >= organization_limit -> {:error, :organization_connection_limit}
+      true -> :ok
+    end
+  end
+
+  defp release_connection(state, connection, demonitor?) do
+    case Map.pop(state.claims, connection) do
+      {nil, _claims} ->
+        state
+
+      {claim, claims} ->
+        if demonitor?, do: Process.demonitor(claim.monitor, [:flush])
+
+        %{
+          state
+          | claims: claims,
+            node_connections: decrement(state.node_connections, claim.node_key),
+            organization_connections:
+              decrement(state.organization_connections, claim.organization_id),
+            closing_connections: MapSet.delete(state.closing_connections, connection)
+        }
+        |> rebuild_budgets()
+    end
+  end
+
+  defp increment(counts, key), do: Map.update(counts, key, 1, &(&1 + 1))
+
+  defp decrement(counts, key) do
+    case Map.get(counts, key, 0) do
+      count when count <= 1 -> Map.delete(counts, key)
+      count -> Map.put(counts, key, count - 1)
+    end
+  end
+
+  defp rebuild_budgets(state) do
+    {node_budgets, organization_budgets} =
+      Enum.reduce(state.leases, {%{}, %{}}, fn {_key, entry}, budgets ->
+        merge_budgets(budgets, node_budget(entry.lease), organization_budget(entry.lease))
+      end)
+
+    {node_budgets, organization_budgets} =
+      Enum.reduce(state.claims, {node_budgets, organization_budgets}, fn {_pid, claim}, budgets ->
+        merge_budgets(budgets, claim.node_budget, claim.organization_budget)
+      end)
+
+    %{state | node_budgets: node_budgets, organization_budgets: organization_budgets}
+  end
+
+  defp merge_budgets({node_budgets, organization_budgets}, node, organization) do
+    {
+      put_newer_budget(node_budgets, node.identity, node),
+      put_newer_budget(organization_budgets, organization.identity, organization)
+    }
+  end
+
+  defp put_newer_budget(budgets, identity, budget) do
+    case budgets[identity] do
+      %{revision: revision} when revision > budget.revision -> budgets
+      _older_or_missing -> Map.put(budgets, identity, budget)
+    end
+  end
+
+  defp node_budget(lease) do
+    %{
+      identity: lease.node_key,
+      revision: lease.quota_revision,
+      connection_limit: lease.node_connection_limit,
+      bytes_per_second: lease.node_bytes_per_second,
+      byte_burst: lease.node_byte_burst
+    }
+  end
+
+  defp organization_budget(lease) do
+    %{
+      identity: lease.organization_id,
+      revision: lease.quota_revision,
+      connection_limit: lease.organization_connection_limit,
+      bytes_per_second: lease.organization_bytes_per_second,
+      byte_burst: lease.organization_byte_burst
+    }
+  end
+
+  defp enforce_revised_budgets(state) do
+    state
+    |> over_limit_connections()
+    |> Enum.reject(&MapSet.member?(state.closing_connections, &1))
+    |> Enum.reduce(state, fn connection, state ->
+      state.close_connection.(connection, :quota_revision)
+      %{state | closing_connections: MapSet.put(state.closing_connections, connection)}
+    end)
+  end
+
+  defp over_limit_connections(state) do
+    node_excess =
+      Enum.flat_map(state.node_connections, fn {node_key, count} ->
+        limit = state.node_budgets[node_key].connection_limit
+        newest_claims(state, fn claim -> claim.node_key == node_key end, max(count - limit, 0))
+      end)
+
+    organization_excess =
+      Enum.flat_map(state.organization_connections, fn {organization_id, count} ->
+        limit = state.organization_budgets[organization_id].connection_limit
+
+        newest_claims(
+          state,
+          fn claim -> claim.organization_id == organization_id end,
+          max(count - limit, 0)
+        )
+      end)
+
+    Enum.uniq(node_excess ++ organization_excess)
+  end
+
+  defp newest_claims(_state, _filter, 0), do: []
+
+  defp newest_claims(state, filter, count) do
+    state.claims
+    |> Enum.filter(fn {_connection, claim} -> filter.(claim) end)
+    |> Enum.sort_by(fn {_connection, claim} -> claim.sequence end, :desc)
+    |> Enum.take(count)
+    |> Enum.map(&elem(&1, 0))
+  end
+
   defp load_cache(state) do
     case Cache.load(state.cache_path, state.max_cache_entries, state.max_revocations) do
       {:ok, {lease_wires, revocation_wires}} -> load_records(state, lease_wires, revocation_wires)
@@ -458,12 +713,14 @@ defmodule Derpex.Admission.Gentility do
         end
       end)
 
-    Enum.reduce(revocation_wires, state, fn wire, state ->
+    revocation_wires
+    |> Enum.reduce(state, fn wire, state ->
       case Contract.verify_revocation(wire, state.verification_keys) do
         {:ok, revocation} -> elem(put_revocation(state, wire, revocation), 0)
         {:error, _invalid} -> state
       end
     end)
+    |> rebuild_budgets()
   end
 
   defp put_loaded_lease(state, wire, lease) do
@@ -492,7 +749,7 @@ defmodule Derpex.Admission.Gentility do
         )
       end)
 
-    %{state | leases: Map.new(valid_leases), revocations: revocations}
+    %{state | leases: Map.new(valid_leases), revocations: revocations} |> rebuild_budgets()
   end
 
   defp purge_expired(state) do
@@ -505,7 +762,7 @@ defmodule Derpex.Admission.Gentility do
       state
     else
       Enum.each(expired, fn {key, _entry} -> close_peer(state, key) end)
-      state = %{state | leases: Map.new(valid)}
+      state = %{state | leases: Map.new(valid)} |> rebuild_budgets()
       persist_or_note_error(state)
     end
   end
