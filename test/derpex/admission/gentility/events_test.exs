@@ -121,11 +121,75 @@ defmodule Derpex.Admission.Gentility.EventsTest do
 
     events =
       start_supervised!(
-        {Events, controller: controller, adapter: {StalledAdapter, adapter}, clock: Manual}
+        {Events,
+         controller: controller,
+         adapter: {StalledAdapter, adapter},
+         clock: Manual,
+         worker_timeout_ms: 100,
+         backoff_ms: 50}
       )
 
     eventually(fn -> Events.stats(events).reconciling? end)
     assert Gentility.stats(controller).cache_entries == 0
+
+    Manual.advance(100)
+    eventually(fn -> Events.stats(events).last_error == :adapter_timeout end)
+    assert Events.stats(events).worker_timeouts == 1
+    refute Events.stats(events).reconciling?
+  end
+
+  test "an adapter returning early timeouts cannot spin the polling loop" do
+    {:ok, adapter} =
+      Agent.start_link(fn ->
+        %{
+          reconcile: [{:ok, [], "cursor"}],
+          stream: [{:timeout, "cursor"}, {:timeout, "cursor"}]
+        }
+      end)
+
+    controller = start_controller(self())
+
+    events =
+      start_supervised!(
+        {Events,
+         controller: controller,
+         adapter: {Adapter, adapter},
+         clock: Manual,
+         min_poll_interval_ms: 100}
+      )
+
+    eventually(fn -> Events.stats(events).early_timeouts == 1 end)
+    assert Agent.get(adapter, &length(&1.stream)) == 1
+    assert Events.stats(events).retrying?
+    Process.sleep(25)
+    assert Agent.get(adapter, &length(&1.stream)) == 1
+
+    Manual.advance(99)
+    assert Agent.get(adapter, &length(&1.stream)) == 1
+    Manual.advance(1)
+    eventually(fn -> Events.stats(events).early_timeouts == 2 end)
+    assert Agent.get(adapter, &length(&1.stream)) == 0
+  end
+
+  test "an abrupt consumer exit cannot orphan a stalled adapter worker" do
+    parent = self()
+
+    adapter = fn ->
+      send(parent, {:adapter_worker, self()})
+      receive do: (:release -> {:ok, [], "cursor"})
+    end
+
+    controller = start_controller(parent)
+
+    events =
+      start_supervised!(
+        {Events, controller: controller, adapter: {StalledAdapter, adapter}, clock: Manual}
+      )
+
+    assert_receive {:adapter_worker, worker}
+    monitor = Process.monitor(worker)
+    Process.exit(events, :kill)
+    assert_receive {:DOWN, ^monitor, :process, ^worker, _reason}
   end
 
   defp start_controller(parent) do

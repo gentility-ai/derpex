@@ -105,8 +105,11 @@ content-addressed usage batches. DERPEX starts the controller before listeners,
 resolves each listener to a lock-free policy handle, and uses `:rest_for_one`
 restart ordering so controller failure also replaces every stale listener
 handle. The event consumer reconciles before consuming revocations and repeats
-reconciliation after every stream failure. Set `DERPEX_GENTILITY_EVENTS=0`
-only for isolated contract tests; active revocation is required in production.
+reconciliation after every stream failure. Adapter operations have an enforced
+watchdog, and premature long-poll timeouts are paced so a faulty dependency
+cannot stall revocation forever or spin a scheduler. Set
+`DERPEX_GENTILITY_EVENTS=0` only for isolated contract tests; active revocation
+is required in production.
 
 Cached leases and usage batches are atomically persisted with mode `0600`.
 Unknown and expired nodes fail closed during outage. A full usage spool stops

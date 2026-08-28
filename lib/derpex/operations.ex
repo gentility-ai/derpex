@@ -254,7 +254,9 @@ defmodule Derpex.Operations do
           reconciling?: "derpex_gentility_events_reconciling",
           retrying?: "derpex_gentility_events_retrying",
           reconciliations: "derpex_gentility_events_reconciliations_total",
-          revocations: "derpex_gentility_events_revocations_total"
+          revocations: "derpex_gentility_events_revocations_total",
+          early_timeouts: "derpex_gentility_events_early_timeouts_total",
+          worker_timeouts: "derpex_gentility_events_worker_timeouts_total"
         }
 
         merge_named_snapshot(metrics, safe(fn -> Events.stats(Events) end), names)
