@@ -38,3 +38,8 @@ restarts. The UDP STUN service listens on port `3478` by default whenever the
 DERP listener is enabled. Set `DERPEX_STUN_PORT` to change it or
 `DERPEX_STUN=0` to disable it. Clear HTTP is available only through the
 explicit `DERPEX_CLEAR_HTTP=1` development setting.
+
+Regional connection watching is disabled unless `DERPEX_MESH_KEY` contains a
+64-digit hexadecimal key. Trusted clients advertise the same key in their
+encrypted `ClientInfo`; comparisons are constant-time and untrusted clients
+cannot subscribe to presence updates.

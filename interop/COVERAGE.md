@@ -12,8 +12,8 @@ disposition map and review that change together with `interop/upstream.lock`.
 | State | Count |
 | --- | ---: |
 | Total | 69 |
-| Ported | 17 |
-| Pending (release-blocking) | 48 |
+| Ported | 22 |
+| Pending (release-blocking) | 43 |
 | Implementation-specific | 4 |
 
 | Area | Upstream test | Source | Disposition | Gate/notes |
@@ -28,14 +28,14 @@ disposition map and review that change together with `interop/upstream.lock`.
 | DERP framing/client | `TestClientInfoUnmarshal` | `derp/derp_test.go:196` | `ported` | ported in test/derpex/client_info_test.exs; duplicate and field-type cases added |
 | DERP framing/client | `TestSendRecv` | `derp/derp_test.go:243` | `ported` | unchanged official clients cover source attribution, empty, and maximum packets |
 | DERP framing/client | `TestSendFreeze` | `derp/derp_test.go:464` | `ported` | adapted in test/derpex/writer_test.exs; a saturated frozen writer cannot stop another flow |
-| DERP framing/client | `TestWatch` | `derp/derp_test.go:875` | `pending` | release-blocking mapping not yet implemented |
-| DERP framing/client | `TestWatchAppName` | `derp/derp_test.go:915` | `pending` | release-blocking mapping not yet implemented |
+| DERP framing/client | `TestWatch` | `derp/derp_test.go:875` | `ported` | unchanged official mesh client covers snapshots and live connect/disconnect updates |
+| DERP framing/client | `TestWatchAppName` | `derp/derp_test.go:915` | `ported` | unchanged official mesh client verifies watcher app-name propagation |
 | DERP framing/client | `TestValidAppName` | `derp/derp_test.go:957` | `ported` | ported in test/derpex/client_info_test.exs; byte-length and ASCII behavior preserved |
 | DERP framing/client | `TestServerRepliesToPing` | `derp/derp_test.go:992` | `ported` | unchanged official client ping/pong gate in test/interop/go_client_test.exs |
-| DERP server | `TestSetMeshKey` | `derp/derpserver/derpserver_test.go:45` | `pending` | release-blocking mapping not yet implemented |
-| DERP server | `TestIsMeshPeer` | `derp/derpserver/derpserver_test.go:85` | `pending` | release-blocking mapping not yet implemented |
+| DERP server | `TestSetMeshKey` | `derp/derpserver/derpserver_test.go:45` | `ported` | ported parser and validation cases in test/derpex/mesh_key_test.exs |
+| DERP server | `TestIsMeshPeer` | `derp/derpserver/derpserver_test.go:85` | `ported` | ported constant-time trust cases in test/derpex/mesh_key_test.exs |
 | DERP server | `TestVerifyClientDisallowedAppNames` | `derp/derpserver/derpserver_test.go:138` | `pending` | release-blocking mapping not yet implemented |
-| DERP server | `TestRecvClientKeyAppName` | `derp/derpserver/derpserver_test.go:169` | `pending` | release-blocking mapping not yet implemented |
+| DERP server | `TestRecvClientKeyAppName` | `derp/derpserver/derpserver_test.go:169` | `ported` | ported encrypted ClientInfo and app-name validation in handshake and client-info tests |
 | DERP server | `TestForwarderRegistration` | `derp/derpserver/derpserver_test.go:221` | `pending` | release-blocking mapping not yet implemented |
 | DERP server | `TestMultiForwarder` | `derp/derpserver/derpserver_test.go:349` | `pending` | release-blocking mapping not yet implemented |
 | DERP server | `TestMetaCert` | `derp/derpserver/derpserver_test.go:405` | `ported` | ported certificate shape plus official TLS fast-start gate |

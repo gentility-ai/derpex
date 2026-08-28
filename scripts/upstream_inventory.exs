@@ -46,6 +46,12 @@ defmodule Derpex.UpstreamInventory do
       "ported certificate shape plus official TLS fast-start gate",
     {"derp/derpserver/derpserver_test.go", "TestServerDupClients"} =>
       "ported lifecycle cases and unchanged official last-writer-active client gate",
+    {"derp/derpserver/derpserver_test.go", "TestSetMeshKey"} =>
+      "ported parser and validation cases in test/derpex/mesh_key_test.exs",
+    {"derp/derpserver/derpserver_test.go", "TestIsMeshPeer"} =>
+      "ported constant-time trust cases in test/derpex/mesh_key_test.exs",
+    {"derp/derpserver/derpserver_test.go", "TestRecvClientKeyAppName"} =>
+      "ported encrypted ClientInfo and app-name validation in handshake and client-info tests",
     {"cmd/derper/derper_test.go", "TestNoContent"} =>
       "ported all challenge validity cases in test/derpex/http1_test.exs",
     {"derp/derp_test.go", "TestClientInfoUnmarshal"} =>
@@ -58,6 +64,10 @@ defmodule Derpex.UpstreamInventory do
       "unchanged official clients cover source attribution, empty, and maximum packets",
     {"derp/derp_test.go", "TestServerRepliesToPing"} =>
       "unchanged official client ping/pong gate in test/interop/go_client_test.exs",
+    {"derp/derp_test.go", "TestWatch"} =>
+      "unchanged official mesh client covers snapshots and live connect/disconnect updates",
+    {"derp/derp_test.go", "TestWatchAppName"} =>
+      "unchanged official mesh client verifies watcher app-name propagation",
     {"derp/derp_test.go", "TestValidAppName"} =>
       "ported in test/derpex/client_info_test.exs; byte-length and ASCII behavior preserved",
     {"derp/derp_test.go", "TestWriteFrameHeader"} =>

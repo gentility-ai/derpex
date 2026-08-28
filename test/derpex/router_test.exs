@@ -108,4 +108,91 @@ defmodule Derpex.RouterTest do
     Process.exit(first, :kill)
     Process.exit(second, :kill)
   end
+
+  test "trusted watchers receive an active snapshot and future presence changes" do
+    first_key = :crypto.strong_rand_bytes(32)
+    second_key = :crypto.strong_rand_bytes(32)
+    first_connection = spawn(fn -> Process.sleep(:infinity) end)
+    second_connection = spawn(fn -> Process.sleep(:infinity) end)
+    watcher = spawn(fn -> Process.sleep(:infinity) end)
+    first_ring = Ring.new(4)
+    second_ring = Ring.new(4)
+    watcher_ring = Ring.new(8)
+
+    first_presence = %{
+      ip: <<0::80, 0xFFFF::16, 127, 0, 0, 1>>,
+      port: 12_345,
+      flags: 0x01,
+      app_name: "test-app"
+    }
+
+    second_presence = %{
+      ip: <<0::128>>,
+      port: 23_456,
+      flags: 0x06,
+      app_name: ""
+    }
+
+    assert Router.register(
+             first_key,
+             first_connection,
+             first_ring,
+             first_ring,
+             first_ring,
+             first_presence
+           ) == :ok
+
+    assert Router.watch(watcher, watcher_ring) == :ok
+
+    assert Ring.take(watcher_ring) ==
+             {:ok,
+              {:peer_present, first_key, first_presence.ip, first_presence.port,
+               first_presence.flags, first_presence.app_name}}
+
+    assert Router.register(
+             second_key,
+             second_connection,
+             second_ring,
+             second_ring,
+             second_ring,
+             second_presence
+           ) == :ok
+
+    assert Ring.take(watcher_ring) ==
+             {:ok,
+              {:peer_present, second_key, second_presence.ip, second_presence.port,
+               second_presence.flags, second_presence.app_name}}
+
+    assert Router.unregister(second_key, second_connection) == :ok
+    assert Ring.take(watcher_ring) == {:ok, {:peer_gone, second_key, 0x00}}
+
+    assert Router.unregister(first_key, first_connection) == :ok
+    Process.exit(first_connection, :kill)
+    Process.exit(second_connection, :kill)
+    Process.exit(watcher, :kill)
+  end
+
+  test "a vanished ring owner becomes a drop instead of crashing topology state" do
+    parent = self()
+
+    owner =
+      spawn(fn ->
+        send(parent, {:stale_ring, Ring.new(1)})
+      end)
+
+    monitor = Process.monitor(owner)
+    assert_receive {:stale_ring, stale_ring}
+    assert_receive {:DOWN, ^monitor, :process, ^owner, _reason}
+
+    source = :crypto.strong_rand_bytes(32)
+    source_connection = spawn(fn -> Process.sleep(:infinity) end)
+    source_ring = Ring.new(1)
+
+    assert Router.register(source, source_connection, source_ring) == :ok
+    assert Router.note_send(source, self(), stale_ring) == :ok
+    assert Router.unregister(source, source_connection) == :ok
+    assert Process.alive?(Process.whereis(Router))
+
+    Process.exit(source_connection, :kill)
+  end
 end

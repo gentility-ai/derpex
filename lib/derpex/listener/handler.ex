@@ -4,6 +4,7 @@ defmodule Derpex.Listener.Handler do
   use ThousandIsland.Handler
 
   alias Derpex.Clock
+  alias Derpex.Crypto
   alias Derpex.Outbox.Ring
   alias Derpex.RateLimiter
   alias Derpex.Router
@@ -15,9 +16,11 @@ defmodule Derpex.Listener.Handler do
   @impl ThousandIsland.Handler
   def handle_connection(socket, options) do
     server_private_key = Keyword.fetch!(options, :server_private_key)
+    mesh_key = Keyword.get(options, :mesh_key)
     event_handler = Keyword.get(options, :event_handler, fn _event -> :ok end)
 
-    with {:ok, writer} <- Writer.start_link(owner: self(), transport: Transport, socket: socket),
+    with {:ok, server_public_key} <- Crypto.public_key(server_private_key),
+         {:ok, writer} <- Writer.start_link(owner: self(), transport: Transport, socket: socket),
          ordinary =
            Ring.new(32, notifier: writer, wake_message: Writer.wake_message()),
          disco =
@@ -33,7 +36,7 @@ defmodule Derpex.Listener.Handler do
              pong: pong,
              lifecycle: lifecycle
            }),
-         {:ok, session, actions} <- Session.new(server_private_key) do
+         {:ok, session, actions} <- Session.new(server_private_key, mesh_key: mesh_key) do
       state = %{
         session: session,
         timers: %{},
@@ -46,7 +49,11 @@ defmodule Derpex.Listener.Handler do
         peer_gone_limiter: RateLimiter.new(1, 3),
         wire_mode: :native,
         websocket_decoder: WebSocketFrame.new(),
-        client_public_key: nil
+        client_public_key: nil,
+        client_info: nil,
+        can_mesh: false,
+        server_public_key: server_public_key,
+        remote_address: remote_address(socket)
       }
 
       continue_after_actions(socket, state, actions)
@@ -153,11 +160,23 @@ defmodule Derpex.Listener.Handler do
     {:ok, cancel_timer(state, name)}
   end
 
-  defp execute_action(_socket, state, {:authenticated, key, info}) do
-    :ok = Router.register(key, self(), state.ordinary, state.disco, state.lifecycle)
+  defp execute_action(_socket, state, {:authenticated, key, info, can_mesh}) do
+    presence = presence(state, info, can_mesh)
+
+    :ok =
+      Router.register(
+        key,
+        self(),
+        state.ordinary,
+        state.disco,
+        state.lifecycle,
+        presence
+      )
 
     state
     |> Map.put(:client_public_key, key)
+    |> Map.put(:client_info, info)
+    |> Map.put(:can_mesh, can_mesh)
     |> dispatch_event({:authenticated, key, info})
   end
 
@@ -231,6 +250,14 @@ defmodule Derpex.Listener.Handler do
   defp handle_client_message(state, message)
        when elem(message, 0) in [:forward_packet, :close_peer] do
     {:error, :insufficient_permissions, state}
+  end
+
+  defp handle_client_message(%{can_mesh: true} = state, :watch_connections) do
+    if state.client_public_key != state.server_public_key do
+      :ok = Router.watch(self(), state.lifecycle)
+    end
+
+    {:ok, state}
   end
 
   defp handle_client_message(state, :watch_connections),
@@ -316,4 +343,47 @@ defmodule Derpex.Listener.Handler do
   end
 
   defp close_ring(_ring), do: :ok
+
+  defp remote_address(socket) do
+    case Transport.peername(socket) do
+      {:ok, {ip, port}} -> {ip, port}
+      {:error, _reason} -> {{0, 0, 0, 0}, 0}
+    end
+  end
+
+  defp presence(state, info, can_mesh) do
+    {ip, port} = state.remote_address
+
+    %{
+      ip: encode_ip(ip),
+      port: port,
+      flags: presence_flags(info, can_mesh, state.session),
+      app_name: info.app_name
+    }
+  end
+
+  defp encode_ip({a, b, c, d}), do: <<0::80, 0xFFFF::16, a, b, c, d>>
+
+  defp encode_ip({a, b, c, d, e, f, g, h}),
+    do: <<a::16, b::16, c::16, d::16, e::16, f::16, g::16, h::16>>
+
+  defp presence_flags(info, can_mesh, session) do
+    flags =
+      0
+      |> maybe_flag(info.is_prober, 0x04)
+      |> maybe_flag(can_mesh, 0x02)
+      |> maybe_flag(not_ideal?(session), 0x08)
+
+    if flags == 0, do: 0x01, else: flags
+  end
+
+  defp maybe_flag(flags, true, flag), do: Bitwise.bor(flags, flag)
+  defp maybe_flag(flags, false, _flag), do: flags
+
+  defp not_ideal?(session) do
+    case Session.info(session).metadata.ideal_node do
+      value when is_binary(value) -> value != ""
+      nil -> false
+    end
+  end
 end

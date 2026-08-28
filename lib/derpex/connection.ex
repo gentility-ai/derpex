@@ -13,6 +13,7 @@ defmodule Derpex.Connection do
   alias Derpex.Frame.Body
   alias Derpex.Frame.Decoder
   alias Derpex.Handshake
+  alias Derpex.MeshKey
   alias Derpex.ServerInfo
 
   @handshake_timeout 10_000
@@ -25,6 +26,8 @@ defmodule Derpex.Connection do
     :phase,
     :client_public_key,
     :client_info,
+    :mesh_key,
+    :can_mesh,
     :keep_alive_interval,
     :close_reason
   ]
@@ -34,7 +37,7 @@ defmodule Derpex.Connection do
           {:send, iodata()}
           | {:set_timeout, :handshake, pos_integer()}
           | {:cancel_timeout, :handshake}
-          | {:authenticated, binary(), ClientInfo.t()}
+          | {:authenticated, binary(), ClientInfo.t(), boolean()}
           | :activity
           | {:server_message, Body.server_message()}
           | {:client_message, Body.client_message()}
@@ -46,6 +49,8 @@ defmodule Derpex.Connection do
             phase: phase(),
             client_public_key: nil | binary(),
             client_info: nil | ClientInfo.t(),
+            mesh_key: nil | MeshKey.t(),
+            can_mesh: boolean(),
             keep_alive_interval: pos_integer(),
             close_reason: nil | term()
           }
@@ -64,6 +69,8 @@ defmodule Derpex.Connection do
         phase: :awaiting_client_info,
         client_public_key: nil,
         client_info: nil,
+        mesh_key: Keyword.get(options, :mesh_key),
+        can_mesh: false,
         keep_alive_interval: 60_000 + keep_alive_jitter(options),
         close_reason: nil
       }
@@ -114,6 +121,7 @@ defmodule Derpex.Connection do
       phase: state.phase,
       client_public_key: state.client_public_key,
       client_info: state.client_info,
+      can_mesh: state.can_mesh,
       close_reason: state.close_reason
     }
   end
@@ -141,7 +149,7 @@ defmodule Derpex.Connection do
   end
 
   defp process_buffered_frame(state, rest, actions, frame) do
-    case decode_client_frame(frame) do
+    case decode_client_frame(state, frame) do
       {:ok, message} ->
         process_frames(state, rest, [{:client_message, message}, :activity | actions])
 
@@ -170,16 +178,23 @@ defmodule Derpex.Connection do
              client_public_key,
              state.server_info
            ) do
+      can_mesh = MeshKey.trusted?(state.mesh_key, client_info.mesh_key)
+
       state = %{
         state
         | phase: :authenticated,
           client_public_key: client_public_key,
           client_info: client_info,
-          decoder: Decoder.with_frame_policy(state.decoder, &authenticated_frame_policy/2)
+          can_mesh: can_mesh,
+          decoder:
+            Decoder.with_frame_policy(
+              state.decoder,
+              &authenticated_frame_policy(&1, &2, can_mesh)
+            )
       }
 
       actions = [
-        {:authenticated, client_public_key, client_info},
+        {:authenticated, client_public_key, client_info, can_mesh},
         {:send, server_info},
         {:cancel_timeout, :handshake},
         {:set_timeout, :keep_alive, state.keep_alive_interval}
@@ -189,7 +204,21 @@ defmodule Derpex.Connection do
     end
   end
 
-  defp decode_client_frame({type, body}), do: Body.decode_client(type, body)
+  defp decode_client_frame(state, {type, body}) do
+    case Body.decode_client(type, body) do
+      {:ok, message} -> authorize_client_message(state, message)
+      other -> other
+    end
+  end
+
+  defp authorize_client_message(%{can_mesh: false}, message)
+       when elem(message, 0) in [:forward_packet, :close_peer],
+       do: {:error, :insufficient_permissions}
+
+  defp authorize_client_message(%{can_mesh: false}, :watch_connections),
+    do: {:error, :insufficient_permissions}
+
+  defp authorize_client_message(_state, message), do: {:ok, message}
 
   defp handshake_frame_policy(type, length) do
     cond do
@@ -200,11 +229,11 @@ defmodule Derpex.Connection do
         :buffer
 
       true ->
-        authenticated_frame_policy(type, length)
+        authenticated_frame_policy(type, length, :pending)
     end
   end
 
-  defp authenticated_frame_policy(type, length) do
+  defp authenticated_frame_policy(type, length, mesh_permission) do
     case Frame.type_name(type) do
       {:ok, :send_packet} ->
         bounded(length, 32 + 65_536)
@@ -214,6 +243,15 @@ defmodule Derpex.Connection do
 
       {:ok, :note_preferred} ->
         exact(length, 1, :note_preferred_wrong_size)
+
+      {:ok, :forward_packet} when mesh_permission in [true, :pending] ->
+        bounded(length, 64 + 65_536)
+
+      {:ok, :watch_connections} when mesh_permission in [true, :pending] ->
+        exact(length, 0, :watch_connections_wrong_size)
+
+      {:ok, :close_peer} when mesh_permission in [true, :pending] ->
+        exact(length, 32, :close_peer_wrong_size)
 
       {:ok, name} when name in [:forward_packet, :watch_connections, :close_peer] ->
         {:error, :insufficient_permissions}

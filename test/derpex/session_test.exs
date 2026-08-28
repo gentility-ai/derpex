@@ -23,7 +23,7 @@ defmodule Derpex.SessionTest do
              {:send, http_response},
              {:send, greeting},
              {:set_timeout, :handshake, 10_000},
-             {:authenticated, ^client_public, ^client_info},
+             {:authenticated, ^client_public, ^client_info, false},
              {:send, _server_info},
              {:cancel_timeout, :handshake},
              {:set_timeout, :keep_alive, keep_alive_interval}

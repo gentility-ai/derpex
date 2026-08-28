@@ -37,7 +37,7 @@ defmodule Derpex.ConnectionTest do
       end)
 
     assert [
-             {:authenticated, ^client_public, ^client_info},
+             {:authenticated, ^client_public, ^client_info, false},
              {:send, server_info_frame},
              {:cancel_timeout, :handshake},
              {:set_timeout, :keep_alive, keep_alive_interval}
@@ -75,7 +75,7 @@ defmodule Derpex.ConnectionTest do
              )
 
     assert [
-             {:authenticated, ^client_public, ^client_info},
+             {:authenticated, ^client_public, ^client_info, false},
              {:send, _server_info},
              {:cancel_timeout, :handshake},
              {:set_timeout, :keep_alive, _interval},
@@ -104,6 +104,45 @@ defmodule Derpex.ConnectionTest do
                 {:server_message, :keep_alive},
                 {:set_timeout, :keep_alive, 64_999}
               ]}
+  end
+
+  test "only a constant-time authenticated mesh peer may watch connections" do
+    {server_public, server_private} = Crypto.generate_keypair()
+    {client_public, client_private} = Crypto.generate_keypair()
+    mesh_key = :binary.copy(<<7>>, 32)
+    client_info = %ClientInfo{version: 2, mesh_key: mesh_key}
+
+    {:ok, client_info_frame} =
+      Handshake.client_info_frame(client_private, server_public, client_info)
+
+    watch_frame = Frame.encode(:watch_connections, "")
+
+    {:ok, state, _actions} = Connection.new(server_private, mesh_key: mesh_key)
+
+    assert {:ok, state, actions} =
+             Connection.receive_data(state, IO.iodata_to_binary([client_info_frame, watch_frame]))
+
+    assert [
+             {:authenticated, ^client_public, ^client_info, true},
+             {:send, _server_info},
+             {:cancel_timeout, :handshake},
+             {:set_timeout, :keep_alive, _interval},
+             :activity,
+             {:client_message, :watch_connections}
+           ] = actions
+
+    assert Connection.info(state).can_mesh
+
+    {:ok, untrusted, _actions} =
+      Connection.new(server_private, mesh_key: :binary.copy(<<8>>, 32))
+
+    assert {:close, _state, :insufficient_permissions, prior_actions} =
+             Connection.receive_data(
+               untrusted,
+               IO.iodata_to_binary([client_info_frame, watch_frame])
+             )
+
+    assert [{:authenticated, ^client_public, ^client_info, false} | _rest] = prior_actions
   end
 
   test "closes on the wrong first frame, malformed bodies, and handshake timeout" do

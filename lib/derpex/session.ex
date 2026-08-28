@@ -18,6 +18,7 @@ defmodule Derpex.Session do
     :server_private_key,
     :server_public_key,
     :http_parser,
+    :connection_options,
     :connection,
     :metadata,
     :close_reason
@@ -36,6 +37,7 @@ defmodule Derpex.Session do
             server_private_key: binary(),
             server_public_key: binary(),
             http_parser: Parser.t(),
+            connection_options: keyword(),
             connection: nil | Connection.t(),
             metadata: map(),
             close_reason: nil | term()
@@ -50,6 +52,7 @@ defmodule Derpex.Session do
         server_private_key: server_private_key,
         server_public_key: server_public_key,
         http_parser: Parser.new(Keyword.get(options, :http_parser, [])),
+        connection_options: Keyword.take(options, [:mesh_key]),
         connection: nil,
         metadata: %{},
         close_reason: nil
@@ -115,7 +118,8 @@ defmodule Derpex.Session do
   end
 
   defp route_http(state, {:upgrade, :websocket, response, metadata}, read_ahead) do
-    with {:ok, connection, connection_actions} <- Connection.new(state.server_private_key) do
+    with {:ok, connection, connection_actions} <-
+           Connection.new(state.server_private_key, state.connection_options) do
       state = %{state | phase: :derp, connection: connection, metadata: metadata}
 
       actions =
@@ -127,7 +131,8 @@ defmodule Derpex.Session do
   end
 
   defp route_http(state, {:upgrade, :derp, response, metadata}, read_ahead) do
-    with {:ok, connection, connection_actions} <- Connection.new(state.server_private_key) do
+    with {:ok, connection, connection_actions} <-
+           Connection.new(state.server_private_key, state.connection_options) do
       state = %{state | phase: :derp, connection: connection, metadata: metadata}
       actions = [{:cancel_timeout, :http}] ++ maybe_send(response) ++ connection_actions
       receive_read_ahead(state, read_ahead, actions)
