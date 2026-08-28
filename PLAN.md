@@ -435,24 +435,27 @@ No test may silently disappear, and a release may contain no `pending` rows.
 3. **Go black-box conformance tests** use unchanged official `derp.Client` and
    `derphttp.Client` code against a DERPEX listener. A raw Go driver supplies
    malformed and extension frames the normal client cannot emit.
-4. **Differential tests** start the pinned Go server and DERPEX with equivalent
+4. **Oracle-health tests** execute the exact pinned Go packages represented by
+   the compatibility inventory. They prove the reference remains reproducible;
+   the reviewed mapping and DERPEX-facing gates prove implementation behavior.
+5. **Differential tests** start the pinned Go server and DERPEX with equivalent
    identity/configuration, replay a scenario, normalize nondeterminism, and
    compare semantic traces.
-5. **Rust interoperability tests** use the pinned `ts_derp` client for a
+6. **Rust interoperability tests** use the pinned `ts_derp` client for a
    separate handshake/send/receive smoke gate.
-6. **Tailscaled-stack tests** run two pinned official `tsnet` nodes through
+7. **Tailscaled-stack tests** run two pinned official `tsnet` nodes through
    LocalBackend, magicsock, WireGuard, and DERPEX, force the path away from
    direct UDP, and require Tailscale's DERP data counters to advance around a
    successful encrypted tunnel ping.
-7. **System tests** cover TLS, WebSocket, STUN, signals, config reload,
+8. **System tests** cover TLS, WebSocket, STUN, signals, config reload,
    admission dependencies, and multiple OS processes.
-8. **Gentility contract tests** run DERPEX with a version-matched fake and real
+9. **Gentility contract tests** run DERPEX with a version-matched fake and real
    mothership service through authorization, outage, revocation, reconciliation,
    quota, usage-spool, drain, and rollback scenarios.
-9. **Artifact tests** inspect and boot the final OCI/OTP artifacts, asserting
+10. **Artifact tests** inspect and boot the final OCI/OTP artifacts, asserting
    that no Go or Rust executable, compiler, source tree, or test helper entered
    the runtime filesystem.
-10. **Benchmarks and soak tests** measure throughput, latency, mailbox growth,
+11. **Benchmarks and soak tests** measure throughput, latency, mailbox growth,
    memory retention, and slow-client isolation.
 
 ### 5.3 Intended commands

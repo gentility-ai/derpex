@@ -100,6 +100,17 @@ jobs:
           diff="$(gofmt -d interop/go)"
           test -z "$diff" || { printf '%s\n' "$diff"; exit 1; }
 
+      - name: Run pinned upstream oracle packages
+        working-directory: upstream/tailscale
+        run: >-
+          go test -count=1
+          ./derp
+          ./derp/derpserver
+          ./derp/derphttp
+          ./cmd/derper
+          ./prober
+          ./derp/xdp
+
       - name: Run Go clients, differential oracle, and tsnet-stack smokes
         run: >-
           mix test test/interop/go_client_test.exs
