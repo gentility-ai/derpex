@@ -44,6 +44,15 @@ The canonical SHA-256 vectors in `ContractTest` are the language-neutral v1
 fixtures. Any Gentility implementation must produce those exact records before
 the joint contract gate passes.
 
+Usage export uses a separate canonical `DXUB` version-1 record. It identifies
+the DERPEX instance, region, fixed window, and sorted sender-attribution
+entries. Entries contain Gentility node, organization, owner kind, deployment,
+and accepted/dropped packet and byte totals. They never contain a destination,
+peer relationship, payload, source IP, or packet timing. The SHA-256 digest of
+the complete record is its idempotency key. Export transport must authenticate
+the DERPEX instance; usage records are not bearer authorization and are not
+individually signed. `UsageContractTest` fixes the cross-language vector.
+
 ## Consequences
 
 - Cached authorization remains verifiable without a live control-plane call.
