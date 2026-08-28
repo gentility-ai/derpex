@@ -19,6 +19,7 @@ defmodule Derpex.Listener.Handler do
   alias Derpex.Router
   alias Derpex.SendQueueConfig
   alias Derpex.Session
+  alias Derpex.SocketOptions
   alias Derpex.Transport.ThousandIsland, as: Transport
   alias Derpex.WebSocket.Frame, as: WebSocketFrame
   alias Derpex.Writer
@@ -122,7 +123,13 @@ defmodule Derpex.Listener.Handler do
         remote_address: remote_address,
         accept_limiter: accept_limiter,
         drain: drain,
-        metrics: metrics
+        metrics: metrics,
+        mesh_write_timeout:
+          Keyword.get(
+            options,
+            :mesh_write_timeout,
+            SocketOptions.mesh_write_timeout_ms()
+          )
       }
 
       continue_after_actions(socket, state, actions)
@@ -269,7 +276,12 @@ defmodule Derpex.Listener.Handler do
     rate_limit(socket, state, frame_length)
   end
 
-  defp execute_action(_socket, state, {:authenticated, key, info, can_mesh}) do
+  defp execute_action(socket, state, {:authenticated, key, info, can_mesh}) do
+    if can_mesh do
+      _ignored =
+        SocketOptions.configure_mesh_write_timeout(socket, state.mesh_write_timeout)
+    end
+
     case admit(state, key, info, can_mesh) do
       {:ok, {admission_context, request}} ->
         case Admission.claim(state.admission_policy, request, admission_context, self()) do

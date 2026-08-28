@@ -61,6 +61,14 @@ client-advertised app names to reject before registration. Trusted mesh peers
 are exempt, matching the baseline server. Embedders can also supply a
 `Derpex.Admission` policy in listener handler options for product authorization.
 
+Listener sockets match the pinned server's production bounds: TCP keepalive
+starts after 10 minutes, Linux `TCP_USER_TIMEOUT` is 15 seconds, ordinary
+client writes time out after 2 seconds, and authenticated mesh writes use the
+upstream 30-second privileged timeout. Override the first three values with
+`DERPEX_TCP_KEEPALIVE_MS`, `DERPEX_TCP_USER_TIMEOUT_MS`, and
+`DERPEX_TCP_WRITE_TIMEOUT_MS`; a write timeout of `0` disables that deadline.
+`TCP_USER_TIMEOUT` is a logged no-op outside Linux.
+
 Set `DERPEX_RATE_CONFIG` to an upstream-compatible JSON file containing
 `PerClientRateLimitBytesPerSec` and `PerClientRateBurstBytes`. Enabled buckets
 are clamped to hold at least one maximum DERP packet, and live updates through

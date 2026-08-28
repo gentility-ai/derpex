@@ -51,6 +51,20 @@ if config_env() == :prod do
 
     stun_port_text = System.get_env("DERPEX_STUN_PORT", "3478")
 
+    parse_milliseconds = fn name, default, minimum ->
+      case Integer.parse(System.get_env(name, Integer.to_string(default))) do
+        {value, ""} when value >= minimum and value <= 0xFFFF_FFFF ->
+          value
+
+        _invalid ->
+          raise "#{name} must be an integer from #{minimum} through 4294967295"
+      end
+    end
+
+    tcp_keepalive_ms = parse_milliseconds.("DERPEX_TCP_KEEPALIVE_MS", 600_000, 1)
+    tcp_user_timeout_ms = parse_milliseconds.("DERPEX_TCP_USER_TIMEOUT_MS", 15_000, 0)
+    tcp_write_timeout_ms = parse_milliseconds.("DERPEX_TCP_WRITE_TIMEOUT_MS", 2_000, 0)
+
     mesh_key =
       case mesh_key_text do
         nil ->
@@ -272,13 +286,16 @@ if config_env() == :prod do
           [
             port: port,
             transport_module: ThousandIsland.Transports.SSL,
+            socket_options: [
+              keepalive_ms: tcp_keepalive_ms,
+              user_timeout_ms: tcp_user_timeout_ms,
+              write_timeout_ms: tcp_write_timeout_ms
+            ],
             transport_options: [
               certfile: certfile,
               keyfile: keyfile,
               versions: [:"tlsv1.3"],
-              alpn_preferred_protocols: ["http/1.1"],
-              send_timeout: 2_000,
-              send_timeout_close: true
+              alpn_preferred_protocols: ["http/1.1"]
             ]
           ]
 
@@ -286,7 +303,11 @@ if config_env() == :prod do
           [
             port: port,
             transport_module: ThousandIsland.Transports.TCP,
-            transport_options: [send_timeout: 2_000, send_timeout_close: true]
+            socket_options: [
+              keepalive_ms: tcp_keepalive_ms,
+              user_timeout_ms: tcp_user_timeout_ms,
+              write_timeout_ms: tcp_write_timeout_ms
+            ]
           ]
 
         true ->

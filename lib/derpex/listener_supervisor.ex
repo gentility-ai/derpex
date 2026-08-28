@@ -7,6 +7,7 @@ defmodule Derpex.ListenerSupervisor do
   alias Derpex.Certificates
   alias Derpex.Crypto
   alias Derpex.Listener.Handler
+  alias Derpex.SocketOptions
 
   @spec start_link({[keyword()], binary()}) :: Supervisor.on_start()
   def start_link({listeners, server_private_key}) do
@@ -21,18 +22,21 @@ defmodule Derpex.ListenerSupervisor do
   end
 
   defp listener_child(options, server_private_key) do
+    {socket_options, options} = Keyword.pop(options, :socket_options, [])
+
     handler_options =
       options
       |> Keyword.get(:handler_options, [])
       |> resolve_admission()
+      |> Keyword.put_new(:mesh_write_timeout, SocketOptions.mesh_write_timeout_ms())
       |> Keyword.put(:server_private_key, server_private_key)
 
     options =
       options
       |> Keyword.put(:handler_module, Handler)
       |> Keyword.put(:handler_options, handler_options)
-      |> ensure_write_timeout()
       |> configure_tls(server_private_key)
+      |> configure_socket(socket_options)
 
     {ThousandIsland, options}
   end
@@ -48,12 +52,13 @@ defmodule Derpex.ListenerSupervisor do
     end
   end
 
-  defp ensure_write_timeout(options) do
+  defp configure_socket(options, socket_options) do
+    :ok = SocketOptions.log_platform_notice(socket_options)
+
     transport_options =
       options
       |> Keyword.get(:transport_options, [])
-      |> Keyword.put_new(:send_timeout, 2_000)
-      |> Keyword.put_new(:send_timeout_close, true)
+      |> SocketOptions.listener_options(socket_options)
 
     Keyword.put(options, :transport_options, transport_options)
   end
