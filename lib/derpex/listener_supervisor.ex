@@ -3,6 +3,7 @@ defmodule Derpex.ListenerSupervisor do
 
   use Supervisor
 
+  alias Derpex.Admission.Gentility
   alias Derpex.Certificates
   alias Derpex.Crypto
   alias Derpex.Listener.Handler
@@ -23,6 +24,7 @@ defmodule Derpex.ListenerSupervisor do
     handler_options =
       options
       |> Keyword.get(:handler_options, [])
+      |> resolve_admission()
       |> Keyword.put(:server_private_key, server_private_key)
 
     options =
@@ -33,6 +35,17 @@ defmodule Derpex.ListenerSupervisor do
       |> configure_tls(server_private_key)
 
     {ThousandIsland, options}
+  end
+
+  defp resolve_admission(handler_options) do
+    case Keyword.get(handler_options, :admission) do
+      {:gentility, server} ->
+        policy = Gentility.policy(server)
+        Keyword.put(handler_options, :admission, {Gentility, policy})
+
+      _other ->
+        handler_options
+    end
   end
 
   defp ensure_write_timeout(options) do

@@ -15,6 +15,13 @@ proxy or load balancer.
 - Go DERP is not a production dependency or fallback.
 - The runtime artifact contains an OTP release and precompiled NIF only. It
   contains no Go/Rust toolchain, upstream checkout, or conformance helper.
+- The release includes a module implementing
+  `Derpex.Admission.Gentility.ControlPlane`; its authenticated transport is a
+  Gentility-owned integration, while leases, revocations, reconciliation, and
+  usage batches use DERPEX contract v1.
+- Admission cache and usage spool live on persistent encrypted storage with
+  mode `0600`. Event reconciliation and usage export are mandatory; exhausting
+  the bounded spool sheds relay packets rather than losing the billing ledger.
 
 ## Milestone 0 launch inputs
 

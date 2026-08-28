@@ -70,3 +70,31 @@ connection while trusted mesh peers remain exempt.
 Set both `DERPEX_ACCEPT_CONNECTION_LIMIT` (connections per second) and
 `DERPEX_ACCEPT_CONNECTION_BURST` to bound unauthenticated connection creation.
 The shared bucket is checked before crypto, ring, or session allocation.
+
+## Gentility profile
+
+The baseline profile remains the default. A production Gentility deployment
+includes one adapter module implementing
+`Derpex.Admission.Gentility.ControlPlane` in the OTP release, then sets:
+
+```sh
+DERPEX_GENTILITY_ADAPTER=Gentility.DERPControlPlane
+DERPEX_GENTILITY_VERIFY_KEYS='2026-08:<base64-ed25519-public-key>'
+DERPEX_GENTILITY_CACHE_PATH=/var/lib/derpex/admission.cache
+DERPEX_GENTILITY_USAGE_SPOOL_PATH=/var/lib/derpex/usage.spool
+DERPEX_GENTILITY_INSTANCE_ID=derpex-sin-1
+DERPEX_GENTILITY_REGION_ID=17
+```
+
+The adapter owns its transport and transport authentication configuration; it
+returns only contract-v1 signed lease/revocation records and accepts canonical
+content-addressed usage batches. DERPEX starts the controller before listeners,
+resolves each listener to a lock-free policy handle, and uses `:rest_for_one`
+restart ordering so controller failure also replaces every stale listener
+handle. The event consumer reconciles before consuming revocations and repeats
+reconciliation after every stream failure. Set `DERPEX_GENTILITY_EVENTS=0`
+only for isolated contract tests; active revocation is required in production.
+
+Cached leases and usage batches are atomically persisted with mode `0600`.
+Unknown and expired nodes fail closed during outage. A full usage spool stops
+packet admission instead of dropping accounting data or growing memory.

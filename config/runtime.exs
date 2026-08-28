@@ -25,6 +25,7 @@ if config_env() == :prod do
     rate_config_path = System.get_env("DERPEX_RATE_CONFIG")
     accept_limit_text = System.get_env("DERPEX_ACCEPT_CONNECTION_LIMIT")
     accept_burst_text = System.get_env("DERPEX_ACCEPT_CONNECTION_BURST")
+    gentility_adapter_text = System.get_env("DERPEX_GENTILITY_ADAPTER")
 
     send_queue_depth_text =
       System.get_env("DERPEX_SEND_QUEUE_DEPTH") ||
@@ -110,6 +111,101 @@ if config_env() == :prod do
           raise "set both DERPEX_ACCEPT_CONNECTION_LIMIT and DERPEX_ACCEPT_CONNECTION_BURST"
       end
 
+    gentility =
+      case gentility_adapter_text do
+        nil ->
+          nil
+
+        adapter_text ->
+          module_name =
+            if String.starts_with?(adapter_text, "Elixir."),
+              do: adapter_text,
+              else: "Elixir." <> adapter_text
+
+          adapter =
+            try do
+              String.to_existing_atom(module_name)
+            rescue
+              ArgumentError ->
+                raise "DERPEX_GENTILITY_ADAPTER must name a module included in the release"
+            end
+
+          unless Code.ensure_loaded?(adapter) do
+            raise "DERPEX_GENTILITY_ADAPTER must name a module included in the release"
+          end
+
+          verification_keys_text =
+            System.get_env("DERPEX_GENTILITY_VERIFY_KEYS") ||
+              raise "DERPEX_GENTILITY_VERIFY_KEYS is required with DERPEX_GENTILITY_ADAPTER"
+
+          verification_keys =
+            verification_keys_text
+            |> String.split(",", trim: true)
+            |> Enum.map(fn entry ->
+              case String.split(entry, ":", parts: 2) do
+                [key_id, encoded] when key_id != "" and byte_size(key_id) <= 64 ->
+                  decoded =
+                    case Base.decode64(encoded) do
+                      {:ok, key} -> {:ok, key}
+                      :error -> Base.url_decode64(encoded, padding: false)
+                    end
+
+                  case decoded do
+                    {:ok, <<key::binary-size(32)>>} -> {key_id, key}
+                    _invalid -> raise "DERPEX_GENTILITY_VERIFY_KEYS contains an invalid key"
+                  end
+
+                _invalid ->
+                  raise "DERPEX_GENTILITY_VERIFY_KEYS must contain key-id:base64 pairs"
+              end
+            end)
+            |> Map.new()
+
+          if map_size(verification_keys) == 0 or map_size(verification_keys) > 16 do
+            raise "DERPEX_GENTILITY_VERIFY_KEYS must contain between one and sixteen keys"
+          end
+
+          cache_path =
+            System.get_env("DERPEX_GENTILITY_CACHE_PATH") ||
+              raise "DERPEX_GENTILITY_CACHE_PATH is required with DERPEX_GENTILITY_ADAPTER"
+
+          spool_path =
+            System.get_env("DERPEX_GENTILITY_USAGE_SPOOL_PATH") ||
+              raise "DERPEX_GENTILITY_USAGE_SPOOL_PATH is required with DERPEX_GENTILITY_ADAPTER"
+
+          instance_id =
+            System.get_env("DERPEX_GENTILITY_INSTANCE_ID") ||
+              raise "DERPEX_GENTILITY_INSTANCE_ID is required with DERPEX_GENTILITY_ADAPTER"
+
+          region_text =
+            System.get_env("DERPEX_GENTILITY_REGION_ID") ||
+              raise "DERPEX_GENTILITY_REGION_ID is required with DERPEX_GENTILITY_ADAPTER"
+
+          region_id =
+            case Integer.parse(region_text) do
+              {value, ""} when value in 0..0xFFFF_FFFF -> value
+              _invalid -> raise "DERPEX_GENTILITY_REGION_ID must be an unsigned 32-bit integer"
+            end
+
+          events =
+            if System.get_env("DERPEX_GENTILITY_EVENTS") == "0",
+              do: nil,
+              else: [adapter: adapter]
+
+          [
+            authority: adapter,
+            verification_keys: verification_keys,
+            cache_path: cache_path,
+            usage: [
+              instance_id: instance_id,
+              region_id: region_id,
+              spool_path: spool_path,
+              exporter: adapter
+            ],
+            events: events
+          ]
+      end
+
     listener =
       cond do
         certfile && keyfile ->
@@ -164,6 +260,7 @@ if config_env() == :prod do
 
     config :derpex,
       accept_limit: accept_limit,
+      gentility: gentility,
       identity_path: identity_path,
       listeners: [listener],
       mesh_key: mesh_key,
