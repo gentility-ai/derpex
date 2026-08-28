@@ -38,6 +38,12 @@ defmodule Derpex.Listener.HandlerTest do
       send(parent, {:reserved_connection_bytes, context.organization_id, bytes, self()})
       {:ok, 0}
     end
+
+    @impl true
+    def record_usage(context, bytes, outcome, parent) do
+      send(parent, {:recorded_connection_usage, context.organization_id, bytes, outcome, self()})
+      :ok
+    end
   end
 
   test "official-style cleartext HTTP client completes an authenticated handshake" do
@@ -226,6 +232,11 @@ defmodule Derpex.Listener.HandlerTest do
     pong_result = :gen_tcp.recv(socket, 13, 2_000)
     assert {:ok, <<pong_type, 8::unsigned-big-32, "pingpong">>} = pong_result
     assert pong_type == Frame.type(:pong)
+
+    destination = :binary.copy(<<0xDD>>, 32)
+    :ok = :gen_tcp.send(socket, Frame.encode(:send_packet, [destination, "data"]))
+    assert_receive {:reserved_connection_bytes, "org_01", 36, ^handler}, 2_000
+    assert_receive {:recorded_connection_usage, "org_01", 4, :dropped, ^handler}, 2_000
 
     :ok = :gen_tcp.close(socket)
     assert_receive {:released_connection, ^handler}, 2_000

@@ -33,6 +33,12 @@ defmodule Derpex.AdmissionTest do
       send(parent, {:released, connection})
       :ok
     end
+
+    @impl true
+    def record_usage(context, bytes, outcome, parent) do
+      send(parent, {:usage, context, bytes, outcome})
+      :ok
+    end
   end
 
   test "dispatches authenticated request data to configured policy" do
@@ -68,6 +74,15 @@ defmodule Derpex.AdmissionTest do
     assert connection == self()
     assert Admission.release({AccountingPolicy, self()}, self()) == :ok
     assert_receive {:released, ^connection}
+
+    assert Admission.record_usage(
+             {AccountingPolicy, self()},
+             %{organization_id: "org-1"},
+             64,
+             :accepted
+           ) == :ok
+
+    assert_receive {:usage, %{organization_id: "org-1"}, 64, :accepted}
 
     assert Admission.claim(fn _request -> {:ok, %{}} end, request, %{}, self()) == {:ok, %{}}
   end

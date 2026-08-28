@@ -15,6 +15,9 @@ defmodule Derpex.Admission.Gentility do
   alias Derpex.Admission.Gentility.Cache
   alias Derpex.Admission.Gentility.Contract
   alias Derpex.Admission.Gentility.Lease
+  alias Derpex.Admission.Gentility.Usage
+  alias Derpex.Admission.Gentility.UsageContract
+  alias Derpex.Admission.Gentility.UsageSpool
   alias Derpex.Admission.Request
   alias Derpex.Clock
   alias Derpex.Router
@@ -26,6 +29,11 @@ defmodule Derpex.Admission.Gentility do
   @default_max_lease_ms 15 * 60 * 1_000
   @default_max_future_skew_ms 30_000
   @default_max_byte_delay_ms 30_000
+  @default_usage_window_ms 60_000
+  @default_usage_retry_ms 5_000
+  @default_usage_export_timeout_ms 5_000
+  @default_usage_max_batches 120
+  @default_usage_max_bytes 64 * 1_024 * 1_024
 
   defmodule Policy do
     @moduledoc "An immutable, lock-free admission handle obtained from a running controller."
@@ -38,7 +46,8 @@ defmodule Derpex.Admission.Gentility do
       :authority_timeout,
       :byte_budgets,
       :clock,
-      :max_byte_delay_ms
+      :max_byte_delay_ms,
+      :usage
     ]
     defstruct @enforce_keys
 
@@ -50,7 +59,8 @@ defmodule Derpex.Admission.Gentility do
             authority_timeout: pos_integer(),
             byte_budgets: :ets.tid(),
             clock: module(),
-            max_byte_delay_ms: pos_integer()
+            max_byte_delay_ms: pos_integer(),
+            usage: nil | map()
           }
   end
 
@@ -114,7 +124,8 @@ defmodule Derpex.Admission.Gentility do
       when is_integer(bytes) and bytes >= 0 do
     now = policy.clock.monotonic_time(:microsecond)
 
-    with {:ok, node_delay} <-
+    with :ok <- usage_available(policy.usage),
+         {:ok, node_delay} <-
            ByteBudget.reserve(policy.byte_budgets, :node, gentility.node_key, bytes, now),
          {:ok, organization_delay} <-
            ByteBudget.reserve(
@@ -136,6 +147,32 @@ defmodule Derpex.Admission.Gentility do
 
   def reserve_bytes(context, bytes, server) do
     reserve_bytes(context, bytes, policy(server))
+  catch
+    :exit, _reason -> {:error, :admission_unavailable}
+  end
+
+  @impl Derpex.Admission
+  def record_usage(_context, _bytes, _outcome, %Policy{usage: nil}), do: :ok
+
+  def record_usage(%{gentility: gentility}, bytes, outcome, %Policy{} = policy)
+      when is_integer(bytes) and bytes >= 0 and outcome in [:accepted, :dropped] do
+    with :ok <- usage_available(policy.usage) do
+      Usage.record(
+        policy.usage.table,
+        policy.usage.window_ms,
+        gentility,
+        bytes,
+        outcome,
+        policy.clock.system_time(:millisecond)
+      )
+    end
+  end
+
+  def record_usage(_context, _bytes, _outcome, %Policy{}),
+    do: {:error, :invalid_admission_context}
+
+  def record_usage(context, bytes, outcome, server) do
+    record_usage(context, bytes, outcome, policy(server))
   catch
     :exit, _reason -> {:error, :admission_unavailable}
   end
@@ -166,7 +203,8 @@ defmodule Derpex.Admission.Gentility do
   @impl GenServer
   def init(options) do
     with {:ok, state} <- initial_state(options) do
-      {:ok, state |> load_cache() |> purge_expired() |> reschedule_expiry()}
+      state = state |> load_cache() |> purge_expired() |> reschedule_expiry()
+      {:ok, state |> rotate_usage() |> start_usage_export() |> schedule_usage()}
     end
   end
 
@@ -186,6 +224,8 @@ defmodule Derpex.Admission.Gentility do
       load_error: state.load_error,
       persist_error: state.persist_error
     }
+
+    reply = Map.put(reply, :usage, usage_stats(state.usage))
 
     {:reply, reply, state}
   end
@@ -263,6 +303,54 @@ defmodule Derpex.Admission.Gentility do
 
   def handle_info({__MODULE__, :expire, _stale}, state), do: {:noreply, state}
 
+  def handle_info({__MODULE__, :usage_tick, token}, %{usage: %{timer_token: token}} = state) do
+    state = put_in(state.usage.timer, nil)
+    state = put_in(state.usage.timer_token, nil)
+    state = put_in(state.usage.last_error, nil)
+    {:noreply, state |> rotate_usage() |> start_usage_export() |> schedule_usage()}
+  end
+
+  def handle_info({__MODULE__, :usage_tick, _stale}, state), do: {:noreply, state}
+
+  def handle_info(
+        {__MODULE__, :usage_export_result, reference, result},
+        %{usage: %{export: %{reference: reference}}} = state
+      ) do
+    state = finish_usage_export(state, result)
+
+    state =
+      if state.usage.last_error do
+        schedule_usage(state)
+      else
+        state |> rotate_usage() |> start_usage_export() |> schedule_usage()
+      end
+
+    {:noreply, state}
+  end
+
+  def handle_info({__MODULE__, :usage_export_result, _reference, _result}, state),
+    do: {:noreply, state}
+
+  def handle_info(
+        {__MODULE__, :usage_export_timeout, reference},
+        %{usage: %{export: %{reference: reference, pid: pid}}} = state
+      ) do
+    Process.exit(pid, :kill)
+    usage = %{state.usage | export: nil, last_error: :export_timeout}
+    {:noreply, %{state | usage: usage} |> schedule_usage()}
+  end
+
+  def handle_info({__MODULE__, :usage_export_timeout, _stale}, state), do: {:noreply, state}
+
+  def handle_info(
+        {:DOWN, monitor, :process, _pid, _reason},
+        %{usage: %{export: %{monitor: monitor}}} = state
+      ) do
+    usage = cancel_export_timer(state.usage, state.clock)
+    usage = %{usage | export: nil, last_error: :export_exit}
+    {:noreply, %{state | usage: usage} |> schedule_usage()}
+  end
+
   def handle_info({:DOWN, monitor, :process, connection, _reason}, state) do
     case state.claims[connection] do
       %{monitor: ^monitor} -> {:noreply, release_connection(state, connection, false)}
@@ -273,6 +361,7 @@ defmodule Derpex.Admission.Gentility do
   @impl GenServer
   def terminate(_reason, state) do
     cancel_expiry(state)
+    stop_usage(state.usage, state.clock)
     :ok
   end
 
@@ -296,9 +385,10 @@ defmodule Derpex.Admission.Gentility do
       positive_option!(options, :max_byte_delay_ms, @default_max_byte_delay_ms)
 
     verification_keys = Keyword.fetch!(options, :verification_keys)
+    clock = Keyword.get(options, :clock, Clock)
 
-    with :ok <- validate_verification_keys(verification_keys) do
-      clock = Keyword.get(options, :clock, Clock)
+    with :ok <- validate_verification_keys(verification_keys),
+         {:ok, usage} <- initial_usage(Keyword.get(options, :usage), clock) do
       byte_budgets = ByteBudget.new()
 
       policy = %Policy{
@@ -309,7 +399,8 @@ defmodule Derpex.Admission.Gentility do
         authority_timeout: authority_timeout,
         byte_budgets: byte_budgets,
         clock: clock,
-        max_byte_delay_ms: max_byte_delay_ms
+        max_byte_delay_ms: max_byte_delay_ms,
+        usage: usage_policy(usage)
       }
 
       {:ok,
@@ -339,7 +430,8 @@ defmodule Derpex.Admission.Gentility do
          expiry_timer: nil,
          expiry_token: nil,
          load_error: nil,
-         persist_error: nil
+         persist_error: nil,
+         usage: usage
        }}
     end
   end
@@ -926,6 +1018,262 @@ defmodule Derpex.Admission.Gentility do
 
   defp close_peer(state, key) do
     _connection_count = state.close_peer.(key)
+    :ok
+  end
+
+  defp initial_usage(nil, _clock), do: {:ok, nil}
+
+  defp initial_usage(options, _clock) when is_list(options) do
+    instance_id = Keyword.fetch!(options, :instance_id)
+    region_id = Keyword.fetch!(options, :region_id)
+    spool_path = Keyword.fetch!(options, :spool_path)
+    exporter = Keyword.fetch!(options, :exporter)
+    window_ms = positive_option!(options, :window_ms, @default_usage_window_ms)
+    retry_ms = positive_option!(options, :retry_ms, @default_usage_retry_ms)
+
+    export_timeout_ms =
+      positive_option!(options, :export_timeout_ms, @default_usage_export_timeout_ms)
+
+    max_batches = positive_option!(options, :max_batches, @default_usage_max_batches)
+    max_bytes = positive_option!(options, :max_bytes, @default_usage_max_bytes)
+
+    with :ok <- validate_usage_identity(instance_id, region_id, spool_path, exporter),
+         {:ok, spool} <- UsageSpool.load(spool_path, max_batches, max_bytes) do
+      blocked = :atomics.new(1, signed: false)
+      if UsageSpool.stats(spool).batches >= max_batches, do: :atomics.put(blocked, 1, 1)
+
+      {:ok,
+       %{
+         table: Usage.new(),
+         blocked: blocked,
+         instance_id: instance_id,
+         region_id: region_id,
+         window_ms: window_ms,
+         retry_ms: retry_ms,
+         export_timeout_ms: export_timeout_ms,
+         exporter: exporter,
+         spool: spool,
+         timer: nil,
+         timer_token: nil,
+         export: nil,
+         last_error: nil
+       }}
+    end
+  end
+
+  defp initial_usage(_options, _clock), do: {:error, :invalid_usage_options}
+
+  defp validate_usage_identity(instance_id, region_id, spool_path, exporter) do
+    with :ok <- validate_instance_id(instance_id),
+         :ok <- validate_region_id(region_id),
+         :ok <- validate_spool_path(spool_path) do
+      validate_exporter(exporter)
+    end
+  end
+
+  defp validate_instance_id(instance_id)
+       when is_binary(instance_id) and byte_size(instance_id) in 1..512 do
+    if String.valid?(instance_id), do: :ok, else: {:error, :invalid_usage_instance_id}
+  end
+
+  defp validate_instance_id(_instance_id), do: {:error, :invalid_usage_instance_id}
+
+  defp validate_region_id(region_id) when is_integer(region_id) and region_id in 0..0xFFFF_FFFF,
+    do: :ok
+
+  defp validate_region_id(_region_id), do: {:error, :invalid_usage_region_id}
+
+  defp validate_spool_path(spool_path) when is_binary(spool_path) and spool_path != "", do: :ok
+  defp validate_spool_path(_spool_path), do: {:error, :invalid_usage_spool_path}
+
+  defp validate_exporter(exporter) do
+    if valid_exporter?(exporter), do: :ok, else: {:error, :invalid_usage_exporter}
+  end
+
+  defp valid_exporter?(exporter) when is_function(exporter, 2), do: true
+  defp valid_exporter?({module, _options}) when is_atom(module), do: true
+  defp valid_exporter?(module) when is_atom(module), do: true
+  defp valid_exporter?(_exporter), do: false
+
+  defp usage_policy(nil), do: nil
+
+  defp usage_policy(usage) do
+    %{table: usage.table, blocked: usage.blocked, window_ms: usage.window_ms}
+  end
+
+  defp usage_available(nil), do: :ok
+
+  defp usage_available(usage) do
+    if :atomics.get(usage.blocked, 1) == 0,
+      do: :ok,
+      else: {:error, :usage_spool_full}
+  end
+
+  defp usage_stats(nil), do: %{enabled: false}
+
+  defp usage_stats(usage) do
+    spool = UsageSpool.stats(usage.spool)
+    aggregates = Usage.stats(usage.table)
+
+    %{
+      enabled: true,
+      spool_batches: spool.batches,
+      spool_bytes: spool.bytes,
+      aggregate_entries: aggregates.entries,
+      aggregate_windows: aggregates.windows,
+      blocked?: :atomics.get(usage.blocked, 1) == 1,
+      exporting?: not is_nil(usage.export),
+      last_error: usage.last_error
+    }
+  end
+
+  defp rotate_usage(%{usage: nil} = state), do: state
+
+  defp rotate_usage(state) do
+    usage = state.usage
+    now = state.clock.system_time(:millisecond)
+
+    case Usage.oldest_closed(
+           usage.table,
+           usage.window_ms,
+           usage.instance_id,
+           usage.region_id,
+           now
+         ) do
+      nil ->
+        state
+
+      {batch, rows} ->
+        commit_usage_batch(state, batch, rows)
+    end
+  end
+
+  defp commit_usage_batch(state, batch, rows) do
+    with {:ok, encoded} <- UsageContract.encode(batch),
+         {:ok, spool} <- UsageSpool.put(state.usage.spool, encoded) do
+      :ok = Usage.delete_rows(state.usage.table, rows)
+      :atomics.put(state.usage.blocked, 1, 0)
+      usage = %{state.usage | spool: spool, last_error: nil}
+      rotate_usage(%{state | usage: usage})
+    else
+      {:error, reason} ->
+        :atomics.put(state.usage.blocked, 1, 1)
+        %{state | usage: %{state.usage | last_error: reason}}
+    end
+  end
+
+  defp start_usage_export(%{usage: nil} = state), do: state
+  defp start_usage_export(%{usage: %{export: export}} = state) when not is_nil(export), do: state
+
+  defp start_usage_export(state) do
+    case UsageSpool.peek(state.usage.spool) do
+      nil ->
+        state
+
+      {id, wire} ->
+        parent = self()
+        reference = make_ref()
+        exporter = state.usage.exporter
+
+        {pid, monitor} =
+          spawn_monitor(fn ->
+            result = invoke_usage_exporter(exporter, id, wire)
+            send(parent, {__MODULE__, :usage_export_result, reference, result})
+          end)
+
+        timer =
+          state.clock.send_after(
+            self(),
+            {__MODULE__, :usage_export_timeout, reference},
+            state.usage.export_timeout_ms
+          )
+
+        export = %{
+          id: id,
+          pid: pid,
+          monitor: monitor,
+          reference: reference,
+          timer: timer
+        }
+
+        %{state | usage: %{state.usage | export: export}}
+    end
+  end
+
+  defp invoke_usage_exporter(exporter, id, wire) when is_function(exporter, 2),
+    do: exporter.(id, wire)
+
+  defp invoke_usage_exporter({module, options}, id, wire),
+    do: module.export_usage(id, wire, options)
+
+  defp invoke_usage_exporter(module, id, wire), do: module.export_usage(id, wire, [])
+
+  defp finish_usage_export(state, result) do
+    export = state.usage.export
+    Process.demonitor(export.monitor, [:flush])
+    usage = cancel_export_timer(state.usage, state.clock)
+    usage = %{usage | export: nil}
+
+    if successful_export?(result) do
+      case UsageSpool.ack(usage.spool, export.id) do
+        {:ok, spool} ->
+          :atomics.put(usage.blocked, 1, 0)
+          %{state | usage: %{usage | spool: spool, last_error: nil}}
+
+        {:error, reason} ->
+          :atomics.put(usage.blocked, 1, 1)
+          %{state | usage: %{usage | last_error: {:spool_ack, reason}}}
+      end
+    else
+      %{state | usage: %{usage | last_error: :export_failed}}
+    end
+  end
+
+  defp successful_export?(:ok), do: true
+  defp successful_export?({:ok, _result}), do: true
+  defp successful_export?(_result), do: false
+
+  defp schedule_usage(%{usage: nil} = state), do: state
+
+  defp schedule_usage(state) do
+    usage = cancel_usage_timer(state.usage, state.clock)
+    now = state.clock.system_time(:millisecond)
+    boundary_delay = usage.window_ms - Integer.mod(now, usage.window_ms)
+
+    delay =
+      if usage.last_error || :atomics.get(usage.blocked, 1) == 1,
+        do: min(boundary_delay, usage.retry_ms),
+        else: boundary_delay
+
+    token = make_ref()
+    timer = state.clock.send_after(self(), {__MODULE__, :usage_tick, token}, delay)
+    %{state | usage: %{usage | timer: timer, timer_token: token}}
+  end
+
+  defp cancel_usage_timer(%{timer: nil} = usage, _clock), do: usage
+
+  defp cancel_usage_timer(usage, clock) do
+    _remaining = clock.cancel_timer(usage.timer)
+    %{usage | timer: nil, timer_token: nil}
+  end
+
+  defp cancel_export_timer(%{export: %{timer: timer}} = usage, clock) do
+    _remaining = clock.cancel_timer(timer)
+    usage
+  end
+
+  defp cancel_export_timer(usage, _clock), do: usage
+
+  defp stop_usage(nil, _clock), do: :ok
+
+  defp stop_usage(usage, clock) do
+    _usage = cancel_usage_timer(usage, clock)
+
+    if usage.export do
+      _usage = cancel_export_timer(usage, clock)
+      Process.exit(usage.export.pid, :kill)
+    end
+
     :ok
   end
 

@@ -27,7 +27,9 @@ defmodule Derpex.Admission do
   @callback release(pid(), term()) :: :ok
   @callback reserve_bytes(context(), non_neg_integer(), term()) ::
               {:ok, non_neg_integer()} | {:error, term()}
-  @optional_callbacks claim: 4, release: 2, reserve_bytes: 3
+  @callback record_usage(context(), non_neg_integer(), :accepted | :dropped, term()) ::
+              :ok | {:error, term()}
+  @optional_callbacks claim: 4, release: 2, reserve_bytes: 3, record_usage: 4
 
   @doc "Runs configured policy after authentication; trusted mesh peers bypass ordinary admission."
   @spec authorize(policy(), Request.t()) :: decision()
@@ -98,6 +100,26 @@ defmodule Derpex.Admission do
 
   def reserve_bytes(module, context, bytes) when is_atom(module) do
     reserve_bytes({module, []}, context, bytes)
+  end
+
+  @doc "Records one sender-attributed relay outcome for product accounting."
+  @spec record_usage(policy(), context(), non_neg_integer(), :accepted | :dropped) ::
+          :ok | {:error, term()}
+  def record_usage(nil, _context, _bytes, _outcome), do: :ok
+  def record_usage(policy, _context, _bytes, _outcome) when is_function(policy, 1), do: :ok
+
+  def record_usage({module, options}, context, bytes, outcome)
+      when is_atom(module) and is_map(context) and is_integer(bytes) and bytes >= 0 and
+             outcome in [:accepted, :dropped] do
+    if function_exported?(module, :record_usage, 4) do
+      module.record_usage(context, bytes, outcome, options)
+    else
+      :ok
+    end
+  end
+
+  def record_usage(module, context, bytes, outcome) when is_atom(module) do
+    record_usage({module, []}, context, bytes, outcome)
   end
 
   defp normalize_decision({:ok, context}) when is_map(context), do: {:ok, context}

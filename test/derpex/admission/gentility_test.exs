@@ -5,6 +5,7 @@ defmodule Derpex.Admission.GentilityTest do
   alias Derpex.Admission.Gentility.Contract
   alias Derpex.Admission.Gentility.Lease
   alias Derpex.Admission.Gentility.Revocation
+  alias Derpex.Admission.Gentility.UsageContract
   alias Derpex.Admission.Request
   alias Derpex.ClientInfo
   alias Derpex.Clock.Manual
@@ -394,6 +395,122 @@ defmodule Derpex.Admission.GentilityTest do
     assert Gentility.reserve_bytes(context, 50, policy) == {:error, :byte_budget_exhausted}
   end
 
+  @tag :tmp_dir
+  test "exports fixed usage windows and durably acknowledges their idempotency key", %{
+    tmp_dir: tmp_dir
+  } do
+    parent = self()
+    node_key = node_key(20)
+
+    exporter = fn id, wire ->
+      send(parent, {:usage_export, id, wire})
+      :ok
+    end
+
+    controller =
+      start_controller(
+        authority: fn _request -> {:ok, signed_lease(node_key)} end,
+        usage: usage_options(tmp_dir, exporter)
+      )
+
+    policy = Gentility.policy(controller)
+    {:ok, context} = Gentility.authorize(request(node_key), policy)
+    assert Gentility.record_usage(context, 100, :accepted, policy) == :ok
+    assert Gentility.record_usage(context, 20, :dropped, policy) == :ok
+
+    Manual.advance(100)
+    assert_receive {:usage_export, id, wire}, 2_000
+    assert {:ok, batch} = UsageContract.decode(wire, id)
+    assert batch.window_start_ms == 1_000
+    assert batch.window_end_ms == 1_100
+    assert [entry] = batch.entries
+    assert entry.node_id == "node_01"
+    assert entry.accepted_packets == 1
+    assert entry.accepted_bytes == 100
+    assert entry.dropped_packets == 1
+    assert entry.dropped_bytes == 20
+
+    eventually(fn -> Gentility.stats(controller).usage.spool_batches == 0 end)
+    assert Gentility.stats(controller).usage.aggregate_entries == 0
+  end
+
+  @tag :tmp_dir
+  test "replays the same durable usage id after outage and controller restart", %{
+    tmp_dir: tmp_dir
+  } do
+    parent = self()
+    node_key = node_key(21)
+
+    failing_exporter = fn id, wire ->
+      send(parent, {:failed_usage_export, id, wire})
+      {:error, :unavailable}
+    end
+
+    controller =
+      start_controller(
+        authority: fn _request -> {:ok, signed_lease(node_key)} end,
+        usage: usage_options(tmp_dir, failing_exporter)
+      )
+
+    policy = Gentility.policy(controller)
+    {:ok, context} = Gentility.authorize(request(node_key), policy)
+    assert Gentility.record_usage(context, 64, :accepted, policy) == :ok
+    Manual.advance(100)
+    assert_receive {:failed_usage_export, id, wire}, 2_000
+    eventually(fn -> Gentility.stats(controller).usage.spool_batches == 1 end)
+    refute_receive {:failed_usage_export, _id, _wire}, 25
+    assert :ok = stop_supervised(Gentility)
+
+    successful_exporter = fn replay_id, replay_wire ->
+      send(parent, {:replayed_usage_export, replay_id, replay_wire})
+      :ok
+    end
+
+    controller =
+      start_controller(
+        authority: fn _request -> {:error, :unavailable} end,
+        usage: usage_options(tmp_dir, successful_exporter)
+      )
+
+    assert_receive {:replayed_usage_export, ^id, ^wire}, 2_000
+    eventually(fn -> Gentility.stats(controller).usage.spool_batches == 0 end)
+  end
+
+  @tag :tmp_dir
+  test "a full durable usage spool stops packet admission without growing state", %{
+    tmp_dir: tmp_dir
+  } do
+    parent = self()
+    node_key = node_key(22)
+
+    exporter = fn _id, _wire ->
+      send(parent, {:blocked_usage_export, self()})
+      receive do: (:release -> :ok)
+    end
+
+    controller =
+      start_controller(
+        authority: fn _request -> {:ok, signed_lease(node_key)} end,
+        usage: usage_options(tmp_dir, exporter, max_batches: 1)
+      )
+
+    policy = Gentility.policy(controller)
+    {:ok, context} = Gentility.authorize(request(node_key), policy)
+    assert Gentility.record_usage(context, 10, :accepted, policy) == :ok
+    Manual.advance(100)
+    assert_receive {:blocked_usage_export, _worker}, 2_000
+
+    assert Gentility.record_usage(context, 20, :accepted, policy) == :ok
+    Manual.advance(100)
+    eventually(fn -> Gentility.stats(controller).usage.blocked? end)
+    assert Gentility.stats(controller).usage.spool_batches == 1
+    assert Gentility.stats(controller).usage.aggregate_windows == 1
+    assert Gentility.reserve_bytes(context, 1, policy) == {:error, :usage_spool_full}
+
+    assert Gentility.record_usage(context, 1, :accepted, policy) ==
+             {:error, :usage_spool_full}
+  end
+
   defp start_controller(options) do
     defaults = [
       verification_keys: %{@signing_key_id => @public_key},
@@ -455,6 +572,23 @@ defmodule Derpex.Admission.GentilityTest do
   end
 
   defp node_key(byte), do: :binary.copy(<<byte>>, 32)
+
+  defp usage_options(tmp_dir, exporter, extra \\ []) do
+    Keyword.merge(
+      [
+        instance_id: "derpex-sin-1",
+        region_id: 17,
+        spool_path: Path.join(tmp_dir, "usage.spool"),
+        exporter: exporter,
+        window_ms: 100,
+        retry_ms: 10,
+        export_timeout_ms: 10_000,
+        max_batches: 10,
+        max_bytes: 1_000_000
+      ],
+      extra
+    )
+  end
 
   defp connections(count) do
     Enum.map(1..count, fn _index -> spawn(fn -> Process.sleep(:infinity) end) end)

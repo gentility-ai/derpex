@@ -304,12 +304,19 @@ defmodule Derpex.Listener.Handler do
   end
 
   defp handle_client_message(state, {:send_packet, destination, packet}) do
-    case Router.route(state.client_public_key, destination, packet) do
-      {:dropped, :unknown_destination} ->
-        maybe_notify_unknown_destination(state, destination, packet)
+    route_result = Router.route(state.client_public_key, destination, packet)
 
-      _routed_or_queue_drop ->
-        {:ok, state}
+    with {:ok, state} <- handle_route_result(state, destination, packet, route_result),
+         :ok <-
+           Admission.record_usage(
+             state.admission_policy,
+             state.admission_context,
+             byte_size(packet),
+             usage_outcome(route_result)
+           ) do
+      {:ok, state}
+    else
+      {:error, reason} -> {:error, {:usage, reason}, state}
     end
   end
 
@@ -353,6 +360,14 @@ defmodule Derpex.Listener.Handler do
     do: {:error, :insufficient_permissions, state}
 
   defp handle_client_message(state, _message), do: {:ok, state}
+
+  defp handle_route_result(state, destination, packet, {:dropped, :unknown_destination}),
+    do: maybe_notify_unknown_destination(state, destination, packet)
+
+  defp handle_route_result(state, _destination, _packet, _result), do: {:ok, state}
+
+  defp usage_outcome({:ok, _result}), do: :accepted
+  defp usage_outcome({:dropped, _reason}), do: :dropped
 
   defp maybe_notify_unknown_destination(state, destination, packet) do
     if Derpex.Disco.looks_like_wrapper?(packet) do
