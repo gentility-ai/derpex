@@ -109,6 +109,24 @@ defmodule Derpex.RouterTest do
     Process.exit(second, :kill)
   end
 
+  test "closing a peer asks every duplicate connection to stop" do
+    key = :crypto.strong_rand_bytes(32)
+    first = reporting_connection(self())
+    second = reporting_connection(self())
+    first_ring = Ring.new(1)
+    second_ring = Ring.new(1)
+
+    assert Router.register(key, first, first_ring) == :ok
+    assert Router.register(key, second, second_ring) == :ok
+    assert Router.close_peer(key) == 2
+    assert_receive {:connection_message, ^first, {:derpex_close_peer, ^key}}
+    assert_receive {:connection_message, ^second, {:derpex_close_peer, ^key}}
+    assert Router.close_peer(:crypto.strong_rand_bytes(32)) == 0
+
+    Process.exit(first, :kill)
+    Process.exit(second, :kill)
+  end
+
   test "trusted watchers receive an active snapshot and future presence changes" do
     first_key = :crypto.strong_rand_bytes(32)
     second_key = :crypto.strong_rand_bytes(32)
@@ -194,5 +212,15 @@ defmodule Derpex.RouterTest do
     assert Process.alive?(Process.whereis(Router))
 
     Process.exit(source_connection, :kill)
+  end
+
+  defp reporting_connection(parent) do
+    spawn(fn ->
+      receive do
+        message ->
+          send(parent, {:connection_message, self(), message})
+          Process.sleep(:infinity)
+      end
+    end)
   end
 end

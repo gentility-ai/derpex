@@ -103,6 +103,12 @@ defmodule Derpex.Router do
     GenServer.call(__MODULE__, {:watch, connection, lifecycle})
   end
 
+  @doc "Asks every local connection for a node key to close."
+  @spec close_peer(binary()) :: non_neg_integer()
+  def close_peer(<<key::binary-size(32)>>) do
+    GenServer.call(__MODULE__, {:close_peer, key})
+  end
+
   @doc "Publishes a packet directly to the active destination ring."
   @spec route(binary(), binary(), binary()) :: route_result()
   def route(<<source::binary-size(32)>>, <<destination::binary-size(32)>>, packet)
@@ -269,6 +275,18 @@ defmodule Derpex.Router do
        | monitors: monitors,
          watchers: Map.put(state.watchers, connection, lifecycle)
      }}
+  end
+
+  def handle_call({:close_peer, key}, _from, state) do
+    connections =
+      state.routes
+      |> Map.get(key, [])
+      |> Enum.map(fn {connection, _ordinary, _disco, _lifecycle, _activity, _presence} ->
+        connection
+      end)
+
+    Enum.each(connections, &send(&1, {:derpex_close_peer, key}))
+    {:reply, length(connections), state}
   end
 
   @impl true

@@ -111,6 +111,17 @@ defmodule Derpex.Listener.Handler do
     {:noreply, {socket, put_receive_limiter(state, config)}}
   end
 
+  def handle_info(
+        {:derpex_close_peer, key},
+        {socket, %{client_public_key: key} = state}
+      ) do
+    {:stop, {:shutdown, :close_peer}, {socket, state}}
+  end
+
+  def handle_info({:derpex_close_peer, _key}, {socket, state}) do
+    {:noreply, {socket, state}}
+  end
+
   def handle_info({:derpex_timeout, name, token}, {socket, state}) do
     case state.timers[name] do
       {^token, _timer} -> handle_protocol_timeout(socket, state, name)
@@ -267,6 +278,24 @@ defmodule Derpex.Listener.Handler do
 
   defp handle_client_message(state, {:ping, payload}) do
     _enqueue_result = Ring.enqueue(state.pong, {:pong, payload})
+    {:ok, state}
+  end
+
+  defp handle_client_message(
+         %{can_mesh: true} = state,
+         {:forward_packet, source, destination, packet}
+       ) do
+    case Router.route(source, destination, packet) do
+      {:dropped, :unknown_destination} ->
+        maybe_notify_unknown_destination(state, destination, packet)
+
+      _routed_or_queue_drop ->
+        {:ok, state}
+    end
+  end
+
+  defp handle_client_message(%{can_mesh: true} = state, {:close_peer, key}) do
+    _closed_connection_count = Router.close_peer(key)
     {:ok, state}
   end
 

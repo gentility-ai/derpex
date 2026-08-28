@@ -247,6 +247,7 @@ defmodule Derpex.Listener.HandlerTest do
     :ok = :gen_tcp.send(socket, packet)
     assert_eventually(fn -> Manual.pending_timer_count() == 2 end)
     monitor = Process.monitor(handler)
+    Process.unlink(server)
     Process.exit(server, :shutdown)
     assert_receive {:DOWN, ^monitor, :process, ^handler, _reason}, 2_000
     :gen_tcp.close(socket)
