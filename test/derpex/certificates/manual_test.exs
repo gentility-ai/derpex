@@ -22,9 +22,18 @@ defmodule Derpex.Certificates.ManualTest do
     assert loaded.certificate_der == manual.certificate_der
     assert Manual.raw_pin(loaded) == Manual.raw_pin(manual)
 
-    assert [%{cert: [certificate_der], key: _private_key}] =
+    assert [%{cert: [certificate_der], key: {key_type, key_der}}] =
              Manual.tls_options(loaded)[:certs_keys]
 
     assert certificate_der == manual.certificate_der
+    assert is_atom(key_type)
+    assert is_binary(key_der)
+
+    tls_options =
+      Manual.tls_options(loaded) ++
+        [ip: {127, 0, 0, 1}, active: false, versions: [:"tlsv1.3"]]
+
+    assert {:ok, listener} = :ssl.listen(0, tls_options)
+    assert :ok = :ssl.close(listener)
   end
 end

@@ -47,7 +47,7 @@ defmodule Derpex.Certificates.Manual do
   def tls_options(%__MODULE__{} = manual) do
     [
       certs_keys: [
-        %{cert: [manual.certificate_der], key: manual.private_key}
+        %{cert: [manual.certificate_der], key: tls_private_key(manual.private_key)}
       ],
       alpn_preferred_protocols: ["http/1.1"]
     ]
@@ -129,6 +129,11 @@ defmodule Derpex.Certificates.Manual do
     |> then(&:public_key.pem_entry_encode(:RSAPrivateKey, &1))
     |> List.wrap()
     |> :public_key.pem_encode()
+  end
+
+  defp tls_private_key(private_key) do
+    type = elem(private_key, 0)
+    {type, :public_key.der_encode(type, private_key)}
   end
 
   defp load_certificate(path) do
