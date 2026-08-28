@@ -49,7 +49,8 @@ defmodule Derpex.Application do
          {Derpex.Drain, profile: if(is_nil(gentility), do: :baseline, else: :gentility)}
        ] ++
          gentility_controller_children(gentility) ++
-         relay_children ++ stun_children ++ gentility_event_children(gentility)}
+         relay_children ++
+         stun_children ++ gentility_event_children(gentility) ++ signal_children()}
     end
   end
 
@@ -131,6 +132,13 @@ defmodule Derpex.Application do
 
   defp gentility_event_children(_invalid),
     do: raise("configure :derpex, :gentility as a keyword list")
+
+  defp signal_children do
+    case Application.fetch_env!(:derpex, :rate_config_path) do
+      nil -> []
+      path -> [{Derpex.Signals, rate_config_path: path}]
+    end
+  end
 
   defp mesh_children([], _private_key, _mesh_key), do: []
 

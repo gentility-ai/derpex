@@ -66,6 +66,9 @@ Set `DERPEX_RATE_CONFIG` to an upstream-compatible JSON file containing
 are clamped to hold at least one maximum DERP packet, and live updates through
 `Derpex.RateController.load_and_apply/1` reach every ordinary duplicate
 connection while trusted mesh peers remain exempt.
+When `DERPEX_RATE_CONFIG` is set, the release installs a supervised OTP signal
+handler and reloads that file on SIGHUP. A malformed or unreadable replacement
+is logged and the last valid live configuration remains applied.
 
 Set both `DERPEX_ACCEPT_CONNECTION_LIMIT` (connections per second) and
 `DERPEX_ACCEPT_CONNECTION_BURST` to bound unauthenticated connection creation.
