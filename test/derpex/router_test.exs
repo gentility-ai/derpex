@@ -103,6 +103,30 @@ defmodule Derpex.RouterTest do
     assert Router.remove_forwarder(destination, :third) == :ok
   end
 
+  test "a crashed forwarding process is evicted and the next path is promoted" do
+    source = :crypto.strong_rand_bytes(32)
+    destination = :crypto.strong_rand_bytes(32)
+    first_process = spawn(fn -> Process.sleep(:infinity) end)
+    second_process = spawn(fn -> Process.sleep(:infinity) end)
+    first = Ring.new(1)
+    second = Ring.new(1)
+
+    assert Router.add_forwarder(destination, first_process, first) == :ok
+    assert Router.add_forwarder(destination, second_process, second) == :ok
+    Process.exit(first_process, :kill)
+
+    assert_eventually(fn -> Router.forwarder_count(destination) == 1 end)
+    assert_enqueued(Router.route(source, destination, "promoted"))
+
+    assert Ring.take(second) ==
+             {:ok, {:forward_packet, source, destination, "promoted"}}
+
+    Process.exit(second_process, :kill)
+
+    assert_eventually(fn -> Router.forwarder_count(destination) == 0 end)
+    assert Router.route(source, destination, "gone") == {:dropped, :unknown_destination}
+  end
+
   test "ordinary and discovery packets use independent bounded rings" do
     source = :crypto.strong_rand_bytes(32)
     destination = :crypto.strong_rand_bytes(32)
@@ -321,4 +345,17 @@ defmodule Derpex.RouterTest do
   defp assert_enqueued(result) do
     assert result in [{:ok, :wake}, {:ok, :coalesced}]
   end
+
+  defp assert_eventually(assertion, attempts \\ 100)
+
+  defp assert_eventually(assertion, attempts) when attempts > 0 do
+    if assertion.() do
+      :ok
+    else
+      Process.sleep(2)
+      assert_eventually(assertion, attempts - 1)
+    end
+  end
+
+  defp assert_eventually(_assertion, 0), do: flunk("condition did not become true")
 end

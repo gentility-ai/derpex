@@ -122,6 +122,12 @@ defmodule Derpex.Router do
     GenServer.call(__MODULE__, {:remove_forwarder, key, identity})
   end
 
+  @doc "Returns the number of regional paths registered for a node key."
+  @spec forwarder_count(binary()) :: non_neg_integer()
+  def forwarder_count(<<key::binary-size(32)>>) do
+    GenServer.call(__MODULE__, {:forwarder_count, key})
+  end
+
   @doc "Publishes to the active local route, then a regional forwarder on a miss."
   @spec route(binary(), binary(), binary()) :: route_result()
   def route(<<source::binary-size(32)>>, <<destination::binary-size(32)>>, packet)
@@ -228,6 +234,7 @@ defmodule Derpex.Router do
        forwarders_table: forwarders_table,
        watchers: %{},
        monitors: %{},
+       forwarder_monitors: %{},
        routes: %{},
        forwarders: %{}
      }}
@@ -332,12 +339,25 @@ defmodule Derpex.Router do
     else
       entries = entries ++ [{identity, ring, activity_sequence()}]
       publish_preferred_forwarder(key, entries)
+      forwarder_monitors = add_forwarder_monitor(state.forwarder_monitors, identity, key)
 
-      {:reply, :ok, %{state | forwarders: Map.put(state.forwarders, key, entries)}}
+      {:reply, :ok,
+       %{
+         state
+         | forwarders: Map.put(state.forwarders, key, entries),
+           forwarder_monitors: forwarder_monitors
+       }}
     end
   end
 
   def handle_call({:remove_forwarder, key, identity}, _from, state) do
+    registered? =
+      state.forwarders
+      |> Map.get(key, [])
+      |> Enum.any?(fn {registered_identity, _ring, _sequence} ->
+        registered_identity == identity
+      end)
+
     entries =
       state.forwarders
       |> Map.get(key, [])
@@ -354,29 +374,114 @@ defmodule Derpex.Router do
         Map.put(state.forwarders, key, entries)
       end
 
-    {:reply, :ok, %{state | forwarders: forwarders}}
+    forwarder_monitors =
+      if registered? do
+        remove_forwarder_monitor(state.forwarder_monitors, identity, key)
+      else
+        state.forwarder_monitors
+      end
+
+    {:reply, :ok, %{state | forwarders: forwarders, forwarder_monitors: forwarder_monitors}}
+  end
+
+  def handle_call({:forwarder_count, key}, _from, state) do
+    {:reply, state.forwarders |> Map.get(key, []) |> length(), state}
   end
 
   @impl true
   def handle_info({:DOWN, monitor, :process, connection, _reason}, state) do
-    case Map.pop(state.monitors, connection) do
-      {{^monitor, keys}, monitors} ->
-        {routes, gone_keys} = remove_connection_routes(state.routes, keys, connection)
-
-        Enum.each(gone_keys, &broadcast(state.watchers, {:peer_gone, &1, 0x00}))
-        forget_destination(connection)
-        watchers = Map.delete(state.watchers, connection)
-        {:noreply, %{state | monitors: monitors, routes: routes, watchers: watchers}}
-
-      {nil, _monitors} ->
-        {:noreply, state}
-    end
+    state = handle_connection_down(state, monitor, connection)
+    {:noreply, handle_forwarder_down(state, monitor, connection)}
   end
 
   defp ensure_monitor(monitors, connection) do
     case monitors[connection] do
       {monitor, _keys} -> {monitor, monitors}
       nil -> {Process.monitor(connection), monitors}
+    end
+  end
+
+  defp handle_connection_down(state, monitor, connection) do
+    case state.monitors[connection] do
+      {^monitor, keys} ->
+        {routes, gone_keys} = remove_connection_routes(state.routes, keys, connection)
+
+        Enum.each(gone_keys, &broadcast(state.watchers, {:peer_gone, &1, 0x00}))
+        forget_destination(connection)
+
+        %{
+          state
+          | monitors: Map.delete(state.monitors, connection),
+            routes: routes,
+            watchers: Map.delete(state.watchers, connection)
+        }
+
+      _different_or_missing_monitor ->
+        state
+    end
+  end
+
+  defp handle_forwarder_down(state, monitor, identity) do
+    case state.forwarder_monitors[identity] do
+      {^monitor, keys} ->
+        forwarders =
+          Enum.reduce(keys, state.forwarders, fn key, forwarders ->
+            remove_dead_forwarder(forwarders, key, identity)
+          end)
+
+        %{
+          state
+          | forwarders: forwarders,
+            forwarder_monitors: Map.delete(state.forwarder_monitors, identity)
+        }
+
+      _different_or_missing_monitor ->
+        state
+    end
+  end
+
+  defp add_forwarder_monitor(monitors, identity, key) when is_pid(identity) do
+    case monitors[identity] do
+      {monitor, keys} -> Map.put(monitors, identity, {monitor, MapSet.put(keys, key)})
+      nil -> Map.put(monitors, identity, {Process.monitor(identity), MapSet.new([key])})
+    end
+  end
+
+  defp add_forwarder_monitor(monitors, _identity, _key), do: monitors
+
+  defp remove_forwarder_monitor(monitors, identity, key) when is_pid(identity) do
+    case monitors[identity] do
+      {monitor, keys} ->
+        keys = MapSet.delete(keys, key)
+
+        if MapSet.size(keys) == 0 do
+          Process.demonitor(monitor, [:flush])
+          Map.delete(monitors, identity)
+        else
+          Map.put(monitors, identity, {monitor, keys})
+        end
+
+      nil ->
+        monitors
+    end
+  end
+
+  defp remove_forwarder_monitor(monitors, _identity, _key), do: monitors
+
+  defp remove_dead_forwarder(forwarders, key, identity) do
+    entries =
+      forwarders
+      |> Map.get(key, [])
+      |> Enum.reject(fn {registered_identity, _ring, _sequence} ->
+        registered_identity == identity
+      end)
+
+    publish_preferred_forwarder(key, entries)
+
+    if entries == [] do
+      Map.delete(forwarders, key)
+    else
+      Map.put(forwarders, key, entries)
     end
   end
 

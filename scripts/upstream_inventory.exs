@@ -42,6 +42,12 @@ defmodule Derpex.UpstreamInventory do
       "unchanged official client gate in test/interop/go_client_test.exs",
     {"derp/derphttp/derphttp_test.go", "TestSendRecv"} =>
       "unchanged official clients relay packet boundaries in test/interop/go_client_test.exs",
+    {"derp/derphttp/derphttp_test.go", "TestBreakWatcherConnRecv"} =>
+      "adapted in test/derpex/mesh/client_test.exs; a broken watch socket withdraws routes and reconnects",
+    {"derp/derphttp/derphttp_test.go", "TestBreakWatcherConn"} =>
+      "adapted in test/derpex/mesh/client_test.exs; reconnect restores bounded forwarding",
+    {"derp/derphttp/derphttp_test.go", "TestRunWatchConnectionLoopServeConnect"} =>
+      "adapted in test/derpex/mesh/client_test.exs; authenticated watch and permanent self-connect detection covered",
     {"derp/derpserver/derpserver_test.go", "TestMetaCert"} =>
       "ported certificate shape plus official TLS fast-start gate",
     {"derp/derpserver/derpserver_test.go", "TestServerDupClients"} =>
