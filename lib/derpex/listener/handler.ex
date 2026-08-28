@@ -599,6 +599,8 @@ defmodule Derpex.Listener.Handler do
     :ok
   end
 
+  defp cleanup(_pre_connection_options), do: :ok
+
   defp close_ring(%Ring{} = ring) do
     _result = Ring.close(ring)
     :ok

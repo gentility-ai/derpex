@@ -19,4 +19,47 @@ defmodule Derpex.CertificatesTest do
     assert Enum.all?(results, &(&1 == [<<1, 2, 3>>, expected_meta]))
     assert provider_chain == [<<1, 2, 3>>]
   end
+
+  test "loads a matching PKCS8 ECDSA certificate and private key" do
+    openssl = System.find_executable("openssl") || flunk("openssl is required for this test")
+    directory = Path.join(System.tmp_dir!(), "derpex-ecdsa-#{System.unique_integer([:positive])}")
+    certificate_path = Path.join(directory, "certificate.pem")
+    key_path = Path.join(directory, "private-key.pem")
+    File.mkdir_p!(directory)
+    on_exit(fn -> File.rm_rf!(directory) end)
+
+    {output, status} =
+      System.cmd(
+        openssl,
+        [
+          "req",
+          "-x509",
+          "-newkey",
+          "ec",
+          "-pkeyopt",
+          "ec_paramgen_curve:P-256",
+          "-nodes",
+          "-keyout",
+          key_path,
+          "-out",
+          certificate_path,
+          "-days",
+          "1",
+          "-subj",
+          "/CN=localhost"
+        ],
+        stderr_to_stdout: true
+      )
+
+    assert status == 0, output
+
+    assert [certs_keys: [%{cert: [_leaf, _meta], key: {:PrivateKeyInfo, key_der}}]] =
+             Certificates.transport_options(
+               certificate_path,
+               key_path,
+               :crypto.strong_rand_bytes(32)
+             )
+
+    assert is_binary(key_der)
+  end
 end

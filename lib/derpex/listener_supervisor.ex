@@ -5,8 +5,10 @@ defmodule Derpex.ListenerSupervisor do
 
   alias Derpex.Admission.Gentility
   alias Derpex.Certificates
+  alias Derpex.Certificates.Reloader
   alias Derpex.Crypto
   alias Derpex.Listener.Handler
+  alias Derpex.Listener.Transports
   alias Derpex.SocketOptions
 
   @spec start_link({[keyword()], binary()}) :: Supervisor.on_start()
@@ -16,12 +18,30 @@ defmodule Derpex.ListenerSupervisor do
 
   @impl true
   def init({listeners, server_private_key}) do
-    listeners
-    |> Enum.map(&listener_child(&1, server_private_key))
-    |> Supervisor.init(strategy: :one_for_one)
+    children =
+      listeners
+      |> Enum.with_index()
+      |> Enum.flat_map(fn {options, index} ->
+        listener_children(options, index, server_private_key)
+      end)
+
+    Supervisor.init(children, strategy: :one_for_one)
   end
 
-  defp listener_child(options, server_private_key) do
+  defp listener_children(options, index, server_private_key) do
+    {reload_interval_ms, options} =
+      Keyword.pop(options, :certificate_reload_interval_ms, 0)
+
+    case certificate_reloader(options, index, server_private_key, reload_interval_ms) do
+      {:ok, reloader, options} ->
+        [reloader, listener_child(options, index, server_private_key)]
+
+      :disabled ->
+        [listener_child(options, index, server_private_key)]
+    end
+  end
+
+  defp listener_child(options, index, server_private_key) do
     {socket_options, options} = Keyword.pop(options, :socket_options, [])
 
     handler_options =
@@ -37,9 +57,43 @@ defmodule Derpex.ListenerSupervisor do
       |> Keyword.put(:handler_options, handler_options)
       |> configure_tls(server_private_key)
       |> configure_socket(socket_options)
+      |> configure_transport()
 
-    {ThousandIsland, options}
+    Supervisor.child_spec({ThousandIsland, options}, id: {ThousandIsland, index})
   end
+
+  defp certificate_reloader(options, index, server_private_key, interval_ms)
+       when is_integer(interval_ms) and interval_ms > 0 do
+    transport_options = Keyword.get(options, :transport_options, [])
+
+    with true <- Keyword.get(options, :transport_module) == ThousandIsland.Transports.SSL,
+         certfile when is_binary(certfile) <- Keyword.get(transport_options, :certfile),
+         keyfile when is_binary(keyfile) <- Keyword.get(transport_options, :keyfile),
+         {:ok, server_public_key} <- Crypto.public_key(server_private_key) do
+      snapshot_key = {__MODULE__, :certificate_snapshot, make_ref()}
+      sni_fun = Reloader.sni_fun(snapshot_key)
+      transport_options = Keyword.put(transport_options, :sni_fun, sni_fun)
+      options = Keyword.put(options, :transport_options, transport_options)
+
+      reloader =
+        Supervisor.child_spec(
+          {Reloader,
+           snapshot_key: snapshot_key,
+           certificate_path: certfile,
+           key_path: keyfile,
+           server_public_key: server_public_key,
+           interval_ms: interval_ms},
+          id: {Reloader, index}
+        )
+
+      {:ok, reloader, options}
+    else
+      _not_file_backed_tls -> :disabled
+    end
+  end
+
+  defp certificate_reloader(_options, _index, _server_private_key, _interval_ms),
+    do: :disabled
 
   defp resolve_admission(handler_options) do
     case Keyword.get(handler_options, :admission) do
@@ -84,6 +138,19 @@ defmodule Derpex.ListenerSupervisor do
       end
     else
       options
+    end
+  end
+
+  defp configure_transport(options) do
+    case Keyword.get(options, :transport_module, ThousandIsland.Transports.TCP) do
+      ThousandIsland.Transports.TCP ->
+        Keyword.put(options, :transport_module, Transports.TCP)
+
+      ThousandIsland.Transports.SSL ->
+        Keyword.put(options, :transport_module, Transports.SSL)
+
+      _custom_transport ->
+        options
     end
   end
 end

@@ -73,6 +73,9 @@ if config_env() == :prod do
     tcp_user_timeout_ms = parse_milliseconds.("DERPEX_TCP_USER_TIMEOUT_MS", 15_000, 0)
     tcp_write_timeout_ms = parse_milliseconds.("DERPEX_TCP_WRITE_TIMEOUT_MS", 2_000, 0)
 
+    tls_reload_interval_ms =
+      parse_milliseconds.("DERPEX_TLS_RELOAD_INTERVAL_MS", 60_000, 0)
+
     verify_clients? =
       case verify_clients_text do
         "0" -> false
@@ -308,6 +311,7 @@ if config_env() == :prod do
           [
             port: port,
             transport_module: ThousandIsland.Transports.SSL,
+            certificate_reload_interval_ms: tls_reload_interval_ms,
             socket_options: [
               keepalive_ms: tcp_keepalive_ms,
               user_timeout_ms: tcp_user_timeout_ms,

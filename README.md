@@ -33,6 +33,14 @@ DERPEX_TLS_KEYFILE=/run/secrets/derpex.key \
 bin/derpex start
 ```
 
+File-backed DNS certificates are checked every 60 seconds. A complete changed
+pair is validated and atomically becomes active for new SNI handshakes without
+restarting the listener or existing DERP connections; invalid or half-rotated
+files leave the last good certificate active. Set
+`DERPEX_TLS_RELOAD_INTERVAL_MS` to change the interval or `0` to disable
+polling. Raw-IP clients do not send SNI and continue to use the startup manual
+certificate, which is the intended stable pinned-certificate path.
+
 The server identity is created atomically with mode `0600` and is stable across
 restarts. The UDP STUN service listens on port `3478` by default whenever the
 DERP listener is enabled. Set `DERPEX_STUN_PORT` to change it or
