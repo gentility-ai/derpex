@@ -535,6 +535,40 @@ defmodule Derpex.Listener.HandlerTest do
     :gen_tcp.close(socket)
   end
 
+  test "serves authorized traffic diagnostics as a live chunked stream" do
+    {_server_public, server_private} = Crypto.generate_keypair()
+    parent = self()
+
+    run_ss = fn ->
+      send(parent, :traffic_sampled)
+      {:ok, ""}
+    end
+
+    {:ok, server} =
+      ThousandIsland.start_link(
+        port: 0,
+        transport_options: [ip: {127, 0, 0, 1}],
+        num_acceptors: 1,
+        handler_module: Handler,
+        handler_options: [
+          server_private_key: server_private,
+          debug: [traffic: [run_ss: run_ss, interval_ms: 60_000]]
+        ]
+      )
+
+    stop_server_on_exit(server)
+    {:ok, {_ip, port}} = ThousandIsland.listener_info(server)
+    {:ok, socket} = :gen_tcp.connect({127, 0, 0, 1}, port, [:binary, active: false])
+    :ok = :gen_tcp.send(socket, "GET /debug/traffic HTTP/1.1\r\nHost: localhost\r\n\r\n")
+
+    assert {:ok, response} = recv_until(socket, "1\r\n\n\r\n")
+    assert response =~ "HTTP/1.1 200 OK\r\n"
+    assert response =~ "Transfer-Encoding: chunked\r\n"
+    assert response =~ "\r\n\r\n1\r\n\n\r\n"
+    assert_receive :traffic_sampled, 2_000
+    :gen_tcp.close(socket)
+  end
+
   defp stop_server_on_exit(server) do
     on_exit(fn ->
       if Process.alive?(server), do: Process.exit(server, :shutdown)
@@ -566,6 +600,25 @@ defmodule Derpex.Listener.HandlerTest do
     {:ok, client_frame} = Handshake.client_info_frame(client_private, server_public, client_info)
     :ok = :gen_tcp.send(socket, client_frame)
     socket
+  end
+
+  defp recv_until(socket, expected, received \\ "", attempts \\ 10)
+
+  defp recv_until(socket, expected, received, attempts) when attempts > 0 do
+    if String.contains?(received, expected) do
+      {:ok, received}
+    else
+      case :gen_tcp.recv(socket, 0, 2_000) do
+        {:ok, data} -> recv_until(socket, expected, received <> data, attempts - 1)
+        {:error, reason} -> {:error, reason}
+      end
+    end
+  end
+
+  defp recv_until(_socket, expected, received, 0) do
+    if String.contains?(received, expected),
+      do: {:ok, received},
+      else: {:error, :too_many_reads}
   end
 
   defp assert_eventually(assertion, attempts \\ 50)

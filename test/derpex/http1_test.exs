@@ -211,6 +211,24 @@ defmodule Derpex.HTTP1Test do
     end
   end
 
+  test "starts an independently authorized chunked traffic stream" do
+    options = [debug: [remote_ip: {127, 0, 0, 1}, traffic: [interval_ms: 25]]]
+
+    assert {:stream, :debug_traffic, response, [interval_ms: 25]} =
+             HTTP1.route(request("GET", "/debug/traffic"), @server_public, options)
+
+    response = IO.iodata_to_binary(response)
+    assert response =~ "HTTP/1.1 200 OK\r\n"
+    assert response =~ "Transfer-Encoding: chunked\r\n"
+
+    forwarded = [{"x-forwarded-for", "198.51.100.9"}]
+
+    assert {:response, forbidden} =
+             HTTP1.route(request("GET", "/debug/traffic", forwarded), @server_public, options)
+
+    assert IO.iodata_to_binary(forbidden) =~ "HTTP/1.1 403 Forbidden\r\n"
+  end
+
   test "serves the upstream robots exclusion body" do
     assert {:response, response} = HTTP1.route(request("GET", "/robots.txt"), @server_public)
     assert IO.iodata_to_binary(response) =~ "User-agent: *\nDisallow: /\n"

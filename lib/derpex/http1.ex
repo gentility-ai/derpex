@@ -15,7 +15,9 @@ defmodule Derpex.HTTP1 do
 
   @doc "Routes a parsed request without consuming bytes read past its headers."
   @spec route(Request.t(), binary(), keyword()) ::
-          {:upgrade, :derp | :websocket, nil | iodata(), map()} | {:response, iodata()}
+          {:upgrade, :derp | :websocket, nil | iodata(), map()}
+          | {:stream, :debug_traffic, iodata(), keyword()}
+          | {:response, iodata()}
   def route(%Request{} = request, server_public_key, options \\ []) do
     request
     |> Request.path()
@@ -46,6 +48,9 @@ defmodule Derpex.HTTP1 do
 
   defp route_path("/debug/varz", request, _server_public_key, options),
     do: debug_protected(request, options, &metrics/0)
+
+  defp route_path("/debug/traffic", request, _server_public_key, options),
+    do: debug_protected(request, options, fn -> debug_traffic(options) end)
 
   defp route_path("/debug/", request, _server_public_key, options),
     do: debug_protected(request, options, &debug_index/0)
@@ -186,6 +191,7 @@ defmodule Derpex.HTTP1 do
         "<li><a href=\"/debug/vars\">/debug/vars</a> (Metrics (Go))</li>" <>
         "<li><a href=\"/debug/varz\">/debug/varz</a> (Metrics (Prometheus))</li>" <>
         "<li><a href=\"/debug/check\">/debug/check</a> (Consistency check)</li>" <>
+        "<li><a href=\"/debug/traffic\">/debug/traffic</a> (Traffic check)</li>" <>
         "</ul></body></html>"
 
     {:response, Response.encode(200, [{"Content-Type", "text/html; charset=utf-8"}], body)}
@@ -198,6 +204,20 @@ defmodule Derpex.HTTP1 do
        [{"Content-Type", "text/plain; charset=utf-8"}, {"X-Content-Type-Options", "nosniff"}],
        "debug access denied\n"
      )}
+  end
+
+  defp debug_traffic(options) do
+    response =
+      Response.encode(
+        200,
+        [
+          {"Content-Type", "text/plain; charset=utf-8"},
+          {"Transfer-Encoding", "chunked"}
+        ]
+      )
+
+    debug = Keyword.get(options, :debug, [])
+    {:stream, :debug_traffic, response, Keyword.get(debug, :traffic, [])}
   end
 
   defp consistency_check do

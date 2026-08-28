@@ -68,6 +68,26 @@ defmodule Derpex.SessionTest do
     assert Session.info(session).phase == :closed
   end
 
+  test "keeps an authorized traffic response open as a bounded stream" do
+    {_server_public, server_private} = Crypto.generate_keypair()
+
+    {:ok, session, _actions} =
+      Session.new(server_private,
+        debug: [remote_ip: {127, 0, 0, 1}, traffic: [interval_ms: 25]]
+      )
+
+    assert {:ok, session,
+            [
+              {:cancel_timeout, :http},
+              {:send, response},
+              {:start_debug_traffic, [interval_ms: 25]}
+            ]} = Session.receive_data(session, "GET /debug/traffic HTTP/1.1\r\n\r\n")
+
+    assert IO.iodata_to_binary(response) =~ "Transfer-Encoding: chunked"
+    assert Session.info(session).phase == :debug_traffic
+    assert Session.receive_data(session, "ignored request body") == {:ok, session, []}
+  end
+
   test "orders the WebSocket upgrade before framed DERP output" do
     {_server_public, server_private} = Crypto.generate_keypair()
     key = Base.encode64(:binary.copy(<<7>>, 16))

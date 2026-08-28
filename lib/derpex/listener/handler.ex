@@ -9,6 +9,7 @@ defmodule Derpex.Listener.Handler do
   alias Derpex.ClientVerifier
   alias Derpex.Clock
   alias Derpex.Crypto
+  alias Derpex.Debug.Traffic
   alias Derpex.Disco
   alias Derpex.Drain
   alias Derpex.Metrics
@@ -137,7 +138,8 @@ defmodule Derpex.Listener.Handler do
             options,
             :mesh_write_timeout,
             SocketOptions.mesh_write_timeout_ms()
-          )
+          ),
+        debug_traffic: nil
       }
 
       continue_after_actions(socket, state, actions)
@@ -205,6 +207,38 @@ defmodule Derpex.Listener.Handler do
     case state.timers[name] do
       {^token, _timer} -> handle_protocol_timeout(socket, state, name)
       _stale -> {:noreply, {socket, state}}
+    end
+  end
+
+  def handle_info(:derpex_debug_traffic_tick, {socket, %{debug_traffic: nil} = state}) do
+    {:noreply, {socket, state}}
+  end
+
+  def handle_info(:derpex_debug_traffic_tick, {socket, state}) do
+    debug = %{state.debug_traffic | timer: nil}
+
+    case Traffic.sample(debug.previous, debug.options) do
+      {:ok, current, body} ->
+        case Writer.write_control(state.writer, encode_chunk(body)) do
+          :ok ->
+            timer =
+              Clock.send_after(self(), :derpex_debug_traffic_tick, debug.interval_ms)
+
+            debug = %{debug | previous: current, timer: timer}
+            {:noreply, {socket, %{state | debug_traffic: debug}}}
+
+          {:error, reason} ->
+            {:stop, {:debug_traffic_write, reason}, {socket, state}}
+        end
+
+      {:error, reason} ->
+        error_body = ["ss failed: ", debug_error(reason)]
+        terminal = [encode_chunk(error_body), "0\r\n\r\n"]
+
+        case Writer.write_control(state.writer, terminal) do
+          :ok -> {:stop, {:shutdown, :debug_traffic_complete}, {socket, state}}
+          {:error, write_reason} -> {:stop, {:debug_traffic_write, write_reason}, {socket, state}}
+        end
     end
   end
 
@@ -278,6 +312,19 @@ defmodule Derpex.Listener.Handler do
 
   defp execute_action(_socket, state, {:cancel_timeout, name}) do
     {:ok, cancel_timer(state, name)}
+  end
+
+  defp execute_action(_socket, state, {:start_debug_traffic, options}) do
+    interval_ms = Keyword.get(options, :interval_ms, 2_000)
+
+    if is_integer(interval_ms) and interval_ms > 0 do
+      send(self(), :derpex_debug_traffic_tick)
+
+      debug = %{previous: %{}, options: options, interval_ms: interval_ms, timer: nil}
+      {:ok, %{state | debug_traffic: debug}}
+    else
+      {:error, :invalid_debug_traffic_interval, state}
+    end
   end
 
   defp execute_action(socket, state, {:rate_limit, frame_length}) do
@@ -520,6 +567,7 @@ defmodule Derpex.Listener.Handler do
 
   defp cleanup(%{timers: _timers} = state) do
     cancel_all_timers(state)
+    cancel_debug_traffic_timer(state[:debug_traffic])
     :ok = AcceptLimiter.release(state[:accept_limiter])
     :ok = Drain.unregister(state[:drain], self())
     :ok = Admission.release(state[:admission_policy], self())
@@ -543,6 +591,20 @@ defmodule Derpex.Listener.Handler do
   end
 
   defp close_ring(_ring), do: :ok
+
+  defp cancel_debug_traffic_timer(%{timer: timer}) when is_reference(timer) do
+    _remaining = Clock.cancel_timer(timer)
+    :ok
+  end
+
+  defp cancel_debug_traffic_timer(_debug), do: :ok
+
+  defp encode_chunk(data) do
+    [Integer.to_string(IO.iodata_length(data), 16), "\r\n", data, "\r\n"]
+  end
+
+  defp debug_error(reason) when is_binary(reason), do: reason
+  defp debug_error(reason), do: inspect(reason)
 
   defp admit(state, key, info, can_mesh) do
     request = %AdmissionRequest{

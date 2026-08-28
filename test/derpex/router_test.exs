@@ -19,6 +19,26 @@ defmodule Derpex.RouterTest do
     assert Router.route(source, destination, "packet") == {:dropped, :unknown_destination}
   end
 
+  test "exposes only live authenticated endpoint-to-key mappings for traffic diagnostics" do
+    key = :crypto.strong_rand_bytes(32)
+    ring = Ring.new(1)
+
+    presence = %{
+      ip: <<0::80, 0xFFFF::16, 192, 0, 2, 8>>,
+      port: 58_145,
+      flags: 0x01,
+      app_name: ""
+    }
+
+    on_exit(fn -> Router.unregister(key, self()) end)
+
+    assert :ok = Router.register(key, self(), ring, ring, ring, presence)
+    assert Router.debug_client_keys()[{{192, 0, 2, 8}, 58_145}] == key
+
+    assert :ok = Router.unregister(key, self())
+    refute Map.has_key?(Router.debug_client_keys(), {{192, 0, 2, 8}, 58_145})
+  end
+
   test "regional forwarders preserve first-seen priority and local routes win" do
     source = :crypto.strong_rand_bytes(32)
     destination = :crypto.strong_rand_bytes(32)

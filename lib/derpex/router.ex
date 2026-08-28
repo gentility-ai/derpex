@@ -186,6 +186,10 @@ defmodule Derpex.Router do
   @spec stats() :: map()
   def stats, do: GenServer.call(__MODULE__, :stats)
 
+  @doc false
+  @spec debug_client_keys() :: %{optional({:inet.ip_address(), 0..65_535}) => binary()}
+  def debug_client_keys, do: GenServer.call(__MODULE__, :debug_client_keys)
+
   @doc "Checks that serialized topology and fast-path tables agree."
   @spec consistency_check() :: :ok | {:error, binary()}
   def consistency_check, do: GenServer.call(__MODULE__, :consistency_check)
@@ -267,6 +271,10 @@ defmodule Derpex.Router do
   @impl true
   def handle_call(:stats, _from, state) do
     {:reply, topology_stats(state), state}
+  end
+
+  def handle_call(:debug_client_keys, _from, state) do
+    {:reply, debug_client_keys(state.routes), state}
   end
 
   def handle_call(:consistency_check, _from, state) do
@@ -730,6 +738,20 @@ defmodule Derpex.Router do
         Enum.sum(Enum.map(state.forwarders, fn {_key, entries} -> length(entries) end))
     }
   end
+
+  defp debug_client_keys(routes) do
+    Enum.reduce(routes, %{}, fn {key, entries}, clients ->
+      Enum.reduce(entries, clients, fn
+        {_connection, _ordinary, _disco, _lifecycle, _activity, presence}, clients ->
+          Map.put(clients, {decode_ip(presence.ip), presence.port}, key)
+      end)
+    end)
+  end
+
+  defp decode_ip(<<0::80, 0xFFFF::16, a, b, c, d>>), do: {a, b, c, d}
+
+  defp decode_ip(<<a::16, b::16, c::16, d::16, e::16, f::16, g::16, h::16>>),
+    do: {a, b, c, d, e, f, g, h}
 
   defp check_consistency(state) do
     expected_routes = map_size(state.routes)

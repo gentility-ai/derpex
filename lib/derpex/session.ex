@@ -31,7 +31,8 @@ defmodule Derpex.Session do
           | {:cancel_timeout, :http}
           | {:set_wire_mode, :websocket}
           | {:websocket_data, binary()}
-  @type phase :: :http | :derp | :closed
+          | {:start_debug_traffic, keyword()}
+  @type phase :: :http | :derp | :debug_traffic | :closed
 
   @opaque t :: %__MODULE__{
             phase: phase(),
@@ -79,6 +80,9 @@ defmodule Derpex.Session do
     do: {:close, state, state.close_reason, []}
 
   def receive_data(%__MODULE__{phase: :http} = state, data), do: receive_http(state, data)
+
+  def receive_data(%__MODULE__{phase: :debug_traffic} = state, _data),
+    do: {:ok, state, []}
 
   def receive_data(%__MODULE__{phase: :derp} = state, data) do
     state.connection
@@ -130,6 +134,21 @@ defmodule Derpex.Session do
 
   defp route_http(state, {:response, response}, _read_ahead) do
     close(state, :http_response, [{:cancel_timeout, :http}, {:send, response}])
+  end
+
+  defp route_http(
+         state,
+         {:stream, :debug_traffic, response, stream_options},
+         _read_ahead
+       ) do
+    state = %{state | phase: :debug_traffic}
+
+    {:ok, state,
+     [
+       {:cancel_timeout, :http},
+       {:send, response},
+       {:start_debug_traffic, stream_options}
+     ]}
   end
 
   defp route_http(state, {:upgrade, :websocket, response, metadata}, read_ahead) do
