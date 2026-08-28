@@ -5,6 +5,8 @@ config :derpex,
   clock: Derpex.Clock.System,
   identity_path: nil,
   listeners: [],
+  mesh_key: nil,
+  mesh_peers: [],
   rate_config_path: nil,
   stun_listeners: [],
   native_base_url:

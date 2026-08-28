@@ -20,6 +20,7 @@ if config_env() == :prod do
     keyfile = System.get_env("DERPEX_TLS_KEYFILE")
     clear_http? = System.get_env("DERPEX_CLEAR_HTTP") == "1"
     mesh_key_text = System.get_env("DERPEX_MESH_KEY")
+    mesh_with_text = System.get_env("DERPEX_MESH_WITH")
     disallowed_app_names_text = System.get_env("DERPEX_DISALLOWED_APP_NAMES")
     rate_config_path = System.get_env("DERPEX_RATE_CONFIG")
     accept_limit_text = System.get_env("DERPEX_ACCEPT_CONNECTION_LIMIT")
@@ -39,6 +40,40 @@ if config_env() == :prod do
             _invalid -> raise "DERPEX_MESH_KEY must be a 64-digit hexadecimal key"
           end
       end
+
+    mesh_peers =
+      case mesh_with_text do
+        nil ->
+          []
+
+        text ->
+          text
+          |> String.split(",", trim: true)
+          |> Enum.map(&String.trim/1)
+          |> Enum.reject(&(&1 == ""))
+          |> Enum.map(fn peer ->
+            cond do
+              String.starts_with?(peer, ["http://", "https://"]) ->
+                [url: peer]
+
+              true ->
+                case String.split(peer, "/", parts: 2) do
+                  [host] when host != "" ->
+                    [url: "https://#{host}/derp"]
+
+                  [host, dial_host] when host != "" and dial_host != "" ->
+                    [url: "https://#{host}/derp", dial_host: dial_host]
+
+                  _invalid ->
+                    raise "DERPEX_MESH_WITH contains an invalid peer: #{inspect(peer)}"
+                end
+            end
+          end)
+      end
+
+    if mesh_peers != [] and is_nil(mesh_key) do
+      raise "DERPEX_MESH_KEY is required when DERPEX_MESH_WITH is set"
+    end
 
     stun_port =
       case Integer.parse(stun_port_text) do
@@ -120,6 +155,8 @@ if config_env() == :prod do
       accept_limit: accept_limit,
       identity_path: identity_path,
       listeners: [listener],
+      mesh_key: mesh_key,
+      mesh_peers: mesh_peers,
       rate_config_path: rate_config_path,
       stun_listeners:
         if(System.get_env("DERPEX_STUN") == "0",

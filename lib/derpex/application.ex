@@ -37,19 +37,42 @@ defmodule Derpex.Application do
   end
 
   defp relay_children do
-    case Application.fetch_env!(:derpex, :listeners) do
-      [] ->
-        {:ok, []}
+    listeners = Application.fetch_env!(:derpex, :listeners)
+    mesh_peers = Application.fetch_env!(:derpex, :mesh_peers)
 
-      listeners ->
-        identity_path =
-          Application.fetch_env!(:derpex, :identity_path) ||
-            raise "configure :derpex, :identity_path before enabling listeners"
+    if listeners == [] and mesh_peers == [] do
+      {:ok, []}
+    else
+      identity_path =
+        Application.fetch_env!(:derpex, :identity_path) ||
+          raise "configure :derpex, :identity_path before enabling listeners or mesh peers"
 
-        with {:ok, {_public_key, private_key}} <-
-               Derpex.Identity.load_or_create_keypair(identity_path) do
-          {:ok, [{Derpex.ListenerSupervisor, {listeners, private_key}}]}
-        end
+      with {:ok, {_public_key, private_key}} <-
+             Derpex.Identity.load_or_create_keypair(identity_path) do
+        {:ok,
+         listener_children(listeners, private_key) ++
+           mesh_children(
+             mesh_peers,
+             private_key,
+             Application.fetch_env!(:derpex, :mesh_key)
+           )}
+      end
     end
+  end
+
+  defp listener_children([], _private_key), do: []
+
+  defp listener_children(listeners, private_key) do
+    [{Derpex.ListenerSupervisor, {listeners, private_key}}]
+  end
+
+  defp mesh_children([], _private_key, _mesh_key), do: []
+
+  defp mesh_children(mesh_peers, private_key, <<mesh_key::binary-size(32)>>) do
+    [{Derpex.Mesh.Supervisor, {mesh_peers, private_key, mesh_key}}]
+  end
+
+  defp mesh_children(_mesh_peers, _private_key, _mesh_key) do
+    raise "configure :derpex, :mesh_key before enabling mesh peers"
   end
 end

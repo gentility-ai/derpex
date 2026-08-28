@@ -44,6 +44,13 @@ Regional connection watching is disabled unless `DERPEX_MESH_KEY` contains a
 encrypted `ClientInfo`; comparisons are constant-time and untrusted clients
 cannot subscribe to presence updates.
 
+Set `DERPEX_MESH_WITH` to a comma-separated list of peers to enable outbound
+regional meshing. Each entry may be a complete `https://host/derp` URL, a host
+name (which expands to that URL), or `host/dial-host` to preserve TLS identity
+while dialing a private address. A configured mesh requires
+`DERPEX_MESH_KEY`. Connections watch and withdraw remote routes automatically,
+use bounded forwarding queues, and reconnect every five seconds after failure.
+
 `DERPEX_DISALLOWED_APP_NAMES` is an optional comma-separated list of exact
 client-advertised app names to reject before registration. Trusted mesh peers
 are exempt, matching the baseline server. Embedders can also supply a
