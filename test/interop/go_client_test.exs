@@ -221,4 +221,59 @@ defmodule Derpex.Interop.GoClientTest do
     assert output =~
              "official low-level client discarded a 2-MiB unknown frame and rejected an oversize packet header"
   end
+
+  test "unchanged official WebSocket client authenticates and pings" do
+    upstream = System.fetch_env!("DERPEX_TAILSCALE_DIR")
+    {_server_public, server_private} = Crypto.generate_keypair()
+
+    {:ok, server} =
+      ThousandIsland.start_link(
+        port: 0,
+        transport_options: [ip: {127, 0, 0, 1}],
+        num_acceptors: 1,
+        handler_module: Handler,
+        handler_options: [server_private_key: server_private]
+      )
+
+    on_exit(fn ->
+      if Process.alive?(server), do: Process.exit(server, :shutdown)
+    end)
+
+    {:ok, {_ip, port}} = ThousandIsland.listener_info(server)
+    helper = Path.expand("../../interop/go/client_smoke.go", __DIR__)
+
+    {output, status} =
+      System.cmd(
+        "go",
+        ["run", "-tags", "ts_debug_websockets", helper, "ws://127.0.0.1:#{port}/derp"],
+        cd: upstream,
+        stderr_to_stdout: true,
+        env: [{"GOTOOLCHAIN", "local"}, {"TS_DEBUG_DERP_WS_CLIENT", "1"}]
+      )
+
+    assert status == 0, output
+    assert output =~ "official Go client authenticated and pinged"
+
+    relay_helper = Path.expand("../../interop/go/relay_smoke.go", __DIR__)
+
+    {relay_output, relay_status} =
+      System.cmd(
+        "go",
+        [
+          "run",
+          "-tags",
+          "ts_debug_websockets",
+          relay_helper,
+          "ws://127.0.0.1:#{port}/derp"
+        ],
+        cd: upstream,
+        stderr_to_stdout: true,
+        env: [{"GOTOOLCHAIN", "local"}, {"TS_DEBUG_DERP_WS_CLIENT", "1"}]
+      )
+
+    assert relay_status == 0, relay_output
+
+    assert relay_output =~
+             "official Go clients relayed packet boundaries and observed both peer-gone reasons"
+  end
 end

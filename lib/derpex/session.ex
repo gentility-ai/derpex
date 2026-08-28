@@ -24,7 +24,11 @@ defmodule Derpex.Session do
   ]
 
   @type action ::
-          Connection.action() | {:set_timeout, :http, pos_integer()} | {:cancel_timeout, :http}
+          Connection.action()
+          | {:set_timeout, :http, pos_integer()}
+          | {:cancel_timeout, :http}
+          | {:set_wire_mode, :websocket}
+          | {:websocket_data, binary()}
   @type phase :: :http | :derp | :closed
 
   @opaque t :: %__MODULE__{
@@ -110,10 +114,16 @@ defmodule Derpex.Session do
     close(state, :http_response, [{:cancel_timeout, :http}, {:send, response}])
   end
 
-  defp route_http(state, {:upgrade, :websocket, _response, metadata}, _read_ahead) do
-    close(%{state | metadata: metadata}, :websocket_not_implemented, [
-      {:cancel_timeout, :http}
-    ])
+  defp route_http(state, {:upgrade, :websocket, response, metadata}, read_ahead) do
+    with {:ok, connection, connection_actions} <- Connection.new(state.server_private_key) do
+      state = %{state | phase: :derp, connection: connection, metadata: metadata}
+
+      actions =
+        [{:cancel_timeout, :http}, {:send, response}, {:set_wire_mode, :websocket}] ++
+          connection_actions ++ maybe_websocket_data(read_ahead)
+
+      {:ok, state, actions}
+    end
   end
 
   defp route_http(state, {:upgrade, :derp, response, metadata}, read_ahead) do
@@ -146,6 +156,9 @@ defmodule Derpex.Session do
 
   defp maybe_send(nil), do: []
   defp maybe_send(response), do: [{:send, response}]
+
+  defp maybe_websocket_data(""), do: []
+  defp maybe_websocket_data(data), do: [{:websocket_data, data}]
 
   defp close(state, reason, actions) do
     state = %{state | phase: :closed, close_reason: reason}

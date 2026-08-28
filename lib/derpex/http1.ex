@@ -56,7 +56,7 @@ defmodule Derpex.HTTP1 do
   end
 
   defp maybe_add_challenge_response(headers, challenge) do
-    if byte_size(challenge) <= 64 and valid_challenge?(challenge) do
+    if byte_size(challenge) in 1..64 and valid_challenge?(challenge) do
       [{"X-Tailscale-Response", "response " <> challenge} | headers]
     else
       headers
@@ -75,7 +75,7 @@ defmodule Derpex.HTTP1 do
   defp upgrade(request, server_public_key) do
     case request |> Request.header("upgrade") |> downcase_header() do
       "derp" -> native_upgrade(request, server_public_key)
-      "websocket" -> {:upgrade, :websocket, nil, upgrade_metadata(request)}
+      "websocket" -> websocket_or_legacy_upgrade(request, server_public_key)
       _other -> upgrade_required()
     end
   end
@@ -99,6 +99,54 @@ defmodule Derpex.HTTP1 do
       end
 
     {:upgrade, :derp, response, upgrade_metadata(request)}
+  end
+
+  defp websocket_or_legacy_upgrade(request, server_public_key) do
+    case Request.header(request, "sec-websocket-protocol") do
+      protocols when is_binary(protocols) ->
+        if String.contains?(protocols, "derp") do
+          websocket_upgrade(request)
+        else
+          native_upgrade(request, server_public_key)
+        end
+
+      nil ->
+        native_upgrade(request, server_public_key)
+    end
+  end
+
+  defp websocket_upgrade(request) do
+    with true <- request.method == "GET",
+         true <- connection_upgrade?(Request.header(request, "connection")),
+         "13" <- Request.header(request, "sec-websocket-version"),
+         key when is_binary(key) <- Request.header(request, "sec-websocket-key"),
+         {:ok, decoded_key} <- Base.decode64(key),
+         true <- byte_size(decoded_key) == 16 do
+      accept = Base.encode64(:crypto.hash(:sha, key <> "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"))
+
+      response = [
+        "HTTP/1.1 101 Switching Protocols\r\n",
+        "Upgrade: websocket\r\n",
+        "Connection: Upgrade\r\n",
+        "Sec-WebSocket-Accept: ",
+        accept,
+        "\r\n",
+        "Sec-WebSocket-Protocol: derp\r\n\r\n"
+      ]
+
+      {:upgrade, :websocket, response, upgrade_metadata(request)}
+    else
+      _invalid ->
+        {:response, Response.encode(400, [], "Bad Request\n")}
+    end
+  end
+
+  defp connection_upgrade?(nil), do: false
+
+  defp connection_upgrade?(value) do
+    value
+    |> String.split(",")
+    |> Enum.any?(&(String.trim(&1) |> String.downcase(:ascii) == "upgrade"))
   end
 
   defp upgrade_required do

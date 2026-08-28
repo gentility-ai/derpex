@@ -12,8 +12,8 @@ disposition map and review that change together with `interop/upstream.lock`.
 | State | Count |
 | --- | ---: |
 | Total | 69 |
-| Ported | 16 |
-| Pending (release-blocking) | 49 |
+| Ported | 17 |
+| Pending (release-blocking) | 48 |
 | Implementation-specific | 4 |
 
 | Area | Upstream test | Source | Disposition | Gate/notes |
@@ -76,7 +76,7 @@ disposition map and review that change together with `interop/upstream.lock`.
 | cmd/derper | `TestPinnedCertRawIP` | `cmd/derper/cert_test.go:114` | `pending` | release-blocking mapping not yet implemented |
 | cmd/derper | `TestGCPCertMode` | `cmd/derper/cert_test.go:173` | `pending` | release-blocking mapping not yet implemented |
 | cmd/derper | `TestProdAutocertHostPolicy` | `cmd/derper/derper_test.go:18` | `pending` | release-blocking mapping not yet implemented |
-| cmd/derper | `TestNoContent` | `cmd/derper/derper_test.go:42` | `pending` | release-blocking mapping not yet implemented |
+| cmd/derper | `TestNoContent` | `cmd/derper/derper_test.go:42` | `ported` | ported all challenge validity cases in test/derpex/http1_test.exs |
 | cmd/derper | `TestDeps` | `cmd/derper/derper_test.go:101` | `implementation-specific` | Go dependency graph; protected behavior maps to the runtime-boundary artifact gate |
 | cmd/derper | `TestTemplate` | `cmd/derper/derper_test.go:116` | `pending` | release-blocking mapping not yet implemented |
 | cmd/derper | `TestIPCertManager` | `cmd/derper/ipcert_test.go:328` | `pending` | release-blocking mapping not yet implemented |

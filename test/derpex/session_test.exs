@@ -67,4 +67,31 @@ defmodule Derpex.SessionTest do
     assert IO.iodata_to_binary(response) =~ "200 OK"
     assert Session.info(session).phase == :closed
   end
+
+  test "orders the WebSocket upgrade before framed DERP output" do
+    {_server_public, server_private} = Crypto.generate_keypair()
+    key = Base.encode64(:binary.copy(<<7>>, 16))
+
+    request =
+      "GET /derp HTTP/1.1\r\n" <>
+        "Upgrade: websocket\r\n" <>
+        "Connection: Upgrade\r\n" <>
+        "Sec-WebSocket-Version: 13\r\n" <>
+        "Sec-WebSocket-Key: #{key}\r\n" <>
+        "Sec-WebSocket-Protocol: derp\r\n\r\n"
+
+    {:ok, session, _actions} = Session.new(server_private)
+    assert {:ok, session, actions} = Session.receive_data(session, request)
+
+    assert [
+             {:cancel_timeout, :http},
+             {:send, response},
+             {:set_wire_mode, :websocket},
+             {:send, _greeting},
+             {:set_timeout, :handshake, 10_000}
+           ] = actions
+
+    assert IO.iodata_to_binary(response) =~ "Sec-WebSocket-Protocol: derp"
+    assert Session.info(session).phase == :derp
+  end
 end

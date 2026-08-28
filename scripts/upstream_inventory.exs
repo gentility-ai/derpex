@@ -46,6 +46,8 @@ defmodule Derpex.UpstreamInventory do
       "ported certificate shape plus official TLS fast-start gate",
     {"derp/derpserver/derpserver_test.go", "TestServerDupClients"} =>
       "ported lifecycle cases and unchanged official last-writer-active client gate",
+    {"cmd/derper/derper_test.go", "TestNoContent"} =>
+      "ported all challenge validity cases in test/derpex/http1_test.exs",
     {"derp/derp_test.go", "TestClientInfoUnmarshal"} =>
       "ported in test/derpex/client_info_test.exs; duplicate and field-type cases added",
     {"derp/derp_test.go", "TestReadFrameHeader"} =>

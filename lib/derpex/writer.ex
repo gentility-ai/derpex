@@ -5,8 +5,10 @@ defmodule Derpex.Writer do
 
   alias Derpex.Frame.Body
   alias Derpex.Outbox.Ring
+  alias Derpex.WebSocket.Frame, as: WebSocketFrame
 
   @wake_message :derpex_outbox_ready
+  @websocket_chunk_size 16 * 1_024
 
   @type rings :: %{
           ordinary: Ring.t(),
@@ -29,6 +31,15 @@ defmodule Derpex.Writer do
   def write_control(writer, data, timeout \\ 5_000),
     do: GenServer.call(writer, {:control, data}, timeout)
 
+  @doc "Switches subsequent writes to RFC 6455 binary messages."
+  @spec set_wire_mode(pid(), :native | :websocket) :: :ok
+  def set_wire_mode(writer, mode) when mode in [:native, :websocket],
+    do: GenServer.call(writer, {:wire_mode, mode})
+
+  @doc "Writes a WebSocket pong without exposing socket ownership."
+  @spec websocket_pong(pid(), binary()) :: :ok | {:error, term()}
+  def websocket_pong(writer, payload), do: GenServer.call(writer, {:websocket_pong, payload})
+
   @doc "The atom used for coalesced ring notification."
   @spec wake_message() :: atom()
   def wake_message, do: @wake_message
@@ -45,6 +56,7 @@ defmodule Derpex.Writer do
        owner_monitor: Process.monitor(owner),
        transport: transport,
        socket: socket,
+       wire_mode: :native,
        rings: nil
      }}
   end
@@ -55,7 +67,16 @@ defmodule Derpex.Writer do
   end
 
   def handle_call({:control, data}, _from, state) do
-    {:reply, state.transport.send(state.socket, data), state}
+    {:reply, send_data(state, data), state}
+  end
+
+  def handle_call({:wire_mode, mode}, _from, state) do
+    {:reply, :ok, %{state | wire_mode: mode}}
+  end
+
+  def handle_call({:websocket_pong, payload}, _from, %{wire_mode: :websocket} = state) do
+    result = state.transport.send(state.socket, WebSocketFrame.encode_pong(payload))
+    {:reply, result, state}
   end
 
   @impl true
@@ -76,7 +97,7 @@ defmodule Derpex.Writer do
     case take_next(state.rings) do
       {:ok, message} ->
         with {:ok, frame} <- Body.encode_server(message),
-             :ok <- state.transport.send(state.socket, frame) do
+             :ok <- send_data(state, frame) do
           maybe_note_send(state, message)
           drain(state)
         else
@@ -120,4 +141,23 @@ defmodule Derpex.Writer do
   end
 
   defp maybe_note_send(_state, _message), do: :ok
+
+  defp send_data(%{wire_mode: :native} = state, data),
+    do: state.transport.send(state.socket, data)
+
+  defp send_data(%{wire_mode: :websocket} = state, data),
+    do: send_websocket_chunks(state, IO.iodata_to_binary(data))
+
+  defp send_websocket_chunks(state, data) when byte_size(data) <= @websocket_chunk_size do
+    state.transport.send(state.socket, WebSocketFrame.encode_binary(data))
+  end
+
+  defp send_websocket_chunks(state, data) do
+    <<chunk::binary-size(@websocket_chunk_size), rest::binary>> = data
+
+    case state.transport.send(state.socket, WebSocketFrame.encode_binary(chunk)) do
+      :ok -> send_websocket_chunks(state, rest)
+      {:error, _reason} = error -> error
+    end
+  end
 end

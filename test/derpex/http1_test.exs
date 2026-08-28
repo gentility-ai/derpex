@@ -40,6 +40,39 @@ defmodule Derpex.HTTP1Test do
              {:upgrade, :derp, nil, %{ideal_node: nil}}
   end
 
+  test "negotiates only a valid WebSocket request with the derp subprotocol" do
+    key = Base.encode64(:binary.copy(<<7>>, 16))
+
+    request =
+      request("GET", "/derp", [
+        {"upgrade", "websocket"},
+        {"connection", "keep-alive, Upgrade"},
+        {"sec-websocket-version", "13"},
+        {"sec-websocket-key", key},
+        {"sec-websocket-protocol", "chat, derp"}
+      ])
+
+    assert {:upgrade, :websocket, response, %{ideal_node: nil}} =
+             HTTP1.route(request, @server_public)
+
+    response = IO.iodata_to_binary(response)
+    assert response =~ "HTTP/1.1 101 Switching Protocols\r\n"
+    assert response =~ "Sec-WebSocket-Protocol: derp\r\n"
+
+    assert response =~
+             "Sec-WebSocket-Accept: #{Base.encode64(:crypto.hash(:sha, key <> "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"))}\r\n"
+
+    invalid = %{request | headers: List.keydelete(request.headers, "sec-websocket-key", 0)}
+    assert {:response, invalid_response} = HTTP1.route(invalid, @server_public)
+    assert IO.iodata_to_binary(invalid_response) =~ "HTTP/1.1 400 Bad Request\r\n"
+  end
+
+  test "preserves legacy native DERP for websocket upgrades without the derp subprotocol" do
+    request = request("GET", "/derp", [{"upgrade", "websocket"}])
+    assert {:upgrade, :derp, response, _metadata} = HTTP1.route(request, @server_public)
+    assert IO.iodata_to_binary(response) =~ "Upgrade: DERP\r\n"
+  end
+
   test "requires an upgrade on other DERP paths" do
     assert {:response, response} = HTTP1.route(request("GET", "/derp/sdf"), @server_public)
     response = IO.iodata_to_binary(response)
@@ -56,6 +89,34 @@ defmodule Derpex.HTTP1Test do
 
     assert response =~
              "Cache-Control: no-cache, no-store, must-revalidate, no-transform, max-age=0"
+  end
+
+  test "matches every upstream generate_204 challenge case" do
+    cases = [
+      {nil, nil},
+      {"", nil},
+      {"input", "response input"},
+      {"ts_derp99b.tailscale.com", "response ts_derp99b.tailscale.com"},
+      {"foo\0bar", nil},
+      {"foo bar", nil},
+      {:binary.copy("x", 65), nil}
+    ]
+
+    for {challenge, expected} <- cases do
+      headers = if challenge == nil, do: [], else: [{"x-tailscale-challenge", challenge}]
+
+      assert {:response, response} =
+               HTTP1.route(request("GET", "/generate_204", headers), @server_public)
+
+      response = IO.iodata_to_binary(response)
+      assert response =~ "HTTP/1.1 204 No Content\r\n"
+
+      if expected do
+        assert response =~ "X-Tailscale-Response: #{expected}\r\n"
+      else
+        refute response =~ "X-Tailscale-Response:"
+      end
+    end
   end
 
   defp request(method, path, headers \\ []) do

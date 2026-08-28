@@ -9,6 +9,7 @@ defmodule Derpex.Listener.Handler do
   alias Derpex.Router
   alias Derpex.Session
   alias Derpex.Transport.ThousandIsland, as: Transport
+  alias Derpex.WebSocket.Frame, as: WebSocketFrame
   alias Derpex.Writer
 
   @impl ThousandIsland.Handler
@@ -43,6 +44,8 @@ defmodule Derpex.Listener.Handler do
         pong: pong,
         lifecycle: lifecycle,
         peer_gone_limiter: RateLimiter.new(1, 3),
+        wire_mode: :native,
+        websocket_decoder: WebSocketFrame.new(),
         client_public_key: nil
       }
 
@@ -54,6 +57,14 @@ defmodule Derpex.Listener.Handler do
   end
 
   @impl ThousandIsland.Handler
+  def handle_data(data, socket, %{wire_mode: :websocket} = state) do
+    case receive_websocket_data(socket, state, data) do
+      {:ok, state} -> {:continue, state}
+      {:close, state} -> {:close, state}
+      {:error, reason, state} -> {:error, reason, state}
+    end
+  end
+
   def handle_data(data, socket, state) do
     case Session.receive_data(state.session, data) do
       {:ok, session, actions} ->
@@ -166,6 +177,19 @@ defmodule Derpex.Listener.Handler do
     {:ok, state}
   end
 
+  defp execute_action(_socket, state, {:set_wire_mode, :websocket}) do
+    :ok = Writer.set_wire_mode(state.writer, :websocket)
+    {:ok, %{state | wire_mode: :websocket}}
+  end
+
+  defp execute_action(socket, state, {:websocket_data, data}) do
+    case receive_websocket_data(socket, state, data) do
+      {:ok, state} -> {:ok, state}
+      {:close, state} -> {:error, :websocket_closed, state}
+      {:error, reason, state} -> {:error, reason, state}
+    end
+  end
+
   defp dispatch_event(state, event) do
     case state.event_handler.(event) do
       :ok -> {:ok, state}
@@ -228,6 +252,47 @@ defmodule Derpex.Listener.Handler do
       {:ok, state}
     end
   end
+
+  defp receive_websocket_data(socket, state, data) do
+    case WebSocketFrame.push(state.websocket_decoder, data) do
+      {:ok, events, decoder} ->
+        process_websocket_events(socket, %{state | websocket_decoder: decoder}, events)
+
+      {:error, reason} ->
+        {:error, {:websocket, reason}, state}
+    end
+  end
+
+  defp process_websocket_events(_socket, state, []), do: {:ok, state}
+
+  defp process_websocket_events(socket, state, [{:binary, data} | rest]) do
+    case Session.receive_data(state.session, data) do
+      {:ok, session, actions} ->
+        case execute_actions(socket, %{state | session: session}, actions) do
+          {:ok, state} -> process_websocket_events(socket, state, rest)
+          {:error, reason, state} -> {:error, reason, state}
+        end
+
+      {:close, session, _reason, actions} ->
+        case execute_actions(socket, %{state | session: session}, actions) do
+          {:ok, state} -> {:close, state}
+          {:error, reason, state} -> {:error, reason, state}
+        end
+    end
+  end
+
+  defp process_websocket_events(socket, state, [{:ping, payload} | rest]) do
+    case Writer.websocket_pong(state.writer, payload) do
+      :ok -> process_websocket_events(socket, state, rest)
+      {:error, reason} -> {:error, {:websocket_pong, reason}, state}
+    end
+  end
+
+  defp process_websocket_events(socket, state, [{:pong, _payload} | rest]),
+    do: process_websocket_events(socket, state, rest)
+
+  defp process_websocket_events(_socket, state, [{:close, _payload} | _rest]),
+    do: {:close, state}
 
   defp cleanup(%{timers: _timers} = state) do
     cancel_all_timers(state)

@@ -4,6 +4,7 @@ defmodule Derpex.HTTP1.Response do
   @status_reasons %{
     200 => "OK",
     204 => "No Content",
+    400 => "Bad Request",
     404 => "Not Found",
     405 => "Method Not Allowed",
     426 => "Upgrade Required"
