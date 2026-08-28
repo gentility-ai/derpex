@@ -10,6 +10,7 @@ config :derpex,
   mesh_key: nil,
   mesh_peers: [],
   rate_config_path: nil,
+  shutdown: [deadline_ms: 30_000, poll_ms: 25],
   stun_listeners: [],
   native_base_url:
     System.get_env(

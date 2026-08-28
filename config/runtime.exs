@@ -3,6 +3,14 @@ import Config
 if config_env() == :prod do
   config :logger, level: :info
 
+  shutdown_deadline_ms =
+    case Integer.parse(System.get_env("DERPEX_SHUTDOWN_DEADLINE_MS", "30000")) do
+      {value, ""} when value in 0..86_400_000 -> value
+      _invalid -> raise "DERPEX_SHUTDOWN_DEADLINE_MS must be an integer from 0 through 86400000"
+    end
+
+  config :derpex, shutdown: [deadline_ms: shutdown_deadline_ms, poll_ms: 25]
+
   listen_port = System.get_env("DERPEX_LISTEN_PORT")
 
   if listen_port do

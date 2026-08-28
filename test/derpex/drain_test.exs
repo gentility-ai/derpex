@@ -116,6 +116,23 @@ defmodule Derpex.DrainTest do
     Process.exit(first, :kill)
   end
 
+  test "finishing a drain immediately closes remaining homes exactly once" do
+    drain = start_supervised!({Drain, name: nil, profile: :gentility, clock: Manual})
+    home = reporting_connection(self())
+    assert Drain.register(drain, home, Ring.new(2)) == :ok
+    assert Drain.set_preferred(drain, home, true) == :ok
+    assert {:ok, %{targeted_connections: 1}} = Drain.begin_drain(drain, deadline_ms: 1_000)
+
+    assert Drain.finish(drain) == {:ok, 1}
+    assert_receive {:connection_message, ^home, {:derpex_drain_close, _token}}
+    assert Drain.finish(drain) == {:ok, 0}
+    refute_receive {:connection_message, ^home, _message}
+    assert Drain.stats(drain).deadline_closes == 1
+    assert Manual.pending_timer_count() == 0
+
+    Process.exit(home, :kill)
+  end
+
   defp reporting_connection(parent) do
     spawn(fn -> report_messages(parent) end)
   end

@@ -10,6 +10,19 @@ defmodule Derpex.Application do
     end
   end
 
+  @impl true
+  def prep_stop(state) do
+    options = Application.fetch_env!(:derpex, :shutdown)
+
+    options =
+      if is_nil(Application.fetch_env!(:derpex, :gentility)),
+        do: Keyword.put(options, :deadline_ms, 0),
+        else: options
+
+    _result = Derpex.Shutdown.run(Derpex.Drain, options)
+    state
+  end
+
   defp runtime_children do
     gentility = Application.fetch_env!(:derpex, :gentility)
 

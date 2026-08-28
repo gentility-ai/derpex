@@ -73,6 +73,10 @@ defmodule Derpex.Drain do
   @spec cancel(GenServer.server()) :: :ok
   def cancel(server \\ __MODULE__), do: GenServer.call(server, :cancel)
 
+  @doc "Closes every remaining drain target immediately. Idempotent."
+  @spec finish(GenServer.server()) :: {:ok, non_neg_integer()}
+  def finish(server \\ __MODULE__), do: GenServer.call(server, :finish)
+
   @doc "Returns bounded state without node, organization, or source attribution."
   @spec stats(GenServer.server()) :: map()
   def stats(server \\ __MODULE__), do: GenServer.call(server, :stats)
@@ -201,20 +205,16 @@ defmodule Derpex.Drain do
     {:reply, :ok, state}
   end
 
+  def handle_call(:finish, _from, state) do
+    {closed, state} = close_targets(state)
+    {:reply, {:ok, closed}, state}
+  end
+
   def handle_call(:stats, _from, state), do: {:reply, stats_from(state), state}
 
   @impl true
   def handle_info({__MODULE__, :deadline, token}, %{drain_token: token} = state) do
-    Enum.each(state.targets, &send(&1, {:derpex_drain_close, token}))
-
-    state = %{
-      state
-      | deadline_timer: nil,
-        deadline_at: nil,
-        deadline_closes: state.deadline_closes + MapSet.size(state.targets),
-        targets: MapSet.new()
-    }
-
+    {_closed, state} = close_targets(%{state | deadline_timer: nil})
     {:noreply, state}
   end
 
@@ -289,6 +289,22 @@ defmodule Derpex.Drain do
   defp cancel_timer(state) do
     _remaining = state.clock.cancel_timer(state.deadline_timer)
     :ok
+  end
+
+  defp close_targets(state) do
+    cancel_timer(state)
+    closed = MapSet.size(state.targets)
+    Enum.each(state.targets, &send(&1, {:derpex_drain_close, state.drain_token}))
+
+    state = %{
+      state
+      | deadline_timer: nil,
+        deadline_at: nil,
+        deadline_closes: state.deadline_closes + closed,
+        targets: MapSet.new()
+    }
+
+    {closed, state}
   end
 
   defp drain_config!(options) when is_list(options) do

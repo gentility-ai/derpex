@@ -118,6 +118,13 @@ peers and probes available, sends bounded-jitter `FrameRestarting` notices only
 in the Gentility profile, and closes homes that remain at the configured hard
 deadline. Repeating a begin or cancel operation is idempotent.
 
+An orderly OTP shutdown enters the same drain from the application
+`prep_stop/1` callback while listeners and connection processes are still
+alive. Gentility waits up to 30 seconds by default before closing leftovers;
+set `DERPEX_SHUTDOWN_DEADLINE_MS` to align that hard wall with the deployment
+manager's stop grace period. The compatibility profile performs an immediate
+close and never emits the Gentility-only restart frame.
+
 `GET /healthz` and `GET /readyz` are public, detail-free liveness and readiness
 checks; readiness turns off during drain or a full Gentility usage spool. Set a
 random `DERPEX_OPERATIONS_TOKEN` of at least 16 bytes to enable `GET /metrics`
