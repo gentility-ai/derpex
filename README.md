@@ -71,6 +71,15 @@ Set both `DERPEX_ACCEPT_CONNECTION_LIMIT` (connections per second) and
 `DERPEX_ACCEPT_CONNECTION_BURST` to bound unauthenticated connection creation.
 The shared bucket is checked before crypto, ring, or session allocation.
 
+Public listeners should also set `DERPEX_ACCEPT_PER_IP_LIMIT` with
+`DERPEX_ACCEPT_PER_IP_BURST`, and `DERPEX_ACCEPT_PER_IP_CONNECTIONS`, to bound
+handshake attempts and concurrently open client sockets from one source. The
+checks occur before product authorization and expensive connection state.
+`DERPEX_ACCEPT_MAX_TRACKED_IPS` defaults to `16384`; inactive source
+buckets are evicted least-recently-used at that hard bound, while active claims
+are process-monitored and never evicted. Limiter metrics aggregate outcomes and
+never use source IPs as labels.
+
 ## Gentility profile
 
 The baseline profile remains the default. A production Gentility deployment

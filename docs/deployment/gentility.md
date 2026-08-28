@@ -22,6 +22,9 @@ proxy or load balancer.
 - Admission cache and usage spool live on persistent encrypted storage with
   mode `0600`. Event reconciliation and usage export are mandatory; exhausting
   the bounded spool sheds relay packets rather than losing the billing ledger.
+- Global and per-source pre-authentication rate limits plus a per-source open
+  connection cap are configured on every public listener. Source tracking is
+  LRU-bounded and its operational counters contain no source-IP labels.
 
 ## Milestone 0 launch inputs
 

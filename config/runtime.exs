@@ -25,6 +25,15 @@ if config_env() == :prod do
     rate_config_path = System.get_env("DERPEX_RATE_CONFIG")
     accept_limit_text = System.get_env("DERPEX_ACCEPT_CONNECTION_LIMIT")
     accept_burst_text = System.get_env("DERPEX_ACCEPT_CONNECTION_BURST")
+    accept_per_ip_limit_text = System.get_env("DERPEX_ACCEPT_PER_IP_LIMIT")
+    accept_per_ip_burst_text = System.get_env("DERPEX_ACCEPT_PER_IP_BURST")
+
+    accept_per_ip_connections_text =
+      System.get_env("DERPEX_ACCEPT_PER_IP_CONNECTIONS")
+
+    accept_max_tracked_ips_text =
+      System.get_env("DERPEX_ACCEPT_MAX_TRACKED_IPS", "16384")
+
     gentility_adapter_text = System.get_env("DERPEX_GENTILITY_ADAPTER")
 
     send_queue_depth_text =
@@ -93,22 +102,64 @@ if config_env() == :prod do
         _invalid -> raise "DERPEX_STUN_PORT must be an integer from 1 through 65535"
       end
 
-    accept_limit =
-      case {accept_limit_text, accept_burst_text} do
-        {nil, nil} ->
+    parse_rate_pair = fn
+      {nil, nil}, _names ->
+        nil
+
+      {limit_text, burst_text}, {limit_name, burst_name}
+      when is_binary(limit_text) and is_binary(burst_text) ->
+        with {limit, ""} when limit >= 0 <- Float.parse(limit_text),
+             {burst, ""} when burst > 0 <- Integer.parse(burst_text) do
+          {limit, burst}
+        else
+          _invalid ->
+            raise "#{limit_name} and #{burst_name} must be a non-negative rate and positive integer burst"
+        end
+
+      _incomplete, {limit_name, burst_name} ->
+        raise "set both #{limit_name} and #{burst_name}"
+    end
+
+    global_accept_limit =
+      parse_rate_pair.(
+        {accept_limit_text, accept_burst_text},
+        {"DERPEX_ACCEPT_CONNECTION_LIMIT", "DERPEX_ACCEPT_CONNECTION_BURST"}
+      )
+
+    per_ip_accept_limit =
+      parse_rate_pair.(
+        {accept_per_ip_limit_text, accept_per_ip_burst_text},
+        {"DERPEX_ACCEPT_PER_IP_LIMIT", "DERPEX_ACCEPT_PER_IP_BURST"}
+      )
+
+    per_ip_connections =
+      case accept_per_ip_connections_text do
+        nil ->
           nil
 
-        {limit_text, burst_text} when is_binary(limit_text) and is_binary(burst_text) ->
-          with {limit, ""} when limit >= 0 <- Float.parse(limit_text),
-               {burst, ""} when burst > 0 <- Integer.parse(burst_text) do
-            {limit, burst}
-          else
-            _invalid ->
-              raise "DERPEX_ACCEPT_CONNECTION_LIMIT and DERPEX_ACCEPT_CONNECTION_BURST must be non-negative rate and positive integer burst"
+        text ->
+          case Integer.parse(text) do
+            {value, ""} when value > 0 -> value
+            _invalid -> raise "DERPEX_ACCEPT_PER_IP_CONNECTIONS must be a positive integer"
           end
+      end
 
-        _incomplete ->
-          raise "set both DERPEX_ACCEPT_CONNECTION_LIMIT and DERPEX_ACCEPT_CONNECTION_BURST"
+    max_tracked_ips =
+      case Integer.parse(accept_max_tracked_ips_text) do
+        {value, ""} when value > 0 -> value
+        _invalid -> raise "DERPEX_ACCEPT_MAX_TRACKED_IPS must be a positive integer"
+      end
+
+    accept_limit =
+      if is_nil(per_ip_accept_limit) and is_nil(per_ip_connections) do
+        global_accept_limit
+      else
+        [
+          global: global_accept_limit,
+          per_ip: per_ip_accept_limit,
+          per_ip_connections: per_ip_connections,
+          max_tracked_ips: max_tracked_ips
+        ]
       end
 
     gentility =

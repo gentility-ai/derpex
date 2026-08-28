@@ -44,7 +44,7 @@ defmodule Derpex.Listener.Handler do
       |> Keyword.get(:send_queue_depth, SendQueueConfig.default_depth())
       |> SendQueueConfig.validate!()
 
-    with true <- AcceptLimiter.allow?(accept_limiter),
+    with :ok <- AcceptLimiter.claim(accept_limiter, elem(remote_address, 0)),
          {:ok, server_public_key} <- Crypto.public_key(server_private_key),
          {:ok, writer} <- Writer.start_link(owner: self(), transport: Transport, socket: socket),
          ordinary =
@@ -100,15 +100,24 @@ defmodule Derpex.Listener.Handler do
         rate_controller: rate_controller,
         receive_limiter: nil,
         server_public_key: server_public_key,
-        remote_address: remote_address
+        remote_address: remote_address,
+        accept_limiter: accept_limiter
       }
 
       continue_after_actions(socket, state, actions)
     else
-      false ->
+      {:error, reason}
+      when reason in [
+             :accept_rate_limited,
+             :ip_rate_limited,
+             :ip_connection_limited,
+             :ip_tracking_limited
+           ] ->
+        :ok = AcceptLimiter.release(accept_limiter)
         {:close, %{session: nil, timers: %{}, event_handler: event_handler}}
 
       {:error, reason} ->
+        :ok = AcceptLimiter.release(accept_limiter)
         {:error, reason, %{session: nil, timers: %{}, event_handler: event_handler}}
     end
   end
@@ -429,6 +438,7 @@ defmodule Derpex.Listener.Handler do
 
   defp cleanup(%{timers: _timers} = state) do
     cancel_all_timers(state)
+    :ok = AcceptLimiter.release(state[:accept_limiter])
     :ok = Admission.release(state[:admission_policy], self())
 
     if state[:client_public_key] && Process.whereis(Router) do

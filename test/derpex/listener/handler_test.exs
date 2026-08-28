@@ -352,6 +352,41 @@ defmodule Derpex.Listener.HandlerTest do
     :gen_tcp.close(rejected)
   end
 
+  test "per-IP connection claims are released when an unauthenticated socket closes" do
+    limiter =
+      start_supervised!(
+        {AcceptLimiter, name: nil, config: [per_ip_connections: 1, max_tracked_ips: 16]}
+      )
+
+    {_server_public, server_private} = Crypto.generate_keypair()
+
+    {:ok, server} =
+      ThousandIsland.start_link(
+        port: 0,
+        transport_options: [ip: {127, 0, 0, 1}],
+        num_acceptors: 1,
+        handler_module: Handler,
+        handler_options: [server_private_key: server_private, accept_limiter: limiter]
+      )
+
+    stop_server_on_exit(server)
+    {:ok, {_ip, port}} = ThousandIsland.listener_info(server)
+    {:ok, first} = :gen_tcp.connect({127, 0, 0, 1}, port, [:binary, active: false])
+    assert_eventually(fn -> AcceptLimiter.stats(limiter).active_connections == 1 end)
+
+    {:ok, rejected} = :gen_tcp.connect({127, 0, 0, 1}, port, [:binary, active: false])
+    assert {:error, :closed} = :gen_tcp.recv(rejected, 0, 2_000)
+    :gen_tcp.close(rejected)
+
+    :gen_tcp.close(first)
+    assert_eventually(fn -> AcceptLimiter.stats(limiter).active_connections == 0 end)
+
+    {:ok, replacement} = :gen_tcp.connect({127, 0, 0, 1}, port, [:binary, active: false])
+    assert_eventually(fn -> AcceptLimiter.stats(limiter).active_connections == 1 end)
+    assert {:error, :timeout} = :gen_tcp.recv(replacement, 0, 25)
+    :gen_tcp.close(replacement)
+  end
+
   test "configured packet queue depth applies independently to ordinary and disco rings" do
     {server_public, server_private} = Crypto.generate_keypair()
     {_client_public, client_private} = Crypto.generate_keypair()
