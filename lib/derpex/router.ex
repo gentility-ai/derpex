@@ -15,6 +15,7 @@ defmodule Derpex.Router do
   @reverse_table __MODULE__.ReversePaths
   @registrations_table __MODULE__.Registrations
   @duplicates_table __MODULE__.Duplicates
+  @forwarders_table __MODULE__.Forwarders
 
   @default_presence %{
     ip: <<0::128>>,
@@ -109,9 +110,31 @@ defmodule Derpex.Router do
     GenServer.call(__MODULE__, {:close_peer, key})
   end
 
-  @doc "Publishes a packet directly to the active destination ring."
+  @doc "Registers a bounded regional forwarding path for a node key."
+  @spec add_forwarder(binary(), term(), Ring.t()) :: :ok
+  def add_forwarder(<<key::binary-size(32)>>, identity, %Ring{} = ring) do
+    GenServer.call(__MODULE__, {:add_forwarder, key, identity, ring})
+  end
+
+  @doc "Removes a regional forwarding path if the identity is registered."
+  @spec remove_forwarder(binary(), term()) :: :ok
+  def remove_forwarder(<<key::binary-size(32)>>, identity) do
+    GenServer.call(__MODULE__, {:remove_forwarder, key, identity})
+  end
+
+  @doc "Publishes to the active local route, then a regional forwarder on a miss."
   @spec route(binary(), binary(), binary()) :: route_result()
   def route(<<source::binary-size(32)>>, <<destination::binary-size(32)>>, packet)
+      when is_binary(packet) do
+    case route_local(source, destination, packet) do
+      {:dropped, :unknown_destination} -> route_forwarder(source, destination, packet)
+      result -> result
+    end
+  end
+
+  @doc "Publishes only to a local route, preventing an already-forwarded packet from looping."
+  @spec route_local(binary(), binary(), binary()) :: route_result()
+  def route_local(<<source::binary-size(32)>>, <<destination::binary-size(32)>>, packet)
       when is_binary(packet) do
     case :ets.lookup(@table, destination) do
       [{^destination, _connection, ordinary, disco, _lifecycle}] ->
@@ -188,15 +211,25 @@ defmodule Derpex.Router do
         read_concurrency: true
       ])
 
+    forwarders_table =
+      :ets.new(@forwarders_table, [
+        :named_table,
+        :set,
+        :public,
+        read_concurrency: true
+      ])
+
     {:ok,
      %{
        table: table,
        reverse_table: reverse_table,
        registrations_table: registrations_table,
        duplicates_table: duplicates_table,
+       forwarders_table: forwarders_table,
        watchers: %{},
        monitors: %{},
-       routes: %{}
+       routes: %{},
+       forwarders: %{}
      }}
   end
 
@@ -287,6 +320,41 @@ defmodule Derpex.Router do
 
     Enum.each(connections, &send(&1, {:derpex_close_peer, key}))
     {:reply, length(connections), state}
+  end
+
+  def handle_call({:add_forwarder, key, identity, ring}, _from, state) do
+    entries = Map.get(state.forwarders, key, [])
+
+    if Enum.any?(entries, fn {registered_identity, _ring, _sequence} ->
+         registered_identity == identity
+       end) do
+      {:reply, :ok, state}
+    else
+      entries = entries ++ [{identity, ring, activity_sequence()}]
+      publish_preferred_forwarder(key, entries)
+
+      {:reply, :ok, %{state | forwarders: Map.put(state.forwarders, key, entries)}}
+    end
+  end
+
+  def handle_call({:remove_forwarder, key, identity}, _from, state) do
+    entries =
+      state.forwarders
+      |> Map.get(key, [])
+      |> Enum.reject(fn {registered_identity, _ring, _sequence} ->
+        registered_identity == identity
+      end)
+
+    publish_preferred_forwarder(key, entries)
+
+    forwarders =
+      if entries == [] do
+        Map.delete(state.forwarders, key)
+      else
+        Map.put(state.forwarders, key, entries)
+      end
+
+    {:reply, :ok, %{state | forwarders: forwarders}}
   end
 
   @impl true
@@ -448,6 +516,25 @@ defmodule Derpex.Router do
     Ring.enqueue(ring, message)
   rescue
     ArgumentError -> {:dropped, :closed_destination}
+  end
+
+  defp route_forwarder(source, destination, packet) do
+    case :ets.lookup(@forwarders_table, destination) do
+      [{^destination, _identity, ring}] ->
+        safe_enqueue(ring, {:forward_packet, source, destination, packet})
+
+      [] ->
+        {:dropped, :unknown_destination}
+    end
+  end
+
+  defp publish_preferred_forwarder(key, []) do
+    true = :ets.delete(@forwarders_table, key)
+  end
+
+  defp publish_preferred_forwarder(key, entries) do
+    {identity, ring, _sequence} = Enum.min_by(entries, &elem(&1, 2))
+    true = :ets.insert(@forwarders_table, {key, identity, ring})
   end
 
   defp activity_sequence, do: :erlang.unique_integer([:positive, :monotonic])

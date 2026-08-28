@@ -56,6 +56,10 @@ defmodule Derpex.UpstreamInventory do
       "unchanged official clients cover exact app-name rejection and trusted mesh bypass",
     {"derp/derpserver/derpserver_test.go", "TestRecvClientKeyAppName"} =>
       "ported encrypted ClientInfo and app-name validation in handshake and client-info tests",
+    {"derp/derpserver/derpserver_test.go", "TestForwarderRegistration"} =>
+      "adapted in test/derpex/router_test.exs; duplicate registration, removal, priority, and local precedence preserved",
+    {"derp/derpserver/derpserver_test.go", "TestMultiForwarder"} =>
+      "adapted in test/derpex/router_test.exs with 5,000 routes concurrent with repeated forwarder changes",
     {"derp/derpserver/derpserver_test.go", "TestPerClientRateLimit"} =>
       "ported with manual-clock live listener pacing and shutdown cancellation",
     {"derp/derpserver/derpserver_test.go", "TestRateLimitWait"} =>
@@ -66,6 +70,12 @@ defmodule Derpex.UpstreamInventory do
       "ported upstream JSON shapes, validation, and missing-path failures",
     {"derp/derpserver/derpserver_test.go", "TestLoadAndApplyRateConfig"} =>
       "ported load, normalization, live apply, and disable behavior",
+    {"derp/derpserver/derpserver_test.go", "TestLookupDestHashTrieFastPath"} =>
+      "adapted to the lock-free ETS local-route lookup in test/derpex/router_test.exs",
+    {"derp/derpserver/derpserver_test.go", "TestLookupDestHashTrieFallsBackForForwarder"} =>
+      "adapted to the secondary ETS regional-forwarder lookup in test/derpex/router_test.exs",
+    {"derp/derpserver/derpserver_test.go", "TestLookupDestHashTrieIgnoresInactiveSet"} =>
+      "DERPEX never publishes inactive local routes; unregister-to-forwarder fallback is covered in test/derpex/router_test.exs",
     {"cmd/derper/derper_test.go", "TestNoContent"} =>
       "ported all challenge validity cases in test/derpex/http1_test.exs",
     {"derp/derp_test.go", "TestClientInfoUnmarshal"} =>

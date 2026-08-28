@@ -16,6 +16,93 @@ defmodule Derpex.RouterTest do
     assert Router.route(source, destination, "packet") == {:dropped, :unknown_destination}
   end
 
+  test "regional forwarders preserve first-seen priority and local routes win" do
+    source = :crypto.strong_rand_bytes(32)
+    destination = :crypto.strong_rand_bytes(32)
+    first = Ring.new(8)
+    second = Ring.new(8)
+    local = Ring.new(2)
+
+    assert Router.add_forwarder(destination, :first, first) == :ok
+    assert Router.add_forwarder(destination, :second, second) == :ok
+    assert Router.add_forwarder(destination, :second, second) == :ok
+
+    assert_enqueued(Router.route(source, destination, "first"))
+
+    assert Ring.take(first) ==
+             {:ok, {:forward_packet, source, destination, "first"}}
+
+    assert Ring.take(second) == :empty
+
+    assert Router.remove_forwarder(destination, :not_registered) == :ok
+    assert_enqueued(Router.route(source, destination, "still first"))
+
+    assert Ring.take(first) ==
+             {:ok, {:forward_packet, source, destination, "still first"}}
+
+    assert Router.remove_forwarder(destination, :first) == :ok
+    assert_enqueued(Router.route(source, destination, "second"))
+
+    assert Ring.take(second) ==
+             {:ok, {:forward_packet, source, destination, "second"}}
+
+    assert Router.register(destination, self(), local) == :ok
+    assert_enqueued(Router.route(source, destination, "local"))
+    assert Ring.take(local) == {:ok, {:recv_packet, source, "local"}}
+    assert Ring.take(second) == :empty
+
+    assert Router.unregister(destination, self()) == :ok
+
+    assert Router.route_local(source, destination, "do not loop") ==
+             {:dropped, :unknown_destination}
+
+    assert Ring.take(second) == :empty
+    assert_enqueued(Router.route(source, destination, "remote again"))
+
+    assert Ring.take(second) ==
+             {:ok, {:forward_packet, source, destination, "remote again"}}
+
+    assert Router.remove_forwarder(destination, :second) == :ok
+    assert Router.route(source, destination, "gone") == {:dropped, :unknown_destination}
+  end
+
+  test "routing remains available while multiple forwarders change concurrently" do
+    source = :crypto.strong_rand_bytes(32)
+    destination = :crypto.strong_rand_bytes(32)
+    first = Ring.new(5_000)
+    second = Ring.new(5_000)
+    third = Ring.new(5_000)
+
+    assert Router.add_forwarder(destination, :first, first) == :ok
+
+    mutator =
+      Task.async(fn ->
+        Enum.each(1..500, fn _iteration ->
+          :ok = Router.add_forwarder(destination, :second, second)
+          :ok = Router.add_forwarder(destination, :third, third)
+          :ok = Router.remove_forwarder(destination, :second)
+          :ok = Router.remove_forwarder(destination, :first)
+          :ok = Router.add_forwarder(destination, :first, first)
+          :ok = Router.remove_forwarder(destination, :third)
+        end)
+      end)
+
+    Enum.each(1..5_000, fn sequence ->
+      assert Router.route(source, destination, Integer.to_string(sequence)) in [
+               {:ok, :wake},
+               {:ok, :coalesced}
+             ]
+    end)
+
+    Task.await(mutator, 5_000)
+
+    assert count_ring(first) + count_ring(second) + count_ring(third) == 5_000
+
+    assert Router.remove_forwarder(destination, :first) == :ok
+    assert Router.remove_forwarder(destination, :second) == :ok
+    assert Router.remove_forwarder(destination, :third) == :ok
+  end
+
   test "ordinary and discovery packets use independent bounded rings" do
     source = :crypto.strong_rand_bytes(32)
     destination = :crypto.strong_rand_bytes(32)
@@ -222,5 +309,16 @@ defmodule Derpex.RouterTest do
           Process.sleep(:infinity)
       end
     end)
+  end
+
+  defp count_ring(ring, count \\ 0) do
+    case Ring.take(ring) do
+      {:ok, _message} -> count_ring(ring, count + 1)
+      :empty -> count
+    end
+  end
+
+  defp assert_enqueued(result) do
+    assert result in [{:ok, :wake}, {:ok, :coalesced}]
   end
 end

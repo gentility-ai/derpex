@@ -285,7 +285,7 @@ defmodule Derpex.Listener.Handler do
          %{can_mesh: true} = state,
          {:forward_packet, source, destination, packet}
        ) do
-    case Router.route(source, destination, packet) do
+    case Router.route_local(source, destination, packet) do
       {:dropped, :unknown_destination} ->
         maybe_notify_unknown_destination(state, destination, packet)
 

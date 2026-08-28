@@ -12,8 +12,8 @@ disposition map and review that change together with `interop/upstream.lock`.
 | State | Count |
 | --- | ---: |
 | Total | 69 |
-| Ported | 29 |
-| Pending (release-blocking) | 36 |
+| Ported | 34 |
+| Pending (release-blocking) | 31 |
 | Implementation-specific | 4 |
 
 | Area | Upstream test | Source | Disposition | Gate/notes |
@@ -36,8 +36,8 @@ disposition map and review that change together with `interop/upstream.lock`.
 | DERP server | `TestIsMeshPeer` | `derp/derpserver/derpserver_test.go:85` | `ported` | ported constant-time trust cases in test/derpex/mesh_key_test.exs |
 | DERP server | `TestVerifyClientDisallowedAppNames` | `derp/derpserver/derpserver_test.go:138` | `ported` | unchanged official clients cover exact app-name rejection and trusted mesh bypass |
 | DERP server | `TestRecvClientKeyAppName` | `derp/derpserver/derpserver_test.go:169` | `ported` | ported encrypted ClientInfo and app-name validation in handshake and client-info tests |
-| DERP server | `TestForwarderRegistration` | `derp/derpserver/derpserver_test.go:221` | `pending` | release-blocking mapping not yet implemented |
-| DERP server | `TestMultiForwarder` | `derp/derpserver/derpserver_test.go:349` | `pending` | release-blocking mapping not yet implemented |
+| DERP server | `TestForwarderRegistration` | `derp/derpserver/derpserver_test.go:221` | `ported` | adapted in test/derpex/router_test.exs; duplicate registration, removal, priority, and local precedence preserved |
+| DERP server | `TestMultiForwarder` | `derp/derpserver/derpserver_test.go:349` | `ported` | adapted in test/derpex/router_test.exs with 5,000 routes concurrent with repeated forwarder changes |
 | DERP server | `TestMetaCert` | `derp/derpserver/derpserver_test.go:405` | `ported` | ported certificate shape plus official TLS fast-start gate |
 | DERP server | `TestModifyTLSConfigToAddMetaCert` | `derp/derpserver/derpserver_test.go:441` | `pending` | release-blocking mapping not yet implemented |
 | DERP server | `TestServerDupClients` | `derp/derpserver/derpserver_test.go:498` | `ported` | ported lifecycle cases and unchanged official last-writer-active client gate |
@@ -53,9 +53,9 @@ disposition map and review that change together with `interop/upstream.lock`.
 | DERP server | `TestUpdateRateLimits` | `derp/derpserver/derpserver_test.go:1304` | `ported` | ported live ordinary and duplicate updates with trusted mesh exemption |
 | DERP server | `TestLoadRateConfig` | `derp/derpserver/derpserver_test.go:1424` | `ported` | ported upstream JSON shapes, validation, and missing-path failures |
 | DERP server | `TestLoadAndApplyRateConfig` | `derp/derpserver/derpserver_test.go:1480` | `ported` | ported load, normalization, live apply, and disable behavior |
-| DERP server | `TestLookupDestHashTrieFastPath` | `derp/derpserver/derpserver_test.go:1582` | `pending` | release-blocking mapping not yet implemented |
-| DERP server | `TestLookupDestHashTrieFallsBackForForwarder` | `derp/derpserver/derpserver_test.go:1610` | `pending` | release-blocking mapping not yet implemented |
-| DERP server | `TestLookupDestHashTrieIgnoresInactiveSet` | `derp/derpserver/derpserver_test.go:1626` | `pending` | release-blocking mapping not yet implemented |
+| DERP server | `TestLookupDestHashTrieFastPath` | `derp/derpserver/derpserver_test.go:1582` | `ported` | adapted to the lock-free ETS local-route lookup in test/derpex/router_test.exs |
+| DERP server | `TestLookupDestHashTrieFallsBackForForwarder` | `derp/derpserver/derpserver_test.go:1610` | `ported` | adapted to the secondary ETS regional-forwarder lookup in test/derpex/router_test.exs |
+| DERP server | `TestLookupDestHashTrieIgnoresInactiveSet` | `derp/derpserver/derpserver_test.go:1626` | `ported` | DERPEX never publishes inactive local routes; unregister-to-forwarder fallback is covered in test/derpex/router_test.exs |
 | DERP server | `TestLookupDestHashTrieNoAlloc` | `derp/derpserver/derpserver_test.go:1655` | `implementation-specific` | Go allocation assertion; packet-path allocation and latency benchmarks protect the invariant |
 | DERP HTTP | `TestSendRecv` | `derp/derphttp/derphttp_test.go:41` | `ported` | unchanged official clients relay packet boundaries in test/interop/go_client_test.exs |
 | DERP HTTP | `TestPing` | `derp/derphttp/derphttp_test.go:181` | `ported` | unchanged official client gate in test/interop/go_client_test.exs |
