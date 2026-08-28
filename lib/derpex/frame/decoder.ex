@@ -13,19 +13,25 @@ defmodule Derpex.Frame.Decoder do
 
   defstruct header: "",
             type: nil,
+            mode: :buffer,
             remaining: 0,
             payload_length: 0,
             fragments: [],
-            max_frame_length: @default_max_frame_length
+            max_frame_length: @default_max_frame_length,
+            frame_policy: nil
 
-  @type frame :: {Frame.type_code(), binary()}
+  @type frame :: {Frame.type_code(), binary() | :discarded}
+  @type frame_policy :: (Frame.type_code(), non_neg_integer() ->
+                           :buffer | :discard | {:error, term()})
   @opaque t :: %__MODULE__{
             header: binary(),
             type: nil | Frame.type_code(),
+            mode: :buffer | :discard,
             remaining: non_neg_integer(),
             payload_length: non_neg_integer(),
             fragments: [binary()],
-            max_frame_length: non_neg_integer()
+            max_frame_length: non_neg_integer(),
+            frame_policy: nil | frame_policy()
           }
 
   @doc "Creates an empty decoder with a bounded accepted frame length."
@@ -34,7 +40,10 @@ defmodule Derpex.Frame.Decoder do
     max_frame_length = Keyword.get(options, :max_frame_length, @default_max_frame_length)
     validate_max_frame_length!(max_frame_length)
 
-    %__MODULE__{max_frame_length: max_frame_length}
+    %__MODULE__{
+      max_frame_length: max_frame_length,
+      frame_policy: Keyword.get(options, :frame_policy)
+    }
   end
 
   @doc "Changes the limit applied to subsequent frame headers."
@@ -42,6 +51,13 @@ defmodule Derpex.Frame.Decoder do
   def with_max_frame_length(%__MODULE__{} = decoder, max_frame_length) do
     validate_max_frame_length!(max_frame_length)
     %{decoder | max_frame_length: max_frame_length}
+  end
+
+  @doc "Changes the header policy used for buffering, bounded discard, or rejection."
+  @spec with_frame_policy(t(), frame_policy()) :: t()
+  def with_frame_policy(%__MODULE__{} = decoder, frame_policy)
+      when is_function(frame_policy, 2) do
+    %{decoder | frame_policy: frame_policy}
   end
 
   @doc "Consumes a transport chunk and returns every complete frame in wire order."
@@ -79,19 +95,24 @@ defmodule Derpex.Frame.Decoder do
     end
   end
 
-  defp start_payload(decoder, _type, payload_length, _chunk, _frames)
-       when payload_length > decoder.max_frame_length do
-    {:error, {:frame_too_large, payload_length, decoder.max_frame_length}}
-  end
-
-  defp start_payload(decoder, type, 0, chunk, frames) do
-    decode(%{decoder | type: nil}, chunk, [{type, ""} | frames])
-  end
-
   defp start_payload(decoder, type, payload_length, chunk, frames) do
+    case frame_policy(decoder, type, payload_length) do
+      :buffer -> start_frame(decoder, type, payload_length, :buffer, chunk, frames)
+      :discard -> start_frame(decoder, type, payload_length, :discard, chunk, frames)
+      {:error, reason} -> {:error, reason}
+    end
+  end
+
+  defp start_frame(decoder, type, 0, mode, chunk, frames) do
+    payload = if mode == :buffer, do: "", else: :discarded
+    decode(%{decoder | type: nil, mode: :buffer}, chunk, [{type, payload} | frames])
+  end
+
+  defp start_frame(decoder, type, payload_length, mode, chunk, frames) do
     decoder = %{
       decoder
       | type: type,
+        mode: mode,
         remaining: payload_length,
         payload_length: payload_length,
         fragments: []
@@ -106,16 +127,17 @@ defmodule Derpex.Frame.Decoder do
   defp consume_payload(decoder, chunk, frames) do
     consumed = min(decoder.remaining, byte_size(chunk))
     <<fragment::binary-size(^consumed), rest::binary>> = chunk
-    fragments = [fragment | decoder.fragments]
+    fragments = retain_fragment(decoder.mode, fragment, decoder.fragments)
     remaining = decoder.remaining - consumed
 
     if remaining == 0 do
       type = decoder.type
-      payload = join_fragments(fragments, decoder.payload_length)
+      payload = payload(decoder.mode, fragments, decoder.payload_length)
 
       decoder = %{
         decoder
         | type: nil,
+          mode: :buffer,
           remaining: 0,
           payload_length: 0,
           fragments: []
@@ -138,6 +160,27 @@ defmodule Derpex.Frame.Decoder do
 
   defp ensure_length(payload, expected_length) when byte_size(payload) == expected_length,
     do: payload
+
+  defp retain_fragment(:buffer, fragment, fragments), do: [fragment | fragments]
+  defp retain_fragment(:discard, _fragment, fragments), do: fragments
+
+  defp payload(:buffer, fragments, payload_length),
+    do: join_fragments(fragments, payload_length)
+
+  defp payload(:discard, _fragments, _payload_length), do: :discarded
+
+  defp frame_policy(%__MODULE__{frame_policy: policy}, type, payload_length)
+       when is_function(policy, 2) do
+    policy.(type, payload_length)
+  end
+
+  defp frame_policy(decoder, _type, payload_length) do
+    if payload_length > decoder.max_frame_length do
+      {:error, {:frame_too_large, payload_length, decoder.max_frame_length}}
+    else
+      :buffer
+    end
+  end
 
   defp validate_max_frame_length!(max_frame_length) do
     if not is_integer(max_frame_length) or max_frame_length < 0 or

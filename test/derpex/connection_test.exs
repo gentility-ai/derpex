@@ -135,10 +135,28 @@ defmodule Derpex.ConnectionTest do
     assert {:ok, state, [:activity]} =
              Connection.receive_data(state, IO.iodata_to_binary(Frame.encode(0xFE, "future")))
 
-    assert {:close, _state, :note_preferred_wrong_size, [:activity]} =
+    assert {:close, _state, :note_preferred_wrong_size, []} =
              Connection.receive_data(
                state,
                IO.iodata_to_binary(Frame.encode(:note_preferred, "wrong"))
              )
+  end
+
+  test "streams unknown authenticated frames to discard without retaining their bodies" do
+    {server_public, server_private} = Crypto.generate_keypair()
+    {_client_public, client_private} = Crypto.generate_keypair()
+
+    {:ok, client_info_frame} =
+      Handshake.client_info_frame(client_private, server_public, %ClientInfo{version: 2})
+
+    {:ok, state, _actions} = Connection.new(server_private)
+
+    {:ok, state, _actions} =
+      Connection.receive_data(state, IO.iodata_to_binary(client_info_frame))
+
+    header = Frame.encode_header(0xFE, 0xFFFFFFFF)
+    assert {:ok, state, []} = Connection.receive_data(state, header <> :binary.copy(<<1>>, 128))
+    assert state.decoder.remaining == 0xFFFFFFFF - 128
+    assert state.decoder.fragments == []
   end
 end

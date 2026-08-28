@@ -17,7 +17,6 @@ defmodule Derpex.Connection do
 
   @handshake_timeout 10_000
   @max_client_info_length 256 * 1_024
-  @max_authenticated_frame_length 1 * 1_024 * 1_024
 
   defstruct [
     :server_private_key,
@@ -61,7 +60,7 @@ defmodule Derpex.Connection do
       state = %__MODULE__{
         server_private_key: server_private_key,
         server_info: server_info,
-        decoder: Decoder.new(max_frame_length: @max_client_info_length),
+        decoder: Decoder.new(frame_policy: &handshake_frame_policy/2),
         phase: :awaiting_client_info,
         client_public_key: nil,
         client_info: nil,
@@ -132,6 +131,16 @@ defmodule Derpex.Connection do
   end
 
   defp process_frames(%__MODULE__{phase: :authenticated} = state, [frame | rest], actions) do
+    case frame do
+      {_type, :discarded} ->
+        process_frames(state, rest, [:activity | actions])
+
+      buffered_frame ->
+        process_buffered_frame(state, rest, actions, buffered_frame)
+    end
+  end
+
+  defp process_buffered_frame(state, rest, actions, frame) do
     case decode_client_frame(frame) do
       {:ok, message} ->
         process_frames(state, rest, [{:client_message, message}, :activity | actions])
@@ -166,7 +175,7 @@ defmodule Derpex.Connection do
         | phase: :authenticated,
           client_public_key: client_public_key,
           client_info: client_info,
-          decoder: Decoder.with_max_frame_length(state.decoder, @max_authenticated_frame_length)
+          decoder: Decoder.with_frame_policy(state.decoder, &authenticated_frame_policy/2)
       }
 
       actions = [
@@ -181,6 +190,44 @@ defmodule Derpex.Connection do
   end
 
   defp decode_client_frame({type, body}), do: Body.decode_client(type, body)
+
+  defp handshake_frame_policy(type, length) do
+    cond do
+      type == Frame.type(:client_info) and length > @max_client_info_length ->
+        {:error, {:frame_too_large, length, @max_client_info_length}}
+
+      type == Frame.type(:client_info) ->
+        :buffer
+
+      true ->
+        authenticated_frame_policy(type, length)
+    end
+  end
+
+  defp authenticated_frame_policy(type, length) do
+    case Frame.type_name(type) do
+      {:ok, :send_packet} ->
+        bounded(length, 32 + 65_536)
+
+      {:ok, :ping} ->
+        bounded(length, 1_000)
+
+      {:ok, :note_preferred} ->
+        exact(length, 1, :note_preferred_wrong_size)
+
+      {:ok, name} when name in [:forward_packet, :watch_connections, :close_peer] ->
+        {:error, :insufficient_permissions}
+
+      _unknown_or_server_frame ->
+        :discard
+    end
+  end
+
+  defp bounded(length, maximum) when length <= maximum, do: :buffer
+  defp bounded(length, maximum), do: {:error, {:frame_too_large, length, maximum}}
+
+  defp exact(length, length, _reason), do: :buffer
+  defp exact(_actual, _expected, reason), do: {:error, reason}
 
   defp close(state, reason, actions) do
     state = %{state | phase: :closed, close_reason: reason}

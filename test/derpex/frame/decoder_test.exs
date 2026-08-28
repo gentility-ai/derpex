@@ -65,6 +65,27 @@ defmodule Derpex.Frame.DecoderTest do
     assert Decoder.finish(decoder) == :ok
   end
 
+  test "discards an arbitrarily chunked body without retaining its fragments" do
+    policy = fn
+      0xFE, _length -> :discard
+      _type, _length -> :buffer
+    end
+
+    decoder = Decoder.new(frame_policy: policy)
+    header = Frame.encode_header(0xFE, 0xFFFFFFFF)
+    assert {:ok, [], decoder} = Decoder.push(decoder, header <> :binary.copy(<<1>>, 128))
+    assert decoder.remaining == 0xFFFFFFFF - 128
+    assert decoder.fragments == []
+
+    decoder = %{decoder | remaining: 2}
+
+    assert {:ok, [{0xFE, :discarded}, {type, ""}], decoder} =
+             Decoder.push(decoder, <<1, 2>> <> IO.iodata_to_binary(Frame.encode(:keep_alive, "")))
+
+    assert type == Frame.type(:keep_alive)
+    assert Decoder.finish(decoder) == :ok
+  end
+
   defp decode_chunks(chunks) do
     {frames, decoder} =
       Enum.reduce(chunks, {[], Decoder.new()}, fn chunk, {frames, decoder} ->
