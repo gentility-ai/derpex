@@ -32,6 +32,12 @@ defmodule Derpex.Listener.HandlerTest do
       send(parent, {:released_connection, connection})
       :ok
     end
+
+    @impl true
+    def reserve_bytes(context, bytes, parent) do
+      send(parent, {:reserved_connection_bytes, context.organization_id, bytes, self()})
+      {:ok, 0}
+    end
   end
 
   test "official-style cleartext HTTP client completes an authenticated handshake" do
@@ -215,6 +221,12 @@ defmodule Derpex.Listener.HandlerTest do
     assert {:ok, <<_server_info_type, length::unsigned-big-32>>} = :gen_tcp.recv(socket, 5, 2_000)
     assert {:ok, _server_info} = :gen_tcp.recv(socket, length, 2_000)
 
+    :ok = :gen_tcp.send(socket, Frame.encode(:ping, "pingpong"))
+    assert_receive {:reserved_connection_bytes, "org_01", 8, ^handler}, 2_000
+    pong_result = :gen_tcp.recv(socket, 13, 2_000)
+    assert {:ok, <<pong_type, 8::unsigned-big-32, "pingpong">>} = pong_result
+    assert pong_type == Frame.type(:pong)
+
     :ok = :gen_tcp.close(socket)
     assert_receive {:released_connection, ^handler}, 2_000
   end
@@ -299,9 +311,9 @@ defmodule Derpex.Listener.HandlerTest do
     :ok = :gen_tcp.send(socket, packet)
     assert_eventually(fn -> Manual.pending_timer_count() == 2 end)
     monitor = Process.monitor(handler)
-    Process.unlink(server)
-    Process.exit(server, :shutdown)
+    send(handler, {:derpex_admission_close, :quota_revision})
     assert_receive {:DOWN, ^monitor, :process, ^handler, _reason}, 2_000
+    assert {:error, :closed} = :gen_tcp.recv(socket, 0, 2_000)
     :gen_tcp.close(socket)
   end
 

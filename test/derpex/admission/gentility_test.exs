@@ -330,6 +330,70 @@ defmodule Derpex.Admission.GentilityTest do
     assert Gentility.authorize(request(node_key), policy) == {:error, :stale_lease}
   end
 
+  test "reserves shared node and organization byte budgets and applies live revisions" do
+    node_key = node_key(18)
+
+    {:ok, authority} =
+      Agent.start_link(fn ->
+        signed_lease(node_key,
+          quota_revision: 3,
+          node_bytes_per_second: 100,
+          node_byte_burst: 100,
+          organization_bytes_per_second: 100,
+          organization_byte_burst: 100
+        )
+      end)
+
+    controller =
+      start_controller(
+        authority: fn _request -> {:ok, Agent.get(authority, & &1)} end,
+        max_byte_delay_ms: 1_000
+      )
+
+    policy = Gentility.policy(controller)
+    {:ok, context} = Gentility.authorize(request(node_key), policy)
+    assert Gentility.reserve_bytes(context, 100, policy) == {:ok, 0}
+    assert Gentility.reserve_bytes(context, 50, policy) == {:ok, 500_000}
+
+    Manual.advance(500)
+
+    Agent.update(authority, fn _wire ->
+      signed_lease(node_key,
+        quota_revision: 4,
+        node_bytes_per_second: 200,
+        node_byte_burst: 200,
+        organization_bytes_per_second: 200,
+        organization_byte_burst: 200
+      )
+    end)
+
+    assert {:ok, revised_context} = Gentility.authorize(request(node_key), policy)
+    assert Gentility.reserve_bytes(revised_context, 100, policy) == {:ok, 500_000}
+  end
+
+  test "closes instead of accumulating an unbounded byte-budget delay" do
+    node_key = node_key(19)
+
+    controller =
+      start_controller(
+        authority: fn _request ->
+          {:ok,
+           signed_lease(node_key,
+             node_bytes_per_second: 100,
+             node_byte_burst: 100,
+             organization_bytes_per_second: 100,
+             organization_byte_burst: 100
+           )}
+        end,
+        max_byte_delay_ms: 100
+      )
+
+    policy = Gentility.policy(controller)
+    {:ok, context} = Gentility.authorize(request(node_key), policy)
+    assert Gentility.reserve_bytes(context, 100, policy) == {:ok, 0}
+    assert Gentility.reserve_bytes(context, 50, policy) == {:error, :byte_budget_exhausted}
+  end
+
   defp start_controller(options) do
     defaults = [
       verification_keys: %{@signing_key_id => @public_key},
@@ -356,10 +420,11 @@ defmodule Derpex.Admission.GentilityTest do
       expires_at_ms: 2_000,
       node_connection_limit: Keyword.get(options, :node_connection_limit, 4),
       organization_connection_limit: Keyword.get(options, :organization_connection_limit, 20),
-      node_bytes_per_second: 10_000,
-      node_byte_burst: 20_000,
-      organization_bytes_per_second: 100_000,
-      organization_byte_burst: 200_000
+      node_bytes_per_second: Keyword.get(options, :node_bytes_per_second, 10_000),
+      node_byte_burst: Keyword.get(options, :node_byte_burst, 20_000),
+      organization_bytes_per_second:
+        Keyword.get(options, :organization_bytes_per_second, 100_000),
+      organization_byte_burst: Keyword.get(options, :organization_byte_burst, 200_000)
     }
 
     {:ok, wire} = Contract.sign_lease(lease, @private_key)

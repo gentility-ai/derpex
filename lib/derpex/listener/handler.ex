@@ -192,6 +192,7 @@ defmodule Derpex.Listener.Handler do
     case execute_actions(socket, state, actions) do
       {:ok, state} -> {:continue, state}
       {:error, {:admission, _reason}, state} -> {:close, state}
+      {:error, {:connection_close, _reason}, state} -> {:close, state}
       {:error, reason, state} -> {:error, reason, state}
     end
   end
@@ -386,6 +387,7 @@ defmodule Derpex.Listener.Handler do
         case execute_actions(socket, %{state | session: session}, actions) do
           {:ok, state} -> process_websocket_events(socket, state, rest)
           {:error, {:admission, _reason}, state} -> {:close, state}
+          {:error, {:connection_close, _reason}, state} -> {:close, state}
           {:error, reason, state} -> {:error, reason, state}
         end
 
@@ -496,21 +498,33 @@ defmodule Derpex.Listener.Handler do
     %{state | receive_limiter: ReceiveLimiter.new(config)}
   end
 
-  defp rate_limit(_socket, %{receive_limiter: nil} = state, _frame_length),
-    do: {:ok, state}
-
   defp rate_limit(socket, state, frame_length) do
+    with {:ok, admission_delay} <-
+           Admission.reserve_bytes(
+             state.admission_policy,
+             state.admission_context,
+             frame_length
+           ),
+         {:ok, receive_delay, state} <- reserve_receive_bytes(state, frame_length),
+         :ok <- wait_for_rate_limit(socket, max(admission_delay, receive_delay)) do
+      {:ok, state}
+    else
+      {:error, reason, state} -> {:error, {:rate_limit, reason}, state}
+      {:error, {:connection_close, _reason} = reason} -> {:error, reason, state}
+      {:error, reason} -> {:error, {:rate_limit, reason}, state}
+    end
+  end
+
+  defp reserve_receive_bytes(%{receive_limiter: nil} = state, _frame_length),
+    do: {:ok, 0, state}
+
+  defp reserve_receive_bytes(state, frame_length) do
     case ReceiveLimiter.reserve(state.receive_limiter, frame_length) do
       {:ok, delay_microseconds, limiter} ->
-        state = %{state | receive_limiter: limiter}
-
-        case wait_for_rate_limit(socket, delay_microseconds) do
-          :ok -> {:ok, state}
-          {:error, reason} -> {:error, reason, state}
-        end
+        {:ok, delay_microseconds, %{state | receive_limiter: limiter}}
 
       {:error, reason} ->
-        {:error, {:rate_limit, reason}, state}
+        {:error, reason, state}
     end
   end
 
@@ -533,6 +547,14 @@ defmodule Derpex.Listener.Handler do
       {:ssl_closed, ^raw_socket} ->
         _remaining = Clock.cancel_timer(timer)
         {:error, :peer_closed}
+
+      {:derpex_close_peer, _key} ->
+        _remaining = Clock.cancel_timer(timer)
+        {:error, {:connection_close, :close_peer}}
+
+      {:derpex_admission_close, reason} ->
+        _remaining = Clock.cancel_timer(timer)
+        {:error, {:connection_close, {:admission, reason}}}
 
       {:EXIT, _process, reason} ->
         _remaining = Clock.cancel_timer(timer)

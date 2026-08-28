@@ -11,6 +11,7 @@ defmodule Derpex.Admission.Gentility do
 
   @behaviour Derpex.Admission
 
+  alias Derpex.Admission.Gentility.ByteBudget
   alias Derpex.Admission.Gentility.Cache
   alias Derpex.Admission.Gentility.Contract
   alias Derpex.Admission.Gentility.Lease
@@ -24,11 +25,21 @@ defmodule Derpex.Admission.Gentility do
   @default_authority_timeout 2_000
   @default_max_lease_ms 15 * 60 * 1_000
   @default_max_future_skew_ms 30_000
+  @default_max_byte_delay_ms 30_000
 
   defmodule Policy do
     @moduledoc "An immutable, lock-free admission handle obtained from a running controller."
 
-    @enforce_keys [:server, :authority, :gate, :max_concurrent_requests, :authority_timeout]
+    @enforce_keys [
+      :server,
+      :authority,
+      :gate,
+      :max_concurrent_requests,
+      :authority_timeout,
+      :byte_budgets,
+      :clock,
+      :max_byte_delay_ms
+    ]
     defstruct @enforce_keys
 
     @type t :: %__MODULE__{
@@ -36,7 +47,10 @@ defmodule Derpex.Admission.Gentility do
             authority: term(),
             gate: :atomics.atomics_ref(),
             max_concurrent_requests: pos_integer(),
-            authority_timeout: pos_integer()
+            authority_timeout: pos_integer(),
+            byte_budgets: :ets.tid(),
+            clock: module(),
+            max_byte_delay_ms: pos_integer()
           }
   end
 
@@ -93,6 +107,37 @@ defmodule Derpex.Admission.Gentility do
   def release(connection, server) when is_pid(connection) do
     _result = controller_call(server, {:release, connection})
     :ok
+  end
+
+  @impl Derpex.Admission
+  def reserve_bytes(%{gentility: gentility}, bytes, %Policy{} = policy)
+      when is_integer(bytes) and bytes >= 0 do
+    now = policy.clock.monotonic_time(:microsecond)
+
+    with {:ok, node_delay} <-
+           ByteBudget.reserve(policy.byte_budgets, :node, gentility.node_key, bytes, now),
+         {:ok, organization_delay} <-
+           ByteBudget.reserve(
+             policy.byte_budgets,
+             :organization,
+             gentility.organization_id,
+             bytes,
+             now
+           ) do
+      delay = max(node_delay, organization_delay)
+
+      if delay <= policy.max_byte_delay_ms * 1_000,
+        do: {:ok, delay},
+        else: {:error, :byte_budget_exhausted}
+    end
+  end
+
+  def reserve_bytes(_context, _bytes, %Policy{}), do: {:error, :invalid_admission_context}
+
+  def reserve_bytes(context, bytes, server) do
+    reserve_bytes(context, bytes, policy(server))
+  catch
+    :exit, _reason -> {:error, :admission_unavailable}
   end
 
   @doc "Applies an authenticated revocation and closes all affected local duplicates."
@@ -247,15 +292,24 @@ defmodule Derpex.Admission.Gentility do
     max_future_skew_ms =
       non_negative_option!(options, :max_future_skew_ms, @default_max_future_skew_ms)
 
+    max_byte_delay_ms =
+      positive_option!(options, :max_byte_delay_ms, @default_max_byte_delay_ms)
+
     verification_keys = Keyword.fetch!(options, :verification_keys)
 
     with :ok <- validate_verification_keys(verification_keys) do
+      clock = Keyword.get(options, :clock, Clock)
+      byte_budgets = ByteBudget.new()
+
       policy = %Policy{
         server: server,
         authority: authority,
         gate: gate,
         max_concurrent_requests: max_concurrent_requests,
-        authority_timeout: authority_timeout
+        authority_timeout: authority_timeout,
+        byte_budgets: byte_budgets,
+        clock: clock,
+        max_byte_delay_ms: max_byte_delay_ms
       }
 
       {:ok,
@@ -267,7 +321,7 @@ defmodule Derpex.Admission.Gentility do
          max_revocations: max_revocations,
          max_lease_ms: max_lease_ms,
          max_future_skew_ms: max_future_skew_ms,
-         clock: Keyword.get(options, :clock, Clock),
+         clock: clock,
          close_peer: Keyword.get(options, :close_peer, &Router.close_peer/1),
          close_connection:
            Keyword.get(options, :close_connection, fn connection, reason ->
@@ -494,6 +548,7 @@ defmodule Derpex.Admission.Gentility do
     %{
       gentility: %{
         source: source,
+        node_key: lease.node_key,
         node_id: lease.node_id,
         organization_id: lease.organization_id,
         owner_kind: lease.owner_kind,
@@ -619,7 +674,33 @@ defmodule Derpex.Admission.Gentility do
         merge_budgets(budgets, claim.node_budget, claim.organization_budget)
       end)
 
-    %{state | node_budgets: node_budgets, organization_budgets: organization_budgets}
+    state = %{state | node_budgets: node_budgets, organization_budgets: organization_budgets}
+    sync_byte_budgets(state)
+  end
+
+  defp sync_byte_budgets(state) do
+    now = state.clock.monotonic_time(:microsecond)
+
+    Enum.each(state.node_budgets, fn {_identity, budget} ->
+      ByteBudget.sync(state.policy.byte_budgets, :node, budget, now)
+    end)
+
+    Enum.each(state.organization_budgets, fn {_identity, budget} ->
+      ByteBudget.sync(state.policy.byte_budgets, :organization, budget, now)
+    end)
+
+    retained =
+      Enum.reduce(state.node_budgets, MapSet.new(), fn {identity, _budget}, retained ->
+        MapSet.put(retained, {:node, identity})
+      end)
+
+    retained =
+      Enum.reduce(state.organization_budgets, retained, fn {identity, _budget}, retained ->
+        MapSet.put(retained, {:organization, identity})
+      end)
+
+    :ok = ByteBudget.prune(state.policy.byte_budgets, retained)
+    state
   end
 
   defp merge_budgets({node_budgets, organization_budgets}, node, organization) do
@@ -631,10 +712,29 @@ defmodule Derpex.Admission.Gentility do
 
   defp put_newer_budget(budgets, identity, budget) do
     case budgets[identity] do
-      %{revision: revision} when revision > budget.revision -> budgets
-      _older_or_missing -> Map.put(budgets, identity, budget)
+      %{revision: revision} when revision > budget.revision ->
+        budgets
+
+      %{revision: revision} = current when revision == budget.revision ->
+        Map.put(budgets, identity, stricter_budget(current, budget))
+
+      _older_or_missing ->
+        Map.put(budgets, identity, budget)
     end
   end
+
+  defp stricter_budget(left, right) do
+    %{
+      left
+      | connection_limit: min(left.connection_limit, right.connection_limit),
+        bytes_per_second: stricter_rate(left.bytes_per_second, right.bytes_per_second),
+        byte_burst: min(left.byte_burst, right.byte_burst)
+    }
+  end
+
+  defp stricter_rate(0, rate), do: rate
+  defp stricter_rate(rate, 0), do: rate
+  defp stricter_rate(left, right), do: min(left, right)
 
   defp node_budget(lease) do
     %{

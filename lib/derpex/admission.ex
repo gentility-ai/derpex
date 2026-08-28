@@ -25,7 +25,9 @@ defmodule Derpex.Admission do
   @callback authorize(Request.t(), term()) :: decision()
   @callback claim(Request.t(), context(), pid(), term()) :: decision()
   @callback release(pid(), term()) :: :ok
-  @optional_callbacks claim: 4, release: 2
+  @callback reserve_bytes(context(), non_neg_integer(), term()) ::
+              {:ok, non_neg_integer()} | {:error, term()}
+  @optional_callbacks claim: 4, release: 2, reserve_bytes: 3
 
   @doc "Runs configured policy after authentication; trusted mesh peers bypass ordinary admission."
   @spec authorize(policy(), Request.t()) :: decision()
@@ -77,6 +79,25 @@ defmodule Derpex.Admission do
 
   def release(module, connection) when is_atom(module) and is_pid(connection) do
     release({module, []}, connection)
+  end
+
+  @doc "Reserves product byte allocations and returns requested pacing in microseconds."
+  @spec reserve_bytes(policy(), context(), non_neg_integer()) ::
+          {:ok, non_neg_integer()} | {:error, term()}
+  def reserve_bytes(nil, _context, _bytes), do: {:ok, 0}
+  def reserve_bytes(policy, _context, _bytes) when is_function(policy, 1), do: {:ok, 0}
+
+  def reserve_bytes({module, options}, context, bytes)
+      when is_atom(module) and is_map(context) and is_integer(bytes) and bytes >= 0 do
+    if function_exported?(module, :reserve_bytes, 3) do
+      module.reserve_bytes(context, bytes, options)
+    else
+      {:ok, 0}
+    end
+  end
+
+  def reserve_bytes(module, context, bytes) when is_atom(module) do
+    reserve_bytes({module, []}, context, bytes)
   end
 
   defp normalize_decision({:ok, context}) when is_map(context), do: {:ok, context}
