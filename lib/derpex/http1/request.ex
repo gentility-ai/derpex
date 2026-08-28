@@ -21,23 +21,35 @@ defmodule Derpex.HTTP1.Request do
     end
   end
 
-  @doc "Returns the origin-form path without a query string."
+  @doc "Returns the normalized request path without a query string."
   @spec path(t()) :: binary()
   def path(%__MODULE__{target: target}) do
-    case :binary.split(target, "?", [:global]) do
-      [path | _query] -> path
-      [] -> target
-    end
+    {path, _query} = path_and_query(target)
+    path
   end
 
   @doc "Returns a decoded query parameter, matching Go URL.Query().Get."
   @spec query_param(t(), binary()) :: binary() | nil
   def query_param(%__MODULE__{target: target}, name) do
-    case :binary.split(target, "?", [:global]) do
-      [_path, query | _rest] -> query |> URI.decode_query() |> Map.get(name)
-      [_path] -> nil
+    case path_and_query(target) do
+      {_path, query} when is_binary(query) -> query |> URI.decode_query() |> Map.get(name)
+      {_path, nil} -> nil
     end
   rescue
     ArgumentError -> nil
+  end
+
+  defp path_and_query(target) do
+    case URI.parse(target) do
+      %URI{scheme: scheme, host: host, path: path, query: query}
+      when scheme in ["http", "https"] and is_binary(host) ->
+        {if(path in [nil, ""], do: "/", else: path), query}
+
+      _origin_or_authority_form ->
+        case :binary.split(target, "?") do
+          [path, query] -> {path, query}
+          [path] -> {path, nil}
+        end
+    end
   end
 end

@@ -17,8 +17,19 @@ mix deps.get
 mix quality
 ```
 
-Go and the pinned upstream repositories are conformance-test inputs only. They
-must never be copied into an OTP release or runtime image.
+Go, Rust, and the pinned upstream repositories are conformance-test inputs
+only. Separate CI jobs exercise the unchanged Go suite and the official
+`tailscale-rs` client. None of those toolchains or checkouts is copied into an
+OTP release or runtime image.
+
+The local official-client gates use sibling pinned checkouts:
+
+```sh
+DERPEX_TAILSCALE_DIR=../tailscale DERPEX_GO_INTEROP=1 \
+  mix test test/interop/go_client_test.exs
+DERPEX_TAILSCALE_RS_DIR=../tailscale-rs DERPEX_RUST_INTEROP=1 \
+  mix test test/interop/rust_client_test.exs
+```
 
 ## Runtime listener
 

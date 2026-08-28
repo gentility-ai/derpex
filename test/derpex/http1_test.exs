@@ -33,6 +33,21 @@ defmodule Derpex.HTTP1Test do
                "Derp-Public-Key: #{Base.encode16(@server_public, case: :lower)}\r\n\r\n"
   end
 
+  test "normalizes absolute-form DERP targets like Go net/http" do
+    request =
+      request(
+        "POST",
+        "https://127.0.0.1:4443/derp?client=rust",
+        [{"upgrade", "DERP"}]
+      )
+
+    assert Request.path(request) == "/derp"
+    assert Request.query_param(request, "client") == "rust"
+
+    assert {:upgrade, :derp, response, _metadata} = HTTP1.route(request, @server_public)
+    assert IO.iodata_to_binary(response) =~ "HTTP/1.1 101 Switching Protocols\r\n"
+  end
+
   test "suppresses only the HTTP response for fast start" do
     request =
       request("GET", "/derp", [{"upgrade", "derp"}, {"derp-fast-start", "1"}])

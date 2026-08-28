@@ -56,6 +56,7 @@ defmodule Derpex.MixProject do
         "format --check-formatted",
         "compile --warnings-as-errors",
         "credo --strict",
+        "cmd rustfmt --check --edition 2024 interop/rust/client_smoke.rs",
         "cmd cargo fmt --manifest-path native/derpex_crypto/Cargo.toml -- --check",
         "cmd cargo clippy --manifest-path native/derpex_crypto/Cargo.toml --all-targets -- -D warnings",
         "test"
