@@ -3,8 +3,8 @@ defmodule Derpex.Interop.GoClientTest do
 
   @moduletag :go_interop
 
-  alias Derpex.Crypto
   alias Derpex.Certificates
+  alias Derpex.Crypto
   alias Derpex.Listener.Handler
 
   test "unchanged official derphttp.Client authenticates to DERPEX" do

@@ -29,9 +29,20 @@ defmodule Derpex.ListenerSupervisor do
       options
       |> Keyword.put(:handler_module, Handler)
       |> Keyword.put(:handler_options, handler_options)
+      |> ensure_write_timeout()
       |> configure_tls(server_private_key)
 
     {ThousandIsland, options}
+  end
+
+  defp ensure_write_timeout(options) do
+    transport_options =
+      options
+      |> Keyword.get(:transport_options, [])
+      |> Keyword.put_new(:send_timeout, 2_000)
+      |> Keyword.put_new(:send_timeout_close, true)
+
+    Keyword.put(options, :transport_options, transport_options)
   end
 
   defp configure_tls(options, server_private_key) do

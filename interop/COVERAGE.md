@@ -12,8 +12,8 @@ disposition map and review that change together with `interop/upstream.lock`.
 | State | Count |
 | --- | ---: |
 | Total | 69 |
-| Ported | 10 |
-| Pending (release-blocking) | 55 |
+| Ported | 16 |
+| Pending (release-blocking) | 49 |
 | Implementation-specific | 4 |
 
 | Area | Upstream test | Source | Disposition | Gate/notes |
@@ -26,21 +26,21 @@ disposition map and review that change together with `interop/upstream.lock`.
 | DERP framing/client | `TestReadFrameHeader` | `derp/derp_test.go:37` | `ported` | ported in test/derpex/frame_test.exs; extension and all chunk boundaries added |
 | DERP framing/client | `TestWriteFrameHeader` | `derp/derp_test.go:96` | `ported` | ported in test/derpex/frame_test.exs; byte-identical vectors |
 | DERP framing/client | `TestClientInfoUnmarshal` | `derp/derp_test.go:196` | `ported` | ported in test/derpex/client_info_test.exs; duplicate and field-type cases added |
-| DERP framing/client | `TestSendRecv` | `derp/derp_test.go:243` | `pending` | release-blocking mapping not yet implemented |
-| DERP framing/client | `TestSendFreeze` | `derp/derp_test.go:464` | `pending` | release-blocking mapping not yet implemented |
+| DERP framing/client | `TestSendRecv` | `derp/derp_test.go:243` | `ported` | unchanged official clients cover source attribution, empty, and maximum packets |
+| DERP framing/client | `TestSendFreeze` | `derp/derp_test.go:464` | `ported` | adapted in test/derpex/writer_test.exs; a saturated frozen writer cannot stop another flow |
 | DERP framing/client | `TestWatch` | `derp/derp_test.go:875` | `pending` | release-blocking mapping not yet implemented |
 | DERP framing/client | `TestWatchAppName` | `derp/derp_test.go:915` | `pending` | release-blocking mapping not yet implemented |
 | DERP framing/client | `TestValidAppName` | `derp/derp_test.go:957` | `ported` | ported in test/derpex/client_info_test.exs; byte-length and ASCII behavior preserved |
-| DERP framing/client | `TestServerRepliesToPing` | `derp/derp_test.go:992` | `pending` | release-blocking mapping not yet implemented |
+| DERP framing/client | `TestServerRepliesToPing` | `derp/derp_test.go:992` | `ported` | unchanged official client ping/pong gate in test/interop/go_client_test.exs |
 | DERP server | `TestSetMeshKey` | `derp/derpserver/derpserver_test.go:45` | `pending` | release-blocking mapping not yet implemented |
 | DERP server | `TestIsMeshPeer` | `derp/derpserver/derpserver_test.go:85` | `pending` | release-blocking mapping not yet implemented |
 | DERP server | `TestVerifyClientDisallowedAppNames` | `derp/derpserver/derpserver_test.go:138` | `pending` | release-blocking mapping not yet implemented |
 | DERP server | `TestRecvClientKeyAppName` | `derp/derpserver/derpserver_test.go:169` | `pending` | release-blocking mapping not yet implemented |
 | DERP server | `TestForwarderRegistration` | `derp/derpserver/derpserver_test.go:221` | `pending` | release-blocking mapping not yet implemented |
 | DERP server | `TestMultiForwarder` | `derp/derpserver/derpserver_test.go:349` | `pending` | release-blocking mapping not yet implemented |
-| DERP server | `TestMetaCert` | `derp/derpserver/derpserver_test.go:405` | `pending` | release-blocking mapping not yet implemented |
+| DERP server | `TestMetaCert` | `derp/derpserver/derpserver_test.go:405` | `ported` | ported certificate shape plus official TLS fast-start gate |
 | DERP server | `TestModifyTLSConfigToAddMetaCert` | `derp/derpserver/derpserver_test.go:441` | `pending` | release-blocking mapping not yet implemented |
-| DERP server | `TestServerDupClients` | `derp/derpserver/derpserver_test.go:498` | `pending` | release-blocking mapping not yet implemented |
+| DERP server | `TestServerDupClients` | `derp/derpserver/derpserver_test.go:498` | `ported` | ported lifecycle cases and unchanged official last-writer-active client gate |
 | DERP server | `TestLimiter` | `derp/derpserver/derpserver_test.go:747` | `pending` | release-blocking mapping not yet implemented |
 | DERP server | `TestParseSSOutput` | `derp/derpserver/derpserver_test.go:884` | `pending` | release-blocking mapping not yet implemented |
 | DERP server | `TestServeDebugTrafficUniqueSenders` | `derp/derpserver/derpserver_test.go:895` | `pending` | release-blocking mapping not yet implemented |
@@ -57,7 +57,7 @@ disposition map and review that change together with `interop/upstream.lock`.
 | DERP server | `TestLookupDestHashTrieFallsBackForForwarder` | `derp/derpserver/derpserver_test.go:1610` | `pending` | release-blocking mapping not yet implemented |
 | DERP server | `TestLookupDestHashTrieIgnoresInactiveSet` | `derp/derpserver/derpserver_test.go:1626` | `pending` | release-blocking mapping not yet implemented |
 | DERP server | `TestLookupDestHashTrieNoAlloc` | `derp/derpserver/derpserver_test.go:1655` | `implementation-specific` | Go allocation assertion; packet-path allocation and latency benchmarks protect the invariant |
-| DERP HTTP | `TestSendRecv` | `derp/derphttp/derphttp_test.go:41` | `pending` | release-blocking mapping not yet implemented |
+| DERP HTTP | `TestSendRecv` | `derp/derphttp/derphttp_test.go:41` | `ported` | unchanged official clients relay packet boundaries in test/interop/go_client_test.exs |
 | DERP HTTP | `TestPing` | `derp/derphttp/derphttp_test.go:181` | `ported` | unchanged official client gate in test/interop/go_client_test.exs |
 | DERP HTTP | `TestBreakWatcherConnRecv` | `derp/derphttp/derphttp_test.go:275` | `pending` | release-blocking mapping not yet implemented |
 | DERP HTTP | `TestBreakWatcherConn` | `derp/derphttp/derphttp_test.go:356` | `pending` | release-blocking mapping not yet implemented |

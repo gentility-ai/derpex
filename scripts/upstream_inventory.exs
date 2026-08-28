@@ -40,10 +40,22 @@ defmodule Derpex.UpstreamInventory do
       "ported in test/derpex/http1_test.exs; both probe paths and upgrade-required behavior",
     {"derp/derphttp/derphttp_test.go", "TestPing"} =>
       "unchanged official client gate in test/interop/go_client_test.exs",
+    {"derp/derphttp/derphttp_test.go", "TestSendRecv"} =>
+      "unchanged official clients relay packet boundaries in test/interop/go_client_test.exs",
+    {"derp/derpserver/derpserver_test.go", "TestMetaCert"} =>
+      "ported certificate shape plus official TLS fast-start gate",
+    {"derp/derpserver/derpserver_test.go", "TestServerDupClients"} =>
+      "ported lifecycle cases and unchanged official last-writer-active client gate",
     {"derp/derp_test.go", "TestClientInfoUnmarshal"} =>
       "ported in test/derpex/client_info_test.exs; duplicate and field-type cases added",
     {"derp/derp_test.go", "TestReadFrameHeader"} =>
       "ported in test/derpex/frame_test.exs; extension and all chunk boundaries added",
+    {"derp/derp_test.go", "TestSendFreeze"} =>
+      "adapted in test/derpex/writer_test.exs; a saturated frozen writer cannot stop another flow",
+    {"derp/derp_test.go", "TestSendRecv"} =>
+      "unchanged official clients cover source attribution, empty, and maximum packets",
+    {"derp/derp_test.go", "TestServerRepliesToPing"} =>
+      "unchanged official client ping/pong gate in test/interop/go_client_test.exs",
     {"derp/derp_test.go", "TestValidAppName"} =>
       "ported in test/derpex/client_info_test.exs; byte-length and ASCII behavior preserved",
     {"derp/derp_test.go", "TestWriteFrameHeader"} =>
