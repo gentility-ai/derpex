@@ -2,10 +2,13 @@ defmodule Derpex.Listener.HandlerTest do
   use ExUnit.Case, async: false
 
   alias Derpex.ClientInfo
+  alias Derpex.Clock.Manual
   alias Derpex.Crypto
   alias Derpex.Frame
   alias Derpex.Handshake
   alias Derpex.Listener.Handler
+  alias Derpex.RateConfig
+  alias Derpex.RateController
 
   test "official-style cleartext HTTP client completes an authenticated handshake" do
     {server_public, server_private} = Crypto.generate_keypair()
@@ -163,6 +166,91 @@ defmodule Derpex.Listener.HandlerTest do
     :gen_tcp.close(mesh_socket)
   end
 
+  test "receive-byte limiting paces frame handling and leaves the socket under backpressure" do
+    start_supervised!({Manual, monotonic_time: 0})
+    previous_clock = Application.fetch_env!(:derpex, :clock)
+    Application.put_env(:derpex, :clock, Manual)
+    on_exit(fn -> Application.put_env(:derpex, :clock, previous_clock) end)
+
+    minimum = RateConfig.minimum_burst()
+
+    rate_controller =
+      start_supervised!(
+        {RateController,
+         name: nil,
+         config: %RateConfig{
+           per_client_rate_limit_bytes_per_second: minimum,
+           per_client_rate_burst_bytes: minimum
+         }}
+      )
+
+    {server_public, server_private} = Crypto.generate_keypair()
+    {_client_public, client_private} = Crypto.generate_keypair()
+    destination = :crypto.strong_rand_bytes(32)
+    payload = :binary.copy(<<0xA5>>, 65_536)
+    parent = self()
+
+    event_handler = fn event ->
+      send(parent, {:handler_event, self(), event})
+      :ok
+    end
+
+    {:ok, server} =
+      ThousandIsland.start_link(
+        port: 0,
+        transport_options: [ip: {127, 0, 0, 1}],
+        num_acceptors: 1,
+        handler_module: Handler,
+        handler_options: [
+          server_private_key: server_private,
+          event_handler: event_handler,
+          rate_controller: rate_controller
+        ]
+      )
+
+    stop_server_on_exit(server)
+    {:ok, {_ip, port}} = ThousandIsland.listener_info(server)
+    socket = connect_and_send_info(port, server_public, client_private, %ClientInfo{version: 2})
+    assert_receive {:handler_event, handler, {:authenticated, _key, %ClientInfo{}}}, 2_000
+    assert {:ok, <<server_info_type, length::unsigned-big-32>>} = :gen_tcp.recv(socket, 5, 2_000)
+    assert server_info_type == Frame.type(:server_info)
+    assert {:ok, _server_info} = :gen_tcp.recv(socket, length, 2_000)
+
+    packet = IO.iodata_to_binary(Frame.encode(:send_packet, [destination, payload]))
+    :ok = :gen_tcp.send(socket, packet)
+
+    assert_receive {:handler_event, ^handler,
+                    {:client_message, {:send_packet, ^destination, ^payload}}},
+                   2_000
+
+    :ok = :gen_tcp.send(socket, packet)
+
+    refute_receive {:handler_event, ^handler,
+                    {:client_message, {:send_packet, ^destination, ^payload}}},
+                   25
+
+    assert_eventually(fn -> Manual.pending_timer_count() == 2 end)
+
+    :ok = Manual.advance(999)
+
+    refute_receive {:handler_event, ^handler,
+                    {:client_message, {:send_packet, ^destination, ^payload}}},
+                   25
+
+    :ok = Manual.advance(1)
+
+    assert_receive {:handler_event, ^handler,
+                    {:client_message, {:send_packet, ^destination, ^payload}}},
+                   2_000
+
+    :ok = :gen_tcp.send(socket, packet)
+    assert_eventually(fn -> Manual.pending_timer_count() == 2 end)
+    monitor = Process.monitor(handler)
+    Process.exit(server, :shutdown)
+    assert_receive {:DOWN, ^monitor, :process, ^handler, _reason}, 2_000
+    :gen_tcp.close(socket)
+  end
+
   defp stop_server_on_exit(server) do
     on_exit(fn ->
       if Process.alive?(server), do: Process.exit(server, :shutdown)
@@ -195,4 +283,17 @@ defmodule Derpex.Listener.HandlerTest do
     :ok = :gen_tcp.send(socket, client_frame)
     socket
   end
+
+  defp assert_eventually(assertion, attempts \\ 50)
+
+  defp assert_eventually(assertion, attempts) when attempts > 0 do
+    if assertion.() do
+      :ok
+    else
+      Process.sleep(2)
+      assert_eventually(assertion, attempts - 1)
+    end
+  end
+
+  defp assert_eventually(_assertion, 0), do: flunk("condition did not become true")
 end

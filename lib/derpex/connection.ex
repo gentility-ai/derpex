@@ -38,6 +38,7 @@ defmodule Derpex.Connection do
           | {:set_timeout, :handshake, pos_integer()}
           | {:cancel_timeout, :handshake}
           | {:authenticated, binary(), ClientInfo.t(), boolean()}
+          | {:rate_limit, non_neg_integer()}
           | :activity
           | {:server_message, Body.server_message()}
           | {:client_message, Body.client_message()}
@@ -138,26 +139,37 @@ defmodule Derpex.Connection do
     end
   end
 
+  defp process_frames(
+         %__MODULE__{phase: :authenticated} = state,
+         [{_type, {:discarded, length}} | rest],
+         actions
+       ) do
+    process_frames(state, rest, [:activity, {:rate_limit, length} | actions])
+  end
+
   defp process_frames(%__MODULE__{phase: :authenticated} = state, [frame | rest], actions) do
     case frame do
-      {_type, :discarded} ->
-        process_frames(state, rest, [:activity | actions])
-
       buffered_frame ->
         process_buffered_frame(state, rest, actions, buffered_frame)
     end
   end
 
   defp process_buffered_frame(state, rest, actions, frame) do
+    length = frame |> elem(1) |> byte_size()
+
     case decode_client_frame(state, frame) do
       {:ok, message} ->
-        process_frames(state, rest, [{:client_message, message}, :activity | actions])
+        process_frames(
+          state,
+          rest,
+          [{:client_message, message}, :activity, {:rate_limit, length} | actions]
+        )
 
       :ignore ->
-        process_frames(state, rest, [:activity | actions])
+        process_frames(state, rest, [:activity, {:rate_limit, length} | actions])
 
       {:error, reason} ->
-        close(state, reason, Enum.reverse([:activity | actions]))
+        close(state, reason, Enum.reverse([:activity, {:rate_limit, length} | actions]))
     end
   end
 

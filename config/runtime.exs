@@ -21,6 +21,7 @@ if config_env() == :prod do
     clear_http? = System.get_env("DERPEX_CLEAR_HTTP") == "1"
     mesh_key_text = System.get_env("DERPEX_MESH_KEY")
     disallowed_app_names_text = System.get_env("DERPEX_DISALLOWED_APP_NAMES")
+    rate_config_path = System.get_env("DERPEX_RATE_CONFIG")
     stun_port_text = System.get_env("DERPEX_STUN_PORT", "3478")
 
     mesh_key =
@@ -98,6 +99,7 @@ if config_env() == :prod do
     config :derpex,
       identity_path: identity_path,
       listeners: [listener],
+      rate_config_path: rate_config_path,
       stun_listeners:
         if(System.get_env("DERPEX_STUN") == "0",
           do: [],

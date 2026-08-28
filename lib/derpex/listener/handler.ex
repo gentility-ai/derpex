@@ -8,7 +8,10 @@ defmodule Derpex.Listener.Handler do
   alias Derpex.Clock
   alias Derpex.Crypto
   alias Derpex.Outbox.Ring
+  alias Derpex.RateConfig
+  alias Derpex.RateController
   alias Derpex.RateLimiter
+  alias Derpex.ReceiveLimiter
   alias Derpex.Router
   alias Derpex.Session
   alias Derpex.Transport.ThousandIsland, as: Transport
@@ -20,6 +23,7 @@ defmodule Derpex.Listener.Handler do
     server_private_key = Keyword.fetch!(options, :server_private_key)
     mesh_key = Keyword.get(options, :mesh_key)
     admission_policy = Keyword.get(options, :admission)
+    rate_controller = Keyword.get(options, :rate_controller, RateController)
 
     disallowed_app_names =
       options
@@ -64,6 +68,8 @@ defmodule Derpex.Listener.Handler do
         admission_policy: admission_policy,
         admission_context: %{},
         disallowed_app_names: disallowed_app_names,
+        rate_controller: rate_controller,
+        receive_limiter: nil,
         server_public_key: server_public_key,
         remote_address: remote_address(socket)
       }
@@ -95,6 +101,10 @@ defmodule Derpex.Listener.Handler do
   end
 
   @impl GenServer
+  def handle_info({RateController, :updated, config}, {socket, state}) do
+    {:noreply, {socket, put_receive_limiter(state, config)}}
+  end
+
   def handle_info({:derpex_timeout, name, token}, {socket, state}) do
     case state.timers[name] do
       {^token, _timer} -> handle_protocol_timeout(socket, state, name)
@@ -171,6 +181,10 @@ defmodule Derpex.Listener.Handler do
 
   defp execute_action(_socket, state, {:cancel_timeout, name}) do
     {:ok, cancel_timer(state, name)}
+  end
+
+  defp execute_action(socket, state, {:rate_limit, frame_length}) do
+    rate_limit(socket, state, frame_length)
   end
 
   defp execute_action(_socket, state, {:authenticated, key, info, can_mesh}) do
@@ -374,6 +388,7 @@ defmodule Derpex.Listener.Handler do
 
   defp register_authenticated(state, key, info, can_mesh, admission_context) do
     presence = presence(state, info, can_mesh)
+    state = subscribe_to_rate_config(state, can_mesh)
 
     :ok =
       Router.register(
@@ -391,6 +406,65 @@ defmodule Derpex.Listener.Handler do
     |> Map.put(:can_mesh, can_mesh)
     |> Map.put(:admission_context, admission_context)
     |> dispatch_event({:authenticated, key, info})
+  end
+
+  defp subscribe_to_rate_config(%{rate_controller: nil} = state, _can_mesh), do: state
+
+  defp subscribe_to_rate_config(state, can_mesh) do
+    config = RateController.subscribe(state.rate_controller, self(), can_mesh)
+    put_receive_limiter(state, config)
+  end
+
+  defp put_receive_limiter(state, %RateConfig{per_client_rate_limit_bytes_per_second: 0}) do
+    %{state | receive_limiter: nil}
+  end
+
+  defp put_receive_limiter(state, %RateConfig{} = config) do
+    %{state | receive_limiter: ReceiveLimiter.new(config)}
+  end
+
+  defp rate_limit(_socket, %{receive_limiter: nil} = state, _frame_length),
+    do: {:ok, state}
+
+  defp rate_limit(socket, state, frame_length) do
+    case ReceiveLimiter.reserve(state.receive_limiter, frame_length) do
+      {:ok, delay_microseconds, limiter} ->
+        state = %{state | receive_limiter: limiter}
+
+        case wait_for_rate_limit(socket, delay_microseconds) do
+          :ok -> {:ok, state}
+          {:error, reason} -> {:error, reason, state}
+        end
+
+      {:error, reason} ->
+        {:error, {:rate_limit, reason}, state}
+    end
+  end
+
+  defp wait_for_rate_limit(_socket, 0), do: :ok
+
+  defp wait_for_rate_limit(socket, delay_microseconds) do
+    token = make_ref()
+    milliseconds = max(div(delay_microseconds + 999, 1_000), 1)
+    timer = Clock.send_after(self(), {:derpex_rate_limit_ready, token}, milliseconds)
+    raw_socket = socket.socket
+
+    receive do
+      {:derpex_rate_limit_ready, ^token} ->
+        :ok
+
+      {:tcp_closed, ^raw_socket} ->
+        _remaining = Clock.cancel_timer(timer)
+        {:error, :peer_closed}
+
+      {:ssl_closed, ^raw_socket} ->
+        _remaining = Clock.cancel_timer(timer)
+        {:error, :peer_closed}
+
+      {:EXIT, _process, reason} ->
+        _remaining = Clock.cancel_timer(timer)
+        {:error, {:shutdown, reason}}
+    end
   end
 
   defp remote_address(socket) do

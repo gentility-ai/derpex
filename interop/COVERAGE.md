@@ -12,8 +12,8 @@ disposition map and review that change together with `interop/upstream.lock`.
 | State | Count |
 | --- | ---: |
 | Total | 69 |
-| Ported | 23 |
-| Pending (release-blocking) | 42 |
+| Ported | 28 |
+| Pending (release-blocking) | 37 |
 | Implementation-specific | 4 |
 
 | Area | Upstream test | Source | Disposition | Gate/notes |
@@ -48,11 +48,11 @@ disposition map and review that change together with `interop/upstream.lock`.
 | DERP server | `TestSenderCardinality` | `derp/derpserver/derpserver_test.go:950` | `pending` | release-blocking mapping not yet implemented |
 | DERP server | `TestSenderCardinality100` | `derp/derpserver/derpserver_test.go:995` | `pending` | release-blocking mapping not yet implemented |
 | DERP server | `TestSenderCardinalityTracking` | `derp/derpserver/derpserver_test.go:1019` | `pending` | release-blocking mapping not yet implemented |
-| DERP server | `TestPerClientRateLimit` | `derp/derpserver/derpserver_test.go:1093` | `pending` | release-blocking mapping not yet implemented |
-| DERP server | `TestRateLimitWait` | `derp/derpserver/derpserver_test.go:1231` | `pending` | release-blocking mapping not yet implemented |
-| DERP server | `TestUpdateRateLimits` | `derp/derpserver/derpserver_test.go:1304` | `pending` | release-blocking mapping not yet implemented |
-| DERP server | `TestLoadRateConfig` | `derp/derpserver/derpserver_test.go:1424` | `pending` | release-blocking mapping not yet implemented |
-| DERP server | `TestLoadAndApplyRateConfig` | `derp/derpserver/derpserver_test.go:1480` | `pending` | release-blocking mapping not yet implemented |
+| DERP server | `TestPerClientRateLimit` | `derp/derpserver/derpserver_test.go:1093` | `ported` | ported with manual-clock live listener pacing and shutdown cancellation |
+| DERP server | `TestRateLimitWait` | `derp/derpserver/derpserver_test.go:1231` | `ported` | ported reservation, refill delay, clamp, and cancellation behavior |
+| DERP server | `TestUpdateRateLimits` | `derp/derpserver/derpserver_test.go:1304` | `ported` | ported live ordinary and duplicate updates with trusted mesh exemption |
+| DERP server | `TestLoadRateConfig` | `derp/derpserver/derpserver_test.go:1424` | `ported` | ported upstream JSON shapes, validation, and missing-path failures |
+| DERP server | `TestLoadAndApplyRateConfig` | `derp/derpserver/derpserver_test.go:1480` | `ported` | ported load, normalization, live apply, and disable behavior |
 | DERP server | `TestLookupDestHashTrieFastPath` | `derp/derpserver/derpserver_test.go:1582` | `pending` | release-blocking mapping not yet implemented |
 | DERP server | `TestLookupDestHashTrieFallsBackForForwarder` | `derp/derpserver/derpserver_test.go:1610` | `pending` | release-blocking mapping not yet implemented |
 | DERP server | `TestLookupDestHashTrieIgnoresInactiveSet` | `derp/derpserver/derpserver_test.go:1626` | `pending` | release-blocking mapping not yet implemented |

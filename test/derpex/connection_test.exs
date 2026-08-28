@@ -79,6 +79,7 @@ defmodule Derpex.ConnectionTest do
              {:send, _server_info},
              {:cancel_timeout, :handshake},
              {:set_timeout, :keep_alive, _interval},
+             {:rate_limit, 38},
              :activity,
              {:client_message, {:send_packet, ^destination, "packet"}}
            ] = actions
@@ -127,6 +128,7 @@ defmodule Derpex.ConnectionTest do
              {:send, _server_info},
              {:cancel_timeout, :handshake},
              {:set_timeout, :keep_alive, _interval},
+             {:rate_limit, 0},
              :activity,
              {:client_message, :watch_connections}
            ] = actions
@@ -171,7 +173,7 @@ defmodule Derpex.ConnectionTest do
     {:ok, state, _actions} =
       Connection.receive_data(state, IO.iodata_to_binary(client_info_frame))
 
-    assert {:ok, state, [:activity]} =
+    assert {:ok, state, [{:rate_limit, 6}, :activity]} =
              Connection.receive_data(state, IO.iodata_to_binary(Frame.encode(0xFE, "future")))
 
     assert {:close, _state, :note_preferred_wrong_size, []} =

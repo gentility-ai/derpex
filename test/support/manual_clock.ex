@@ -17,6 +17,8 @@ defmodule Derpex.Clock.Manual do
     GenServer.call(__MODULE__, {:set_system_time, milliseconds})
   end
 
+  def pending_timer_count, do: GenServer.call(__MODULE__, :pending_timer_count)
+
   @impl Derpex.Clock
   def monotonic_time(unit) do
     __MODULE__
@@ -52,6 +54,9 @@ defmodule Derpex.Clock.Manual do
   def handle_call(:monotonic_time, _from, state), do: {:reply, state.monotonic, state}
 
   def handle_call(:system_time, _from, state), do: {:reply, state.system, state}
+
+  def handle_call(:pending_timer_count, _from, state),
+    do: {:reply, map_size(state.timers), state}
 
   def handle_call({:set_system_time, milliseconds}, _from, state) do
     {:reply, :ok, %{state | system: milliseconds}}

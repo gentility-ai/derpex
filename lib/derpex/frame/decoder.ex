@@ -20,7 +20,7 @@ defmodule Derpex.Frame.Decoder do
             max_frame_length: @default_max_frame_length,
             frame_policy: nil
 
-  @type frame :: {Frame.type_code(), binary() | :discarded}
+  @type frame :: {Frame.type_code(), binary() | {:discarded, non_neg_integer()}}
   @type frame_policy :: (Frame.type_code(), non_neg_integer() ->
                            :buffer | :discard | {:error, term()})
   @opaque t :: %__MODULE__{
@@ -104,7 +104,7 @@ defmodule Derpex.Frame.Decoder do
   end
 
   defp start_frame(decoder, type, 0, mode, chunk, frames) do
-    payload = if mode == :buffer, do: "", else: :discarded
+    payload = if mode == :buffer, do: "", else: {:discarded, 0}
     decode(%{decoder | type: nil, mode: :buffer}, chunk, [{type, payload} | frames])
   end
 
@@ -167,7 +167,7 @@ defmodule Derpex.Frame.Decoder do
   defp payload(:buffer, fragments, payload_length),
     do: join_fragments(fragments, payload_length)
 
-  defp payload(:discard, _fragments, _payload_length), do: :discarded
+  defp payload(:discard, _fragments, payload_length), do: {:discarded, payload_length}
 
   defp frame_policy(%__MODULE__{frame_policy: policy}, type, payload_length)
        when is_function(policy, 2) do

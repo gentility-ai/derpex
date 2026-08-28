@@ -48,3 +48,9 @@ cannot subscribe to presence updates.
 client-advertised app names to reject before registration. Trusted mesh peers
 are exempt, matching the baseline server. Embedders can also supply a
 `Derpex.Admission` policy in listener handler options for product authorization.
+
+Set `DERPEX_RATE_CONFIG` to an upstream-compatible JSON file containing
+`PerClientRateLimitBytesPerSec` and `PerClientRateBurstBytes`. Enabled buckets
+are clamped to hold at least one maximum DERP packet, and live updates through
+`Derpex.RateController.load_and_apply/1` reach every ordinary duplicate
+connection while trusted mesh peers remain exempt.

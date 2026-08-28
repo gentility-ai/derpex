@@ -20,7 +20,13 @@ defmodule Derpex.Application do
           Supervisor.child_spec({Derpex.STUN, options}, id: {Derpex.STUN, index})
         end)
 
-      {:ok, [Derpex.Router | relay_children ++ stun_children]}
+      rate_controller =
+        case Application.fetch_env!(:derpex, :rate_config_path) do
+          nil -> Derpex.RateController
+          path -> {Derpex.RateController, path: path}
+        end
+
+      {:ok, [Derpex.Router, rate_controller | relay_children ++ stun_children]}
     end
   end
 

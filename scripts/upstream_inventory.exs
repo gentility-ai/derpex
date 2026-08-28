@@ -54,6 +54,16 @@ defmodule Derpex.UpstreamInventory do
       "unchanged official clients cover exact app-name rejection and trusted mesh bypass",
     {"derp/derpserver/derpserver_test.go", "TestRecvClientKeyAppName"} =>
       "ported encrypted ClientInfo and app-name validation in handshake and client-info tests",
+    {"derp/derpserver/derpserver_test.go", "TestPerClientRateLimit"} =>
+      "ported with manual-clock live listener pacing and shutdown cancellation",
+    {"derp/derpserver/derpserver_test.go", "TestRateLimitWait"} =>
+      "ported reservation, refill delay, clamp, and cancellation behavior",
+    {"derp/derpserver/derpserver_test.go", "TestUpdateRateLimits"} =>
+      "ported live ordinary and duplicate updates with trusted mesh exemption",
+    {"derp/derpserver/derpserver_test.go", "TestLoadRateConfig"} =>
+      "ported upstream JSON shapes, validation, and missing-path failures",
+    {"derp/derpserver/derpserver_test.go", "TestLoadAndApplyRateConfig"} =>
+      "ported load, normalization, live apply, and disable behavior",
     {"cmd/derper/derper_test.go", "TestNoContent"} =>
       "ported all challenge validity cases in test/derpex/http1_test.exs",
     {"derp/derp_test.go", "TestClientInfoUnmarshal"} =>

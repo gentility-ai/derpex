@@ -79,7 +79,7 @@ defmodule Derpex.Frame.DecoderTest do
 
     decoder = %{decoder | remaining: 2}
 
-    assert {:ok, [{0xFE, :discarded}, {type, ""}], decoder} =
+    assert {:ok, [{0xFE, {:discarded, 0xFFFFFFFF}}, {type, ""}], decoder} =
              Decoder.push(decoder, <<1, 2>> <> IO.iodata_to_binary(Frame.encode(:keep_alive, "")))
 
     assert type == Frame.type(:keep_alive)
