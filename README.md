@@ -93,6 +93,7 @@ DERPEX_GENTILITY_CACHE_PATH=/var/lib/derpex/admission.cache
 DERPEX_GENTILITY_USAGE_SPOOL_PATH=/var/lib/derpex/usage.spool
 DERPEX_GENTILITY_INSTANCE_ID=derpex-sin-1
 DERPEX_GENTILITY_REGION_ID=17
+DERPEX_OPERATIONS_TOKEN='<random-secret-at-least-16-bytes>'
 ```
 
 The adapter owns its transport and transport authentication configuration; it
@@ -113,3 +114,10 @@ and `Derpex.Drain.cancel/1`. A drain rejects new home transitions, leaves mesh
 peers and probes available, sends bounded-jitter `FrameRestarting` notices only
 in the Gentility profile, and closes homes that remain at the configured hard
 deadline. Repeating a begin or cancel operation is idempotent.
+
+`GET /healthz` and `GET /readyz` are public, detail-free liveness and readiness
+checks; readiness turns off during drain or a full Gentility usage spool. Set a
+random `DERPEX_OPERATIONS_TOKEN` of at least 16 bytes to enable `GET /metrics`
+and `GET /debug/check`, then send it as `Authorization: Bearer <token>`.
+Metrics use a fixed schema with only protocol-defined finite labels; relay
+identity, organization, peer, and source-IP values are never metric labels.

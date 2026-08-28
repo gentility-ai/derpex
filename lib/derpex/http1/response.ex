@@ -5,9 +5,12 @@ defmodule Derpex.HTTP1.Response do
     200 => "OK",
     204 => "No Content",
     400 => "Bad Request",
+    401 => "Unauthorized",
     404 => "Not Found",
     405 => "Method Not Allowed",
-    426 => "Upgrade Required"
+    426 => "Upgrade Required",
+    500 => "Internal Server Error",
+    503 => "Service Unavailable"
   }
 
   @spec encode(non_neg_integer(), [{binary(), binary()}], iodata()) :: iodata()

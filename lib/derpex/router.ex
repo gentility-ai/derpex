@@ -9,6 +9,7 @@ defmodule Derpex.Router do
   use GenServer
 
   alias Derpex.Disco
+  alias Derpex.Metrics
   alias Derpex.Outbox.Ring
 
   @table __MODULE__.Routes
@@ -181,6 +182,14 @@ defmodule Derpex.Router do
   @spec route_count() :: non_neg_integer()
   def route_count, do: :ets.info(@table, :size)
 
+  @doc "Returns aggregate topology gauges without client identifiers."
+  @spec stats() :: map()
+  def stats, do: GenServer.call(__MODULE__, :stats)
+
+  @doc "Checks that serialized topology and fast-path tables agree."
+  @spec consistency_check() :: :ok | {:error, binary()}
+  def consistency_check, do: GenServer.call(__MODULE__, :consistency_check)
+
   @doc "Returns the active route's writer without calling the topology process."
   @spec active_writer(binary()) :: {:ok, pid()} | {:error, :not_connected}
   def active_writer(<<key::binary-size(32)>>) do
@@ -256,6 +265,14 @@ defmodule Derpex.Router do
   end
 
   @impl true
+  def handle_call(:stats, _from, state) do
+    {:reply, topology_stats(state), state}
+  end
+
+  def handle_call(:consistency_check, _from, state) do
+    {:reply, check_consistency(state), state}
+  end
+
   def handle_call(
         {:register, key, connection, ordinary, disco, lifecycle, presence},
         _from,
@@ -265,9 +282,10 @@ defmodule Derpex.Router do
     activity = :atomics.new(1, signed: false)
     :atomics.put(activity, 1, activity_sequence())
 
+    previous_entries = Map.get(state.routes, key, [])
+
     entries =
-      state.routes
-      |> Map.get(key, [])
+      previous_entries
       |> Enum.reject(fn {
                           registered_connection,
                           _ordinary,
@@ -279,6 +297,10 @@ defmodule Derpex.Router do
         registered_connection == connection
       end)
       |> Kernel.++([{connection, ordinary, disco, lifecycle, activity, presence}])
+
+    if previous_entries != [] do
+      :ok = Metrics.add(Metrics.default_handle(), :counter_total_dup_client_conns, 1)
+    end
 
     true =
       :ets.insert(
@@ -641,7 +663,17 @@ defmodule Derpex.Router do
   defp route_forwarder(source, destination, packet) do
     case :ets.lookup(@forwarders_table, destination) do
       [{^destination, _identity, ring}] ->
-        safe_enqueue(ring, {:forward_packet, source, destination, packet})
+        result = safe_enqueue(ring, {:forward_packet, source, destination, packet})
+
+        case result do
+          {:ok, _enqueue_result} ->
+            Metrics.add(Metrics.default_handle(), :packets_forwarded_out, 1)
+
+          {:dropped, _reason} ->
+            :ok
+        end
+
+        result
 
       [] ->
         {:dropped, :unknown_destination}
@@ -658,4 +690,101 @@ defmodule Derpex.Router do
   end
 
   defp activity_sequence, do: :erlang.unique_integer([:positive, :monotonic])
+
+  defp topology_stats(state) do
+    registration_count =
+      Enum.sum(Enum.map(state.routes, fn {_key, entries} -> length(entries) end))
+
+    duplicate_entries =
+      Enum.filter(state.routes, fn {_key, entries} -> length(entries) > 1 end)
+
+    duplicate_connections =
+      Enum.sum(Enum.map(duplicate_entries, fn {_key, entries} -> length(entries) end))
+
+    not_ideal_connections =
+      Enum.sum(
+        Enum.map(state.routes, fn {_key, entries} ->
+          Enum.count(entries, fn {_connection, _ordinary, _disco, _lifecycle, _activity, presence} ->
+            Bitwise.band(presence.flags, 0x08) != 0
+          end)
+        end)
+      )
+
+    all_client_keys =
+      state.routes
+      |> Map.keys()
+      |> MapSet.new()
+      |> MapSet.union(MapSet.new(Map.keys(state.forwarders)))
+
+    %{
+      current_connections: registration_count,
+      current_not_ideal_connections: not_ideal_connections,
+      clients_total: MapSet.size(all_client_keys),
+      clients_local: map_size(state.routes),
+      clients_remote: MapSet.size(all_client_keys) - map_size(state.routes),
+      current_duplicate_client_keys: length(duplicate_entries),
+      current_duplicate_connections: duplicate_connections,
+      watchers: map_size(state.watchers),
+      forwarder_keys: map_size(state.forwarders),
+      forwarder_paths:
+        Enum.sum(Enum.map(state.forwarders, fn {_key, entries} -> length(entries) end))
+    }
+  end
+
+  defp check_consistency(state) do
+    expected_routes = map_size(state.routes)
+
+    expected_registrations =
+      Enum.sum(Enum.map(state.routes, fn {_key, entries} -> length(entries) end))
+
+    expected_duplicates = Enum.count(state.routes, fn {_key, entries} -> length(entries) > 1 end)
+
+    errors =
+      []
+      |> check_size(@table, expected_routes, "active routes")
+      |> check_size(@registrations_table, expected_registrations, "registrations")
+      |> check_size(@duplicates_table, expected_duplicates, "duplicate keys")
+      |> check_size(@forwarders_table, map_size(state.forwarders), "forwarder keys")
+      |> check_active_routes(state.routes)
+
+    case errors do
+      [] -> :ok
+      errors -> {:error, errors |> Enum.reverse() |> Enum.join(", ")}
+    end
+  end
+
+  defp check_size(errors, table, expected, label) do
+    actual = :ets.info(table, :size)
+
+    if actual == expected,
+      do: errors,
+      else: ["#{label} table=#{actual} state=#{expected}" | errors]
+  end
+
+  defp check_active_routes(errors, routes) do
+    Enum.reduce(routes, errors, &check_active_route/2)
+  end
+
+  defp check_active_route({key, entries}, errors) do
+    case :ets.lookup(@table, key) do
+      [{^key, connection, _ordinary, _disco, _lifecycle}] ->
+        check_registered_connection(entries, connection, errors)
+
+      [] ->
+        ["serialized route is absent from active table" | errors]
+    end
+  end
+
+  defp check_registered_connection(entries, connection, errors) do
+    if registered_connection?(entries, connection),
+      do: errors,
+      else: ["active route is absent from registrations" | errors]
+  end
+
+  defp registered_connection?(entries, connection) do
+    Enum.any?(entries, fn
+      {^connection, _ordinary, _disco, _lifecycle, _activity, _presence} -> true
+      _different -> false
+    end)
+  end
 end

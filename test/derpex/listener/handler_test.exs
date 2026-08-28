@@ -10,6 +10,7 @@ defmodule Derpex.Listener.HandlerTest do
   alias Derpex.Frame.Body
   alias Derpex.Handshake
   alias Derpex.Listener.Handler
+  alias Derpex.Metrics
   alias Derpex.Outbox.Ring
   alias Derpex.RateConfig
   alias Derpex.RateController
@@ -435,6 +436,48 @@ defmodule Derpex.Listener.HandlerTest do
 
     assert {:error, :closed} = :gen_tcp.recv(socket, 0, 2_000)
     assert_eventually(fn -> Drain.stats(drain).connections == 0 end)
+    :gen_tcp.close(socket)
+  end
+
+  test "authenticated control flow updates fixed counters outside the writer mailbox" do
+    before = Metrics.snapshot()
+    {server_public, server_private} = Crypto.generate_keypair()
+    {_client_public, client_private} = Crypto.generate_keypair()
+
+    {:ok, server} =
+      ThousandIsland.start_link(
+        port: 0,
+        transport_options: [ip: {127, 0, 0, 1}],
+        num_acceptors: 1,
+        handler_module: Handler,
+        handler_options: [server_private_key: server_private]
+      )
+
+    stop_server_on_exit(server)
+    {:ok, {_ip, port}} = ThousandIsland.listener_info(server)
+    socket = connect_and_send_info(port, server_public, client_private, %ClientInfo{version: 2})
+
+    assert {:ok, <<server_info_type, server_info_length::unsigned-big-32>>} =
+             :gen_tcp.recv(socket, 5, 2_000)
+
+    assert server_info_type == Frame.type(:server_info)
+    assert {:ok, _server_info} = :gen_tcp.recv(socket, server_info_length, 2_000)
+
+    {:ok, ping_frame} = Body.encode_client({:ping, "12345678"})
+    :ok = :gen_tcp.send(socket, ping_frame)
+
+    assert {:ok, <<pong_type, 8::unsigned-big-32>>} = :gen_tcp.recv(socket, 5, 2_000)
+    assert pong_type == Frame.type(:pong)
+    assert {:ok, "12345678"} = :gen_tcp.recv(socket, 8, 2_000)
+
+    assert_eventually(fn ->
+      current = Metrics.snapshot()
+
+      current.accepts == before.accepts + 1 and
+        current.got_ping == before.got_ping + 1 and
+        current.sent_pong == before.sent_pong + 1
+    end)
+
     :gen_tcp.close(socket)
   end
 

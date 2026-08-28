@@ -29,6 +29,9 @@ proxy or load balancer.
   from new DERP-map assignments, waits through the hard deadline, and verifies
   zero remaining targeted homes. `Derpex.Drain.cancel/1` is the idempotent
   rollback before upgrade; mesh peers and public probes remain available.
+- Public `/healthz` and `/readyz` responses contain status only. `/metrics` and
+  `/debug/check` remain nonexistent until `DERPEX_OPERATIONS_TOKEN` is set and
+  then require its bearer credential on every request.
 
 ## Milestone 0 launch inputs
 

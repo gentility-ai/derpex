@@ -8,7 +8,9 @@ defmodule Derpex.Listener.Handler do
   alias Derpex.Admission.Request, as: AdmissionRequest
   alias Derpex.Clock
   alias Derpex.Crypto
+  alias Derpex.Disco
   alias Derpex.Drain
+  alias Derpex.Metrics
   alias Derpex.Outbox.Ring
   alias Derpex.RateConfig
   alias Derpex.RateController
@@ -31,7 +33,9 @@ defmodule Derpex.Listener.Handler do
     rate_controller = Keyword.get(options, :rate_controller, RateController)
     bootstrap_dns = Keyword.get(options, :bootstrap_dns, Derpex.BootstrapDNS)
     drain = Keyword.get(options, :drain, Drain)
+    metrics = Keyword.get_lazy(options, :metrics, &Metrics.default_handle/0)
     home_page = Keyword.get(options, :home_page, [])
+    operations = Keyword.get(options, :operations, [])
     remote_address = remote_address(socket)
 
     disallowed_app_names =
@@ -48,7 +52,13 @@ defmodule Derpex.Listener.Handler do
 
     with :ok <- AcceptLimiter.claim(accept_limiter, elem(remote_address, 0)),
          {:ok, server_public_key} <- Crypto.public_key(server_private_key),
-         {:ok, writer} <- Writer.start_link(owner: self(), transport: Transport, socket: socket),
+         {:ok, writer} <-
+           Writer.start_link(
+             owner: self(),
+             transport: Transport,
+             socket: socket,
+             metrics: metrics
+           ),
          ordinary =
            Ring.new(send_queue_depth,
              notifier: writer,
@@ -77,6 +87,7 @@ defmodule Derpex.Listener.Handler do
              |> Keyword.merge(
                bootstrap_dns: bootstrap_dns,
                home_page: home_page,
+               operations: operations,
                remote_address: format_remote_address(remote_address)
              )
              |> Enum.reject(fn {_key, value} -> is_nil(value) end)
@@ -96,6 +107,8 @@ defmodule Derpex.Listener.Handler do
         client_public_key: nil,
         client_info: nil,
         can_mesh: false,
+        preferred: false,
+        connected_at: Clock.monotonic_time(:millisecond),
         admission_policy: admission_policy,
         admission_context: %{},
         disallowed_app_names: disallowed_app_names,
@@ -104,7 +117,8 @@ defmodule Derpex.Listener.Handler do
         server_public_key: server_public_key,
         remote_address: remote_address,
         accept_limiter: accept_limiter,
-        drain: drain
+        drain: drain,
+        metrics: metrics
       }
 
       continue_after_actions(socket, state, actions)
@@ -320,6 +334,15 @@ defmodule Derpex.Listener.Handler do
   end
 
   defp handle_client_message(state, {:send_packet, destination, packet}) do
+    :ok = Metrics.add(state.metrics, :packets_received, 1)
+    :ok = Metrics.add(state.metrics, :bytes_received, byte_size(packet))
+
+    packet_kind =
+      if Disco.looks_like_wrapper?(packet),
+        do: :packets_received_disco,
+        else: :packets_received_other
+
+    :ok = Metrics.add(state.metrics, packet_kind, 1)
     route_result = Router.route(state.client_public_key, destination, packet)
 
     with {:ok, state} <- handle_route_result(state, destination, packet, route_result),
@@ -337,14 +360,19 @@ defmodule Derpex.Listener.Handler do
   end
 
   defp handle_client_message(state, {:ping, payload}) do
+    :ok = Metrics.add(state.metrics, :got_ping, 1)
     _enqueue_result = Ring.enqueue(state.pong, {:pong, payload})
     {:ok, state}
   end
 
   defp handle_client_message(state, {:note_preferred, preferred}) do
     case Drain.set_preferred(state.drain, self(), preferred) do
-      :ok -> {:ok, state}
-      {:error, :draining} -> {:error, {:connection_close, :draining}, state}
+      :ok ->
+        state = record_home_move(state, preferred)
+        {:ok, %{state | preferred: preferred}}
+
+      {:error, :draining} ->
+        {:error, {:connection_close, :draining}, state}
     end
   end
 
@@ -352,6 +380,8 @@ defmodule Derpex.Listener.Handler do
          %{can_mesh: true} = state,
          {:forward_packet, source, destination, packet}
        ) do
+    :ok = Metrics.add(state.metrics, :packets_forwarded_in, 1)
+
     case Router.route_local(source, destination, packet) do
       {:dropped, :unknown_destination} ->
         maybe_notify_unknown_destination(state, destination, packet)
@@ -516,6 +546,7 @@ defmodule Derpex.Listener.Handler do
       )
 
     :ok = Drain.register(state.drain, self(), state.lifecycle, can_mesh)
+    :ok = Metrics.add(state.metrics, :accepts, 1)
 
     state
     |> Map.put(:client_public_key, key)
@@ -523,6 +554,17 @@ defmodule Derpex.Listener.Handler do
     |> Map.put(:can_mesh, can_mesh)
     |> Map.put(:admission_context, admission_context)
     |> dispatch_event({:authenticated, key, info})
+  end
+
+  defp record_home_move(%{preferred: preferred} = state, preferred), do: state
+
+  defp record_home_move(state, preferred) do
+    if Clock.monotonic_time(:millisecond) - state.connected_at > 5_000 do
+      metric = if preferred, do: :home_moves_in, else: :home_moves_out
+      :ok = Metrics.add(state.metrics, metric, 1)
+    end
+
+    state
   end
 
   defp subscribe_to_rate_config(%{rate_controller: nil} = state, _can_mesh), do: state

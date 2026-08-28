@@ -22,6 +22,7 @@ if config_env() == :prod do
     mesh_key_text = System.get_env("DERPEX_MESH_KEY")
     mesh_with_text = System.get_env("DERPEX_MESH_WITH")
     disallowed_app_names_text = System.get_env("DERPEX_DISALLOWED_APP_NAMES")
+    operations_token = System.get_env("DERPEX_OPERATIONS_TOKEN")
     rate_config_path = System.get_env("DERPEX_RATE_CONFIG")
     accept_limit_text = System.get_env("DERPEX_ACCEPT_CONNECTION_LIMIT")
     accept_burst_text = System.get_env("DERPEX_ACCEPT_CONNECTION_BURST")
@@ -291,8 +292,16 @@ if config_env() == :prod do
         names -> String.split(names, ",", trim: false)
       end
 
+    operations =
+      case {gentility, operations_token} do
+        {nil, _token} -> []
+        {_gentility, nil} -> [enabled: true]
+        {_gentility, token} when byte_size(token) >= 16 -> [enabled: true, token: token]
+        _short -> raise "DERPEX_OPERATIONS_TOKEN must contain at least 16 bytes"
+      end
+
     handler_options =
-      [send_queue_depth: send_queue_depth]
+      [send_queue_depth: send_queue_depth, operations: operations]
       |> then(fn options ->
         if mesh_key, do: Keyword.put(options, :mesh_key, mesh_key), else: options
       end)

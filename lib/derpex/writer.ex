@@ -5,6 +5,7 @@ defmodule Derpex.Writer do
 
   alias Derpex.Cardinality
   alias Derpex.Frame.Body
+  alias Derpex.Metrics
   alias Derpex.Outbox.Ring
   alias Derpex.WebSocket.Frame, as: WebSocketFrame
 
@@ -61,6 +62,7 @@ defmodule Derpex.Writer do
        owner_monitor: Process.monitor(owner),
        transport: transport,
        socket: socket,
+       metrics: Keyword.get(options, :metrics),
        wire_mode: :native,
        rings: nil,
        sender_cardinality: Cardinality.new()
@@ -108,10 +110,13 @@ defmodule Derpex.Writer do
       {:ok, message} ->
         with {:ok, frame} <- Body.encode_server(message),
              :ok <- send_data(state, frame) do
+          record_send(state.metrics, message)
           maybe_note_send(state, message)
           drain(state)
         else
-          {:error, reason} -> {:error, reason, state}
+          {:error, reason} ->
+            :ok = Metrics.add(state.metrics, :write_errors, 1)
+            {:error, reason, state}
         end
 
       :empty ->
@@ -154,6 +159,21 @@ defmodule Derpex.Writer do
   end
 
   defp maybe_note_send(_state, _message), do: :ok
+
+  defp record_send(metrics, {:recv_packet, _source, packet}) do
+    :ok = Metrics.add(metrics, :packets_sent, 1)
+    Metrics.add(metrics, :bytes_sent, byte_size(packet))
+  end
+
+  defp record_send(metrics, {:pong, _payload}), do: Metrics.add(metrics, :sent_pong, 1)
+
+  defp record_send(metrics, {:peer_gone, _key, 0x00}),
+    do: Metrics.add(metrics, :peer_gone_disconnected_frames, 1)
+
+  defp record_send(metrics, {:peer_gone, _key, _reason}),
+    do: Metrics.add(metrics, :peer_gone_not_here_frames, 1)
+
+  defp record_send(_metrics, _message), do: :ok
 
   defp send_data(%{wire_mode: :native} = state, data),
     do: state.transport.send(state.socket, data)

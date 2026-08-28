@@ -10,9 +10,12 @@ defmodule Derpex.RouterTest do
     ring = Ring.new(2)
 
     assert Router.register(destination, self(), ring) == :ok
+    assert Router.consistency_check() == :ok
+    assert %{current_connections: 1, clients_local: 1} = Router.stats()
     assert Router.route(source, destination, "packet") == {:ok, :wake}
     assert Ring.take(ring) == {:ok, {:recv_packet, source, "packet"}}
     assert Router.unregister(destination, self()) == :ok
+    assert Router.consistency_check() == :ok
     assert Router.route(source, destination, "packet") == {:dropped, :unknown_destination}
   end
 

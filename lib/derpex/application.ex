@@ -39,6 +39,7 @@ defmodule Derpex.Application do
 
       {:ok,
        [
+         Derpex.Metrics,
          Derpex.Router,
          Derpex.Mesh.ClientAddressTable,
          Derpex.Prober.PacketCache,

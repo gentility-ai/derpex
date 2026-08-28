@@ -10,31 +10,49 @@ defmodule Derpex.HTTP1 do
   alias Derpex.HomePage
   alias Derpex.HTTP1.Request
   alias Derpex.HTTP1.Response
+  alias Derpex.Operations
 
   @doc "Routes a parsed request without consuming bytes read past its headers."
   @spec route(Request.t(), binary(), keyword()) ::
           {:upgrade, :derp | :websocket, nil | iodata(), map()} | {:response, iodata()}
   def route(%Request{} = request, server_public_key, options \\ []) do
-    case Request.path(request) do
-      path when path in ["/derp/probe", "/derp/latency-check"] ->
-        probe(request)
-
-      "/generate_204" ->
-        no_content(request)
-
-      "/bootstrap-dns" ->
-        bootstrap_dns(request, options)
-
-      "/" ->
-        home_page(options)
-
-      path when path == "/derp" or binary_part(path, 0, min(byte_size(path), 6)) == "/derp/" ->
-        upgrade(request, server_public_key)
-
-      _path ->
-        {:response, Response.encode(404, [], "404 page not found\n")}
-    end
+    request
+    |> Request.path()
+    |> route_path(request, server_public_key, options)
   end
+
+  defp route_path(path, request, _server_public_key, _options)
+       when path in ["/derp/probe", "/derp/latency-check"],
+       do: probe(request)
+
+  defp route_path("/generate_204", request, _server_public_key, _options),
+    do: no_content(request)
+
+  defp route_path("/healthz", request, _server_public_key, options),
+    do: health(request, :live, options)
+
+  defp route_path("/readyz", request, _server_public_key, options),
+    do: health(request, :ready, options)
+
+  defp route_path("/metrics", request, _server_public_key, options),
+    do: protected(request, options, &metrics/0)
+
+  defp route_path("/debug/check", request, _server_public_key, options),
+    do: protected(request, options, &consistency_check/0)
+
+  defp route_path("/robots.txt", request, _server_public_key, _options), do: robots(request)
+
+  defp route_path("/bootstrap-dns", request, _server_public_key, options),
+    do: bootstrap_dns(request, options)
+
+  defp route_path("/", _request, _server_public_key, options), do: home_page(options)
+
+  defp route_path(path, request, server_public_key, _options)
+       when path == "/derp" or binary_part(path, 0, min(byte_size(path), 6)) == "/derp/",
+       do: upgrade(request, server_public_key)
+
+  defp route_path(_path, _request, _server_public_key, _options),
+    do: {:response, Response.encode(404, [], "404 page not found\n")}
 
   defp home_page(options) do
     body = options |> Keyword.get(:home_page, []) |> HomePage.render()
@@ -80,6 +98,83 @@ defmodule Derpex.HTTP1 do
       end
 
     {:response, Response.encode(204, headers)}
+  end
+
+  defp health(request, kind, options) do
+    operations = Keyword.get(options, :operations, [])
+
+    if Operations.enabled?(operations),
+      do: enabled_health(request, kind),
+      else: {:response, Response.encode(404, [], "404 page not found\n")}
+  end
+
+  defp enabled_health(%Request{method: "GET"}, kind) do
+    case Operations.health(kind) do
+      :ok ->
+        {:response, Response.encode(200, [{"Content-Type", "text/plain"}], "ok\n")}
+
+      {:error, _reason} ->
+        status = if kind == :live, do: 500, else: 503
+        body = if kind == :live, do: "unhealthy\n", else: "not ready\n"
+        {:response, Response.encode(status, [{"Content-Type", "text/plain"}], body)}
+    end
+  end
+
+  defp enabled_health(_request, _kind), do: method_not_allowed()
+
+  defp protected(%Request{method: "GET"} = request, options, callback) do
+    case Operations.authorize(request, Keyword.get(options, :operations, [])) do
+      :authorized ->
+        callback.()
+
+      :disabled ->
+        {:response, Response.encode(404, [], "404 page not found\n")}
+
+      :unauthorized ->
+        {:response,
+         Response.encode(
+           401,
+           [{"Content-Type", "text/plain"}, {"WWW-Authenticate", "Bearer"}],
+           "unauthorized\n"
+         )}
+    end
+  end
+
+  defp protected(_request, _options, _callback), do: method_not_allowed()
+
+  defp metrics do
+    {:response,
+     Response.encode(
+       200,
+       [{"Content-Type", "text/plain; version=0.0.4; charset=utf-8"}],
+       Operations.prometheus()
+     )}
+  end
+
+  defp consistency_check do
+    case Operations.consistency_check() do
+      :ok ->
+        {:response, Response.encode(200, [], "derp.Server ConsistencyCheck okay")}
+
+      {:error, reason} ->
+        {:response, Response.encode(500, [{"Content-Type", "text/plain"}], reason <> "\n")}
+    end
+  end
+
+  defp robots(%Request{method: "GET"}) do
+    {:response,
+     Response.encode(200, [{"Content-Type", "text/plain"}], "User-agent: *\nDisallow: /\n")}
+  end
+
+  defp robots(_request), do: method_not_allowed()
+
+  defp method_not_allowed do
+    {:response,
+     Response.encode(
+       405,
+       [{"Content-Type", "text/plain; charset=utf-8"}, {"X-Content-Type-Options", "nosniff"}],
+       "method not allowed\n"
+     )}
   end
 
   defp maybe_add_challenge_response(headers, challenge) do

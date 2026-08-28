@@ -9,6 +9,7 @@ defmodule Derpex.HTTP1Test do
   alias Derpex.HTTP1.Request
 
   @server_public :binary.copy(<<0xAB>>, 32)
+  @operations_token "0123456789abcdef0123456789abcdef"
 
   test "returns successful CORS probes on both upstream paths" do
     for path <- ["/derp/probe", "/derp/latency-check"] do
@@ -117,6 +118,51 @@ defmodule Derpex.HTTP1Test do
         refute response =~ "X-Tailscale-Response:"
       end
     end
+  end
+
+  test "serves public health and readiness without topology details" do
+    options = [operations: [enabled: true]]
+
+    assert {:response, disabled} = HTTP1.route(request("GET", "/healthz"), @server_public)
+    assert IO.iodata_to_binary(disabled) =~ "HTTP/1.1 404 Not Found\r\n"
+
+    for path <- ["/healthz", "/readyz"] do
+      assert {:response, response} = HTTP1.route(request("GET", path), @server_public, options)
+
+      assert IO.iodata_to_binary(response) ==
+               "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: 3\r\n\r\nok\n"
+    end
+  end
+
+  test "keeps metrics and consistency disabled until bearer authentication is configured" do
+    assert {:response, disabled} = HTTP1.route(request("GET", "/metrics"), @server_public)
+    assert IO.iodata_to_binary(disabled) =~ "HTTP/1.1 404 Not Found\r\n"
+
+    options = [operations: [enabled: true, token: @operations_token]]
+
+    assert {:response, unauthorized} =
+             HTTP1.route(request("GET", "/metrics"), @server_public, options)
+
+    assert IO.iodata_to_binary(unauthorized) =~ "HTTP/1.1 401 Unauthorized\r\n"
+
+    headers = [{"authorization", "Bearer " <> @operations_token}]
+
+    assert {:response, metrics} =
+             HTTP1.route(request("GET", "/metrics", headers), @server_public, options)
+
+    metrics = IO.iodata_to_binary(metrics)
+    assert metrics =~ "HTTP/1.1 200 OK\r\n"
+    assert metrics =~ "derp_gauge_current_connections "
+
+    assert {:response, check} =
+             HTTP1.route(request("GET", "/debug/check", headers), @server_public, options)
+
+    assert IO.iodata_to_binary(check) =~ "derp.Server ConsistencyCheck okay"
+  end
+
+  test "serves the upstream robots exclusion body" do
+    assert {:response, response} = HTTP1.route(request("GET", "/robots.txt"), @server_public)
+    assert IO.iodata_to_binary(response) =~ "User-agent: *\nDisallow: /\n"
   end
 
   defp request(method, path, headers \\ []) do
