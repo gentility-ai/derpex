@@ -165,6 +165,30 @@ defmodule Derpex.WriterTest do
     assert Ring.stats(frozen_rings.ordinary).size == 32
   end
 
+  test "counts distinct non-zero sources only after their packets are written" do
+    {:ok, writer} =
+      Writer.start_link(
+        owner: self(),
+        transport: ControlledTransport,
+        socket: {self(), :cardinality, :open}
+      )
+
+    rings = rings(writer)
+    first = :crypto.strong_rand_bytes(32)
+    second = :crypto.strong_rand_bytes(32)
+
+    assert Ring.enqueue(rings.ordinary, {:recv_packet, <<0::256>>, "zero"}) == {:ok, :wake}
+    assert_receive {:write_finished, :cardinality, _frame}
+    assert Writer.estimated_unique_senders(writer) == 0
+
+    Enum.each([first, second, first], fn source ->
+      enqueue_until_accepted(rings.ordinary, {:recv_packet, source, "packet"})
+      assert_receive {:write_finished, :cardinality, _frame}
+    end)
+
+    assert Writer.estimated_unique_senders(writer) in 1..3
+  end
+
   defp rings(writer) do
     rings = %{
       ordinary: Ring.new(32, notifier: writer, wake_message: Writer.wake_message()),
@@ -175,5 +199,12 @@ defmodule Derpex.WriterTest do
 
     :ok = Writer.attach(writer, rings)
     rings
+  end
+
+  defp enqueue_until_accepted(ring, message) do
+    case Ring.enqueue(ring, message) do
+      {:ok, _wake_state} -> :ok
+      {:dropped, :contention} -> enqueue_until_accepted(ring, message)
+    end
   end
 end

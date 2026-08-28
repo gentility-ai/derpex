@@ -62,6 +62,12 @@ defmodule Derpex.UpstreamInventory do
       "ported shared burst, refill, zero-rate, disable, and pre-allocation rejection cases",
     {"derp/derpserver/derpserver_test.go", "TestGetPerClientSendQueueDepth"} =>
       "ported in test/derpex/send_queue_config_test.exs; empty/default and explicit depths preserved",
+    {"derp/derpserver/derpserver_test.go", "TestSenderCardinality"} =>
+      "adapted in test/derpex/cardinality_test.exs with duplicate suppression and small-set estimates",
+    {"derp/derpserver/derpserver_test.go", "TestSenderCardinality100"} =>
+      "adapted in test/derpex/cardinality_test.exs with the upstream 100-sender tolerance",
+    {"derp/derpserver/derpserver_test.go", "TestSenderCardinalityTracking"} =>
+      "adapted in cardinality and writer tests; zero sources are ignored and successful sends are recorded",
     {"derp/derpserver/derpserver_test.go", "TestSetMeshKey"} =>
       "ported parser and validation cases in test/derpex/mesh_key_test.exs",
     {"derp/derpserver/derpserver_test.go", "TestIsMeshPeer"} =>

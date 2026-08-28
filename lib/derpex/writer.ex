@@ -3,6 +3,7 @@ defmodule Derpex.Writer do
 
   use GenServer
 
+  alias Derpex.Cardinality
   alias Derpex.Frame.Body
   alias Derpex.Outbox.Ring
   alias Derpex.WebSocket.Frame, as: WebSocketFrame
@@ -40,6 +41,10 @@ defmodule Derpex.Writer do
   @spec websocket_pong(pid(), binary()) :: :ok | {:error, term()}
   def websocket_pong(writer, payload), do: GenServer.call(writer, {:websocket_pong, payload})
 
+  @doc "Estimates the distinct non-zero sources sent to this connection."
+  @spec estimated_unique_senders(pid()) :: non_neg_integer()
+  def estimated_unique_senders(writer), do: GenServer.call(writer, :estimated_unique_senders)
+
   @doc "The atom used for coalesced ring notification."
   @spec wake_message() :: atom()
   def wake_message, do: @wake_message
@@ -57,7 +62,8 @@ defmodule Derpex.Writer do
        transport: transport,
        socket: socket,
        wire_mode: :native,
-       rings: nil
+       rings: nil,
+       sender_cardinality: Cardinality.new()
      }}
   end
 
@@ -77,6 +83,10 @@ defmodule Derpex.Writer do
   def handle_call({:websocket_pong, payload}, _from, %{wire_mode: :websocket} = state) do
     result = state.transport.send(state.socket, WebSocketFrame.encode_pong(payload))
     {:reply, result, state}
+  end
+
+  def handle_call(:estimated_unique_senders, _from, state) do
+    {:reply, Cardinality.estimate(state.sender_cardinality), state}
   end
 
   @impl true
@@ -137,6 +147,7 @@ defmodule Derpex.Writer do
   end
 
   defp maybe_note_send(state, {:recv_packet, source, _packet}) do
+    :ok = Cardinality.insert(state.sender_cardinality, source)
     Derpex.Router.note_send(source, state.owner, state.rings.lifecycle)
   end
 

@@ -12,8 +12,8 @@ disposition map and review that change together with `interop/upstream.lock`.
 | State | Count |
 | --- | ---: |
 | Total | 69 |
-| Ported | 41 |
-| Pending (release-blocking) | 24 |
+| Ported | 44 |
+| Pending (release-blocking) | 21 |
 | Implementation-specific | 4 |
 
 | Area | Upstream test | Source | Disposition | Gate/notes |
@@ -45,9 +45,9 @@ disposition map and review that change together with `interop/upstream.lock`.
 | DERP server | `TestParseSSOutput` | `derp/derpserver/derpserver_test.go:884` | `pending` | release-blocking mapping not yet implemented |
 | DERP server | `TestServeDebugTrafficUniqueSenders` | `derp/derpserver/derpserver_test.go:895` | `pending` | release-blocking mapping not yet implemented |
 | DERP server | `TestGetPerClientSendQueueDepth` | `derp/derpserver/derpserver_test.go:924` | `ported` | ported in test/derpex/send_queue_config_test.exs; empty/default and explicit depths preserved |
-| DERP server | `TestSenderCardinality` | `derp/derpserver/derpserver_test.go:950` | `pending` | release-blocking mapping not yet implemented |
-| DERP server | `TestSenderCardinality100` | `derp/derpserver/derpserver_test.go:995` | `pending` | release-blocking mapping not yet implemented |
-| DERP server | `TestSenderCardinalityTracking` | `derp/derpserver/derpserver_test.go:1019` | `pending` | release-blocking mapping not yet implemented |
+| DERP server | `TestSenderCardinality` | `derp/derpserver/derpserver_test.go:950` | `ported` | adapted in test/derpex/cardinality_test.exs with duplicate suppression and small-set estimates |
+| DERP server | `TestSenderCardinality100` | `derp/derpserver/derpserver_test.go:995` | `ported` | adapted in test/derpex/cardinality_test.exs with the upstream 100-sender tolerance |
+| DERP server | `TestSenderCardinalityTracking` | `derp/derpserver/derpserver_test.go:1019` | `ported` | adapted in cardinality and writer tests; zero sources are ignored and successful sends are recorded |
 | DERP server | `TestPerClientRateLimit` | `derp/derpserver/derpserver_test.go:1093` | `ported` | ported with manual-clock live listener pacing and shutdown cancellation |
 | DERP server | `TestRateLimitWait` | `derp/derpserver/derpserver_test.go:1231` | `ported` | ported reservation, refill delay, clamp, and cancellation behavior |
 | DERP server | `TestUpdateRateLimits` | `derp/derpserver/derpserver_test.go:1304` | `ported` | ported live ordinary and duplicate updates with trusted mesh exemption |
