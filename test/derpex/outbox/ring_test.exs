@@ -232,6 +232,32 @@ defmodule Derpex.Outbox.RingTest do
     assert Ring.take(ring) == {:ok, :held}
   end
 
+  # The wake flag is shared between a producer raising it after it released the
+  # lock and the consumer clearing it on an empty take. A producer that reads
+  # the flag, sends, and only then writes it back can have that clear land in
+  # between: the flag ends up saying "already woken" with no wakeup on its way,
+  # and nothing ever drains the ring again. Reaching it takes real schedulers,
+  # run-queue pressure, and a producer paced so the consumer reaches empty
+  # between publishes, which is when the clear happens.
+  @tag timeout: 180_000
+  test "a paced producer never loses the wakeup to a consumer that reaches empty" do
+    rounds = 20_000
+    consumer = spawn_link(&await_ring/0)
+    ring = Ring.new(64, notifier: consumer, wake_message: :ready)
+    send(consumer, {:ring, ring})
+
+    loaders =
+      Enum.map(1..max(div(System.schedulers_online(), 2), 2), fn _ -> spawn_link(&load/0) end)
+
+    producer = spawn_link(fn -> publish_paced(ring, rounds) end)
+    monitor = Process.monitor(producer)
+
+    assert_receive {:DOWN, ^monitor, :process, ^producer, :normal}, 150_000
+    Enum.each(loaders, &send(&1, :stop))
+
+    assert await_quiescent(ring) == %{size: 0, wake_pending: false}
+  end
+
   test "recovers a producer killed before or after slot publication" do
     assert_stale_producer_recovery(:after_journal, :empty)
     assert_stale_producer_recovery(:after_publish, {:ok, :packet})
@@ -366,6 +392,52 @@ defmodule Derpex.Outbox.RingTest do
 
   defp spin(0), do: :ok
   defp spin(iterations), do: spin(iterations - 1)
+
+  # Paced so the consumer drains to empty between publishes, and swept one
+  # reduction at a time so the producer's preemption point walks across the
+  # whole of the enqueue rather than landing in the same place every round.
+  defp publish_paced(ring, rounds) do
+    Enum.each(1..rounds, fn sequence ->
+      _result = Ring.enqueue(ring, {:recv_packet, <<1::256>>, <<sequence::64>>}, wait: false)
+      spin(6_000 + rem(sequence, 4_096))
+    end)
+  end
+
+  # Run-queue pressure: more runnable processes than the ring's two, which is
+  # what makes a yielding producer actually hand over the scheduler.
+  defp load do
+    receive do
+      :stop -> :ok
+    after
+      0 ->
+        spin(50_000)
+        load()
+    end
+  end
+
+  # A ring nobody is publishing into drains to empty and clears its wake flag.
+  # A lost wakeup leaves it holding items with the flag still raised.
+  defp await_quiescent(ring, attempts \\ 500)
+
+  defp await_quiescent(ring, 0), do: observed_state(ring)
+
+  defp await_quiescent(ring, attempts) do
+    case observed_state(ring) do
+      %{size: 0, wake_pending: false} = quiescent ->
+        quiescent
+
+      _pending ->
+        Process.sleep(10)
+        await_quiescent(ring, attempts - 1)
+    end
+  end
+
+  defp observed_state(ring) do
+    case Ring.stats(ring) do
+      %{size: size, wake_pending: wake_pending} -> %{size: size, wake_pending: wake_pending}
+      :busy -> %{size: :busy, wake_pending: :busy}
+    end
+  end
 
   defp enqueue_until_accepted(ring, item) do
     case Ring.enqueue(ring, item) do

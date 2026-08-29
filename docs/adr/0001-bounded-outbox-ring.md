@@ -27,22 +27,39 @@ published slot or discards an unpublished reservation. Closing clears all
 slots and prevents further publication.
 
 The single writer drains until `:empty`; observing empty clears the wake flag
-while holding the lock. Enqueue claims the wakeup under that lock and sends it
-after releasing: the consumer therefore cannot observe a wakeup before the
+while holding the lock. Enqueue commits under the lock, releases, and only then
+claims the wakeup: the consumer therefore cannot observe a wakeup before the
 operation it is being woken for is committed, and it is never woken into a lock
-the producer still holds. The message is sent before the flag is set, so a
-producer that dies mid-signal leaves a flag that says "not yet woken" and the
-next enqueue wakes the writer rather than coalescing into a message that was
-never sent. A writer that finds a ring locked yields for the same bounded budget a producer
-gets, and only then ends the drain and schedules one short retry (five
-milliseconds). It never re-sends itself a wakeup, because the producer holding
-the lock may have coalesced its signal into the wakeup being handled, and a
-self-wakeup would spin until that producer commits. The retry is a safety net,
-not a mechanism: when it was reached on the ordinary path — a writer woken from
-inside the lock, missing on a single attempt — it put a 6 ms mode into the
-relay's latency, recorded in `docs/benchmarks/2026-08-29.md`. The writer also
-drains once when its rings are attached, since a wakeup raised before
-attachment has no rings to drain and is not repeated.
+the producer still holds.
+
+The claim is a single compare-and-exchange of the flag from clear to raised,
+and only the producer that wins it sends. Raising the flag as a separate write
+after the send is not equivalent, because the consumer clears the same flag on
+an empty take: a clear landing between a producer's read and its write leaves
+the flag saying "already woken" with no wakeup on its way, every later enqueue
+coalescing into it, and the connection's writer idle for good. That is the
+whole failure — one relay run blackholed 47,247 packets — and the ordering that
+caused it is not a hedge against anything else. A producer killed between the
+claim and the send would leave the same stuck flag, but that window is two
+adjacent instructions against a race the consumer runs into on every drain.
+
+Because the claim follows the commit, the flag can be won for an item the
+consumer has already taken; the writer is then woken for an empty ring, which
+costs one wakeup and no correctness.
+
+A writer that finds a ring locked yields for the same bounded budget a producer
+gets — the whole budget in yields, no naps — and only then ends the drain and
+schedules one short retry (one millisecond). It never re-sends itself a wakeup,
+because the producer holding the lock may have coalesced its signal into the
+wakeup being handled, and a self-wakeup would spin until that producer commits.
+The retry is a safety net, not a mechanism: when it was reached on the ordinary
+path it put a 6 ms mode into the relay's latency, recorded in
+`docs/benchmarks/2026-08-29.md`, correlating one-for-one with delivered retry
+messages rather than with packet size. Yielding the whole budget took the
+consumer's busy rate from 0.053% of takes to 0.005%, and the residual retry
+costs a millisecond rather than five. The writer also drains once when its
+rings are attached, since a wakeup raised before attachment has no rings to
+drain and is not repeated.
 
 ## Consequences
 

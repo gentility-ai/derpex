@@ -109,11 +109,11 @@ defmodule Derpex.Outbox.LifecycleQueue do
             Lock.release(queue.table, lock_token)
           end
 
-        # Claimed under the lock, sent after it: a writer woken while the lock
-        # is still held would collide and wait for its retry timer.
-        with {:ok, :wake} <- result, do: send(queue.notifier, queue.wake_message)
-
-        report_overflow(queue, result)
+        # Claimed and sent after release, in one atomic step: a writer woken
+        # while the lock is still held would collide and wait for its retry
+        # timer, and a claim taken under the lock stays raised for good if the
+        # producer dies before it sends.
+        report_overflow(queue, signal_after_release(queue, result))
 
       :busy ->
         {:dropped, :contention}
@@ -130,10 +130,9 @@ defmodule Derpex.Outbox.LifecycleQueue do
         :atomics.add_get(queue.state, @overflow_drops, 1)
         {:overflow, size}
       else
-        wake = signal_writer(queue)
         sequence = :atomics.add_get(queue.state, @sequence, 1)
         true = :ets.insert(queue.table, {{:item, sequence}, enqueued_at, item})
-        {:ok, wake}
+        {:ok, :published}
       end
     end
   end
@@ -296,15 +295,21 @@ defmodule Derpex.Outbox.LifecycleQueue do
     :ok
   end
 
-  # Claims the wakeup under the lock; the message itself is sent after release.
-  defp signal_writer(queue) do
-    if atomic_get(queue, @wake_pending) == 0 do
-      :atomics.put(queue.state, @wake_pending, 1)
-      :wake
+  # Raising the flag is the claim, and it is one compare-and-exchange, so only
+  # the producer that observed it clear sends the wakeup. The consumer clears
+  # the flag when it finds the queue empty under the lock, so a clear that lands
+  # after the insert has already seen the frame; one that lands before it leaves
+  # the flag clear for this claim to take.
+  defp signal_after_release(queue, {:ok, :published}) do
+    if :atomics.compare_exchange(queue.state, @wake_pending, 0, 1) == :ok do
+      send(queue.notifier, queue.wake_message)
+      {:ok, :wake}
     else
-      :coalesced
+      {:ok, :coalesced}
     end
   end
+
+  defp signal_after_release(_queue, result), do: result
 
   defp atomic_get(queue, index), do: :atomics.get(queue.state, index)
 end

@@ -80,14 +80,18 @@ defmodule Derpex.Outbox.Lock do
   end
 
   @doc """
-  Acquires for the single consumer: the same yields a producer gets, no naps.
+  Acquires for the single consumer: yields inside the budget, and never naps.
 
   A writer woken by a publish that has not yet released the lock would
-  otherwise miss on its one attempt and wait for its retry timer, turning a
-  microsecond of overlap into milliseconds of latency.
+  otherwise miss on its attempts and wait for its retry timer, turning a
+  microsecond of overlap into milliseconds of latency. Four yields were not
+  enough of a hedge against that: spending the whole budget in yields instead
+  took the writer's busy rate from 0.053% of takes to 0.005%, and a yield on an
+  idle node returns in microseconds, so the extra attempts cost nothing when
+  the lock is free.
   """
   @spec acquire_consumer(:ets.tid()) :: result()
-  def acquire_consumer(table), do: acquire_producer(table, false, nil)
+  def acquire_consumer(table), do: acquire(table)
 
   @doc "Acquires for an administrative caller: yields inside the same budget."
   @spec acquire(:ets.tid()) :: result()

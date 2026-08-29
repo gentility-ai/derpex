@@ -22,7 +22,11 @@ defmodule Derpex.Writer do
 
   @wake_message :derpex_outbox_ready
   @retry_message :derpex_outbox_retry
-  @retry_interval_ms 5
+  # The shortest timer the BEAM will give: the retry is a safety net for a take
+  # that met a producer's lock, and every millisecond it waits is a millisecond
+  # of latency on packets that are already queued. At five it was visible as a
+  # mode in the relay's latency histogram.
+  @retry_interval_ms 1
   # Frames per wakeup. A writer that drains a full queue in one pass answers no
   # control write and no pong until it is done, so it gives the mailbox a turn.
   @max_drain_per_wake 64

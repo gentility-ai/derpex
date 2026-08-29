@@ -117,10 +117,9 @@ defmodule Derpex.Outbox.Ring do
 
         # Waking the writer while still holding the lock hands it a collision:
         # it wakes, misses, and waits for its retry timer, which is
-        # milliseconds where the overlap was microseconds. The wakeup is sent
-        # after release, and sent before the flag is set, so a producer that
-        # dies mid-signal leaves a flag that says "not yet woken" rather than
-        # one that says "already woken" with nothing on its way.
+        # milliseconds where the overlap was microseconds. The wakeup is
+        # therefore claimed and sent after release, and the claim is one atomic
+        # compare-and-exchange, so the consumer's clear cannot land inside it.
         result = signal_after_release(ring, result, wake)
         record_pending_drop(ring, pending_drop)
         result
@@ -355,9 +354,8 @@ defmodule Derpex.Outbox.Ring do
   end
 
   defp signal_after_release(ring, {:ok, _published}, :publish) do
-    if atomic_get(ring, @wake_pending) == 0 do
+    if claim_wake(ring) do
       send(ring.notifier, ring.wake_message)
-      :atomics.put(ring.state, @wake_pending, 1)
       {:ok, :wake}
     else
       {:ok, :coalesced}
@@ -365,15 +363,21 @@ defmodule Derpex.Outbox.Ring do
   end
 
   defp signal_after_release(ring, {:ok, :replaced} = result, :replace) do
-    if atomic_get(ring, @wake_pending) == 0 do
-      send(ring.notifier, ring.wake_message)
-      :atomics.put(ring.state, @wake_pending, 1)
-    end
-
+    if claim_wake(ring), do: send(ring.notifier, ring.wake_message)
     result
   end
 
   defp signal_after_release(_ring, result, _wake), do: result
+
+  # Raising the flag is the claim, and it is one compare-and-exchange, so only
+  # the producer that observed it clear sends. Reading it, sending, and then
+  # writing it back is not the same thing: the consumer clears the flag on an
+  # empty take, and a clear that lands between the read and the write leaves a
+  # flag saying "already woken" with no wakeup on its way and no producer that
+  # will ever send another one.
+  defp claim_wake(ring) do
+    :atomics.compare_exchange(ring.state, @wake_pending, 0, 1) == :ok
+  end
 
   defp journal(ring, lock_token, operation_token, index, head, size, head_drops) do
     true =
