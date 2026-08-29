@@ -140,20 +140,26 @@ defmodule Derpex.LocalAPITest do
   end
 
   test "enforces one wall timeout across the exchange", context do
+    server_delay_ms = 250
+
     server =
       serve_once(context.listener, fn _socket, _request ->
-        Process.sleep(250)
+        Process.sleep(server_delay_ms)
         :ok
       end)
 
-    started_at = System.monotonic_time(:millisecond)
+    # The property is that the caller gives up on its own deadline rather than
+    # waiting for this server, so the comparison is against the server's reply
+    # arriving, not against a wall-clock budget a loaded machine can blow.
+    would_have_replied = Process.send_after(self(), :server_would_have_replied, server_delay_ms)
 
     assert LocalAPI.whois_node_key(
              @node_key,
              Keyword.put(options(context), :timeout_ms, 20)
            ) == {:error, {:localapi_unavailable, :timeout}}
 
-    assert System.monotonic_time(:millisecond) - started_at < 150
+    refute_received :server_would_have_replied
+    Process.cancel_timer(would_have_replied)
     await_server(server)
   end
 

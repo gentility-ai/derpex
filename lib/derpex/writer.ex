@@ -154,6 +154,11 @@ defmodule Derpex.Writer do
   defp drain(state) do
     case take_next(state) do
       {{:ok, message, queue_age_microseconds}, state} ->
+        # Go counts a pong and a peer-gone frame as it hands them to the
+        # writer, and a relayed packet only once the write returned, so the
+        # counters are incremented on the same side of the socket call here.
+        record_dispatch(state.metrics, message)
+
         with {:ok, frame} <- Body.encode_server(message),
              :ok <- send_data(state, frame) do
           record_queue_duration(state.metrics, message, queue_age_microseconds)
@@ -276,15 +281,17 @@ defmodule Derpex.Writer do
     Metrics.add(metrics, :bytes_sent, byte_size(packet))
   end
 
-  defp record_send(metrics, {:pong, _payload}), do: Metrics.add(metrics, :sent_pong, 1)
+  defp record_send(_metrics, _message), do: :ok
 
-  defp record_send(metrics, {:peer_gone, _key, 0x00}),
+  defp record_dispatch(metrics, {:pong, _payload}), do: Metrics.add(metrics, :sent_pong, 1)
+
+  defp record_dispatch(metrics, {:peer_gone, _key, 0x00}),
     do: Metrics.add(metrics, :peer_gone_disconnected_frames, 1)
 
-  defp record_send(metrics, {:peer_gone, _key, _reason}),
+  defp record_dispatch(metrics, {:peer_gone, _key, _reason}),
     do: Metrics.add(metrics, :peer_gone_not_here_frames, 1)
 
-  defp record_send(_metrics, _message), do: :ok
+  defp record_dispatch(_metrics, _message), do: :ok
 
   defp record_write_drop(metrics, {:recv_packet, _source, packet}) do
     kind = if Derpex.Disco.looks_like_wrapper?(packet), do: :disco, else: :other

@@ -22,6 +22,7 @@ defmodule Derpex.Outbox.RingTest do
 
     assert Ring.stats(ring) == %{
              capacity: 2,
+             full_policy: :replace,
              size: 2,
              wake_pending: true,
              head_drops: 1,
@@ -246,6 +247,35 @@ defmodule Derpex.Outbox.RingTest do
 
     assert current[{:bytes_dropped, :queue_head, :forward}] -
              before[{:bytes_dropped, :queue_head, :forward}] == 5
+  end
+
+  test "a ring that refuses replacement keeps the item it already holds" do
+    ring = Ring.new(1, wake_message: :ready, full: :reject)
+
+    assert Ring.enqueue(ring, :first) == {:ok, :wake}
+    assert Ring.enqueue(ring, :second) == {:dropped, :queue_full}
+    assert Ring.stats(ring).tail_drops == 1
+    assert Ring.take(ring) == {:ok, :first}
+    assert Ring.take(ring) == :empty
+  end
+
+  test "replacing the oldest packet still records how long it waited" do
+    ring =
+      Ring.new(1,
+        wake_message: :ready,
+        metrics: Derpex.Metrics.default_handle(),
+        metric_kind: :other
+      )
+
+    assert Ring.enqueue(ring, {:recv_packet, <<0::256>>, "first"}) == {:ok, :wake}
+    Process.sleep(2)
+    before = Derpex.Metrics.snapshot().average_queue_duration_ms
+    assert Ring.enqueue(ring, {:recv_packet, <<0::256>>, "second"}) == {:ok, :replaced}
+
+    # Go feeds a head-dropped packet's residence time into the same moving
+    # average as a delivered one, so a queue that is dropping still shows how
+    # long it is making packets wait.
+    assert Derpex.Metrics.snapshot().average_queue_duration_ms != before
   end
 
   test "an idle ring costs a bounded amount of table memory" do

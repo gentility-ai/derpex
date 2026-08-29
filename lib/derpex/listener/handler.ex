@@ -88,8 +88,11 @@ defmodule Derpex.Listener.Handler do
              metrics: metrics,
              metric_kind: :disco
            ),
+         # Go answers the ping it received first and ignores a client that
+         # pings faster than it is answered, so a waiting pong is never
+         # replaced by a newer one.
          pong =
-           Ring.new(1, notifier: writer, wake_message: Writer.wake_message()),
+           Ring.new(1, notifier: writer, wake_message: Writer.wake_message(), full: :reject),
          lifecycle =
            LifecycleQueue.new(
              notifier: writer,

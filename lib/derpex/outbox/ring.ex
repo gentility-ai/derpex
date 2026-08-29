@@ -31,6 +31,7 @@ defmodule Derpex.Outbox.Ring do
     :table,
     :state,
     :capacity,
+    :full_policy,
     :notifier,
     :wake_message,
     :test_hook,
@@ -42,6 +43,7 @@ defmodule Derpex.Outbox.Ring do
             table: :ets.tid(),
             state: :atomics.atomics_ref(),
             capacity: pos_integer(),
+            full_policy: :replace | :reject,
             notifier: pid(),
             wake_message: atom(),
             test_hook: nil | (atom() -> term()),
@@ -71,6 +73,7 @@ defmodule Derpex.Outbox.Ring do
       table: table,
       state: :atomics.new(6, signed: false),
       capacity: capacity,
+      full_policy: Keyword.get(options, :full, :replace),
       notifier: Keyword.get(options, :notifier, self()),
       wake_message: Keyword.get(options, :wake_message, :derpex_outbox_ready),
       test_hook: Keyword.get(options, :test_hook),
@@ -122,7 +125,20 @@ defmodule Derpex.Outbox.Ring do
   end
 
   defp record_pending_drop(_ring, nil), do: :ok
+
   defp record_pending_drop(ring, {item, reason}), do: record_drop(ring, item, reason)
+
+  # Go records a head-dropped packet's residence time in the same moving average
+  # as a delivered one, so a queue that is dropping still reports how long it is
+  # making packets wait.
+  defp record_pending_drop(ring, {item, reason, enqueued_at}) do
+    :ok = record_drop(ring, item, reason)
+
+    Metrics.observe_queue_duration(
+      ring.metrics,
+      max(Clock.monotonic_time(:microsecond) - enqueued_at, 0)
+    )
+  end
 
   @doc "Takes the next item for the single writer."
   @spec take(t()) :: {:ok, term()} | :empty | :closed | :busy
@@ -192,6 +208,7 @@ defmodule Derpex.Outbox.Ring do
 
           %{
             capacity: ring.capacity,
+            full_policy: ring.full_policy,
             size: atomic_get(ring, @size),
             wake_pending: atomic_get(ring, @wake_pending) == 1,
             head_drops: atomic_get(ring, @head_drops),
@@ -241,7 +258,23 @@ defmodule Derpex.Outbox.Ring do
     end
   end
 
+  defp enqueue_open_locked(%{full_policy: :reject} = ring, item, enqueued_at, lock_token) do
+    if atomic_get(ring, @size) == ring.capacity do
+      # Go's handleFramePing drops the ping that arrived last when a pong is
+      # already waiting: the client is pinging faster than it is being answered,
+      # and the answer it is owed is the older one.
+      :atomics.add_get(ring.state, @tail_drops, 1)
+      {{:dropped, :queue_full}, nil}
+    else
+      publish_locked(ring, item, enqueued_at, lock_token)
+    end
+  end
+
   defp enqueue_open_locked(ring, item, enqueued_at, lock_token) do
+    publish_locked(ring, item, enqueued_at, lock_token)
+  end
+
+  defp publish_locked(ring, item, enqueued_at, lock_token) do
     wake = signal_writer(ring)
     {full?, index, head, size, head_drops} = slot_plan(ring)
     operation_token = unique_token()
@@ -255,7 +288,7 @@ defmodule Derpex.Outbox.Ring do
     run_hook(ring, :after_commit)
     :ets.delete(ring.table, :journal)
 
-    {enqueue_result(full?, wake), if(replaced, do: {replaced, :queue_head})}
+    {enqueue_result(full?, wake), replaced}
   end
 
   # The slot to publish into, with the head, size and head-drop count that
@@ -386,7 +419,7 @@ defmodule Derpex.Outbox.Ring do
   # Only the lookup belongs under the lock; the drop is recorded after release.
   defp replaced_item(ring, index) do
     case :ets.lookup(ring.table, index) do
-      [{^index, _slot_token, _enqueued_at, item}] -> item
+      [{^index, _slot_token, replaced_at, item}] -> {item, :queue_head, replaced_at}
       [] -> nil
     end
   end
