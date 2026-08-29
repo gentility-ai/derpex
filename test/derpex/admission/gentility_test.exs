@@ -104,6 +104,53 @@ defmodule Derpex.Admission.GentilityTest do
              {:error, :revocation_node_key_mismatch}
   end
 
+  test "a revocation that does not cover the cached lease keeps serving it" do
+    parent = self()
+    node_key = node_key(35)
+
+    {:ok, authority} =
+      Agent.start_link(fn -> {:ok, signed_lease(node_key, policy_revision: 11)} end)
+
+    controller =
+      start_controller(
+        authority: fn _request -> Agent.get(authority, & &1) end,
+        close_peer: fn key -> send(parent, {:closed, key}) end
+      )
+
+    policy = Gentility.policy(controller)
+    assert {:ok, _context} = Gentility.authorize(request(node_key), policy)
+
+    Agent.update(authority, fn _response -> {:ok, signed_revocation(node_key, 10)} end)
+
+    assert {:ok, %{gentility: %{source: :cached, policy_revision: 11}}} =
+             Gentility.authorize(request(node_key), policy)
+
+    refute_receive {:closed, ^node_key}
+    assert Gentility.stats(controller).cache_entries == 1
+    assert Gentility.stats(controller).revocations == 1
+
+    assert {:ok, %{gentility: %{source: :cached}}} =
+             Gentility.authorize(request(node_key), policy)
+
+    assert Gentility.stats(controller).revocations == 1
+
+    Agent.update(authority, fn _response -> {:ok, signed_revocation(node_key, 11)} end)
+
+    assert Gentility.authorize(request(node_key), policy) == {:error, :lease_revoked}
+    assert_receive {:closed, ^node_key}
+    assert Gentility.stats(controller).cache_entries == 0
+  end
+
+  test "an authority record of no known type is rejected as an unknown record" do
+    node_key = node_key(36)
+
+    controller =
+      start_controller(authority: fn _request -> {:ok, :binary.copy(<<0x7F>>, 128)} end)
+
+    assert Gentility.authorize(request(node_key), Gentility.policy(controller)) ==
+             {:error, :unknown_record_type}
+  end
+
   test "active revocation is idempotent, rejects stale leases, and allows a newer revision" do
     parent = self()
     node_key = node_key(3)

@@ -11,8 +11,15 @@ defmodule Derpex.Admission.Gentility.ControlPlane do
   contract v1 records returned as `{:ok, wire}`:
 
     * an admission lease (`DXAL`) for the requested node key admits, and
-    * a revocation (`DXRV`) for the requested node key denies, dropping the
-      cached lease and closing that node's established connections.
+    * a revocation (`DXRV`) for the requested node key denies every lease it
+      covers, dropping the cached lease and closing that node's established
+      connections.
+
+  A revocation denies only leases whose policy revision it covers. Answering
+  with a revocation older than the node's cached lease — or replaying one the
+  relay already holds — does not deny the node: the cached lease still stands
+  and admission continues from it. Denying a node that holds a newer lease
+  requires a revocation at that lease's revision or above.
 
   `{:error, reason}` means the control plane could not answer. It is never a
   denial, whatever the reason term is — `:unavailable`, `{:http, 503}`,

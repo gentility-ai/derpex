@@ -236,24 +236,14 @@ defmodule Derpex.Admission.Gentility do
     state = purge_expired(state)
 
     case Contract.record_type(wire) do
+      {:ok, :lease} -> accept_live_lease(state, node_key, wire)
       {:ok, :revocation} -> accept_live_denial(state, node_key, wire)
-      _lease_or_unknown -> accept_live_lease(state, node_key, wire)
+      {:error, _reason} = error -> {:reply, error, state}
     end
   end
 
   def handle_call({:cached, node_key}, _from, state) do
-    state = purge_expired(state)
-
-    case state.leases[node_key] do
-      nil ->
-        {:reply, {:error, :no_cached_lease}, reschedule_expiry(state)}
-
-      entry ->
-        sequence = state.sequence + 1
-        entry = %{entry | accessed: sequence}
-        state = %{state | leases: Map.put(state.leases, node_key, entry), sequence: sequence}
-        {:reply, {:ok, context(entry.lease, :cached)}, reschedule_expiry(state)}
-    end
+    state |> purge_expired() |> cached_decision(node_key)
   end
 
   def handle_call({:claim, node_key, context, connection}, _from, state) do
@@ -459,17 +449,36 @@ defmodule Derpex.Admission.Gentility do
     end
   end
 
+  # A revocation denies only the leases it covers. One whose policy revision is
+  # older than the cached lease, or one already superseded in the revocation
+  # table, leaves that lease standing, so the authorization continues with the
+  # cached decision rather than reporting a revocation that did not apply.
   defp accept_live_denial(state, node_key, wire) do
     case Contract.verify_revocation(wire, state.verification_keys) do
       {:ok, %Revocation{node_key: ^node_key} = revocation} ->
-        {:reply, _applied_or_stale, state} = apply_one_revocation(state, wire, revocation)
-        {:reply, {:error, :lease_revoked}, state}
+        case revoke_record(state, wire, revocation) do
+          {:covered, state} -> {:reply, {:error, :lease_revoked}, state}
+          {_uncovered_or_stale, state} -> cached_decision(state, node_key)
+        end
 
       {:ok, %Revocation{}} ->
         {:reply, {:error, :revocation_node_key_mismatch}, state}
 
       {:error, _reason} = error ->
         {:reply, error, state}
+    end
+  end
+
+  defp cached_decision(state, node_key) do
+    case state.leases[node_key] do
+      nil ->
+        {:reply, {:error, :no_cached_lease}, reschedule_expiry(state)}
+
+      entry ->
+        sequence = state.sequence + 1
+        entry = %{entry | accessed: sequence}
+        state = %{state | leases: Map.put(state.leases, node_key, entry), sequence: sequence}
+        {:reply, {:ok, context(entry.lease, :cached)}, reschedule_expiry(state)}
     end
   end
 
@@ -562,15 +571,26 @@ defmodule Derpex.Admission.Gentility do
   end
 
   defp apply_one_revocation(state, wire, revocation) do
+    case revoke_record(state, wire, revocation) do
+      {:stale, state} -> {:reply, {:ok, :stale}, state}
+      {_covered_or_uncovered, state} -> {:reply, {:ok, :applied}, state}
+    end
+  end
+
+  # Stores one authenticated revocation. A replay of a revision the table already
+  # holds is not stored again, so a repeated record cannot churn the bounded
+  # revocation table. `:covered` means the record invalidated the cached lease
+  # and closed the node; `:uncovered` means a newer cached lease survives it.
+  defp revoke_record(state, wire, revocation) do
     case state.revocations[revocation.node_key] do
       %{policy_revision: revision} when revision >= revocation.policy_revision ->
-        {:reply, {:ok, :stale}, state}
+        {:stale, state}
 
       _older_or_missing ->
         {state, close?} = put_revocation(state, wire, revocation)
         if close?, do: close_peer(state, revocation.node_key)
         state = persist_or_note_error(state) |> reschedule_expiry()
-        {:reply, {:ok, :applied}, state}
+        {if(close?, do: :covered, else: :uncovered), state}
     end
   end
 
@@ -614,7 +634,12 @@ defmodule Derpex.Admission.Gentility do
     }
 
     revocations =
-      put_bounded(state.revocations, revocation.node_key, entry, state.max_revocations)
+      put_bounded_revocation(
+        state.revocations,
+        revocation.node_key,
+        entry,
+        state.max_revocations
+      )
 
     {%{state | leases: leases, revocations: revocations} |> rebuild_budgets(), close?}
   end
@@ -1003,7 +1028,10 @@ defmodule Derpex.Admission.Gentility do
     Cache.store(state.cache_path, leases, revocations)
   end
 
-  defp put_bounded(entries, key, entry, maximum) do
+  # Revocations are bounded by revocation time: the oldest record is the one
+  # Gentility is soonest to prune, and every lease it could still deny has
+  # expired by then.
+  defp put_bounded_revocation(entries, key, entry, maximum) do
     entries = Map.put(entries, key, entry)
 
     if map_size(entries) <= maximum do
