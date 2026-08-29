@@ -2,6 +2,10 @@ defmodule Derpex.Interop.GoClientTest do
   use ExUnit.Case, async: false
 
   @moduletag :go_interop
+  # Every test here shells out to `go run`, and the prober scenario moves 100 MB
+  # through the relay. On a cold Go build cache the default sixty seconds is a
+  # timeout on the toolchain rather than on DERPEX.
+  @moduletag timeout: 300_000
 
   alias Derpex.Certificates
   alias Derpex.Certificates.Manual

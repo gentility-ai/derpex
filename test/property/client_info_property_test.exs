@@ -89,7 +89,11 @@ defmodule Derpex.ClientInfoPropertyTest do
 
   defp client_info do
     gen all mesh_key <- one_of([constant(nil), binary(length: 32)]),
-            version <- integer(@min_integer..@max_integer),
+            # The 64-bit range is what the field must survive; 0 through 3 is
+            # what a client actually sends, since the pinned ProtocolVersion is
+            # 2. Drawing only from the wide range generated the plausible
+            # versions about as often as never.
+            version <- one_of([integer(0..3), integer(@min_integer..@max_integer)]),
             can_ack_pings <- boolean(),
             is_prober <- boolean(),
             app_name <- app_name(0, @max_app_name_length) do

@@ -1,5 +1,11 @@
 defmodule Derpex.Outbox.RingTest do
-  use ExUnit.Case, async: true
+  # Not async. One test here measures how long a producer waits for a ring
+  # lock and compares it against a ceiling calibrated on the same machine. That
+  # calibration can only speak for the ring if the load it runs under is the
+  # load the measurement runs under, and ExUnit's async pool is neither
+  # constant nor knowable from inside the test, so the whole module runs in the
+  # serial phase.
+  use ExUnit.Case, async: false
 
   alias Derpex.Outbox.Lock
   alias Derpex.Outbox.Ring
@@ -162,7 +168,10 @@ defmodule Derpex.Outbox.RingTest do
   test "an enqueue stays inside the acquisition budget under concurrent producers" do
     parent = self()
     producer_count = 8
-    per_producer = 200
+    # 4,000 samples rather than 1,600, so the 99.9th percentile is the fourth
+    # worst enqueue rather than the second. At two samples above it, one
+    # unlucky preemption decided the assertion; at four it takes a pattern.
+    per_producer = 500
     consumer = spawn_link(&await_ring/0)
     ring = Ring.new(32, notifier: consumer, wake_message: :ready)
     send(consumer, {:ring, ring})

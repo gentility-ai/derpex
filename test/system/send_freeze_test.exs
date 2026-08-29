@@ -21,10 +21,15 @@ defmodule Derpex.System.SendFreezeTest do
     unknown-destination `peer_gone` that alice's post-close sends could earn is
     gated on disco packets, and neither payload here is one.
 
-  Two assertions go beyond upstream, because a real socket makes them
+  * `TestSendRecv`'s `if m.Source.IsZero()` is checked for both recipients, so
+    a packet written out of a stalled queue still has to name its sender.
+
+  Three assertions go beyond upstream, because a real socket makes them
   observable where `memnet` did not: the frozen client is closed by the write
-  timeout, and at least ninety percent of the `alice -> cathy` stream is
-  delivered across the whole flood.
+  timeout, at least ninety percent of the `alice -> cathy` stream is delivered
+  across the whole flood, and the frame kinds bob has seen are compared before
+  and after the thaw rather than only before, so the backlog a thawed socket
+  drains cannot contain a frame upstream's `recv` would have failed on.
   """
 
   use ExUnit.Case, async: false
@@ -104,7 +109,8 @@ defmodule Derpex.System.SendFreezeTest do
            "alice->cathy delivered #{delivered} of #{sent_to_cathy} packets"
 
     # Everything bob saw, he saw before the freeze; snapshot him here so the
-    # thaw below cannot smuggle a late frame past the check.
+    # thaw below can be compared against it rather than only re-checked.
+    bob_frames = frame_types(bob_reader)
     assert_only_packets(bob_reader, "bob")
     assert_only_packets(cathy_reader, "cathy")
 
@@ -119,9 +125,21 @@ defmodule Derpex.System.SendFreezeTest do
     assert eventually(fn -> write_errors() > write_errors_before end, 5_000),
            "the frozen client was closed without a recorded write error"
 
+    # The thaw drains whatever the writer still held for bob before the close.
+    # Upstream's `recv` fails on any frame that is not a ReceivedPacket, so what
+    # comes out of that backlog has to be packets and nothing else: the frame
+    # types must be exactly what they were before the thaw.
+    assert frame_types(bob_reader) == bob_frames
+    assert_only_packets(bob_reader, "bob")
+
     # isEmpty(alice): alice is a pure sender and must never receive a packet.
     assert_no_packets(alice_reader, "alice")
     assert_only_packets(alice_reader, "alice")
+
+    # TestSendRecv's `if m.Source.IsZero()`, for the frozen recipient as well as
+    # the flowing one: a packet written out of a stalled queue still has to name
+    # who sent it.
+    assert DerpClient.zero_source_packets(bob_reader) == 0
     assert DerpClient.zero_source_packets(cathy_reader) == 0
 
     # Close bob before alice, as upstream does, to keep a peer-gone frame from
@@ -226,6 +244,15 @@ defmodule Derpex.System.SendFreezeTest do
 
     assert DerpClient.other_frames(reader) == 0,
            "unexpected frame type received by #{name}, want none"
+  end
+
+  # The frame kinds a reader has seen, packet count excluded: after a thaw the
+  # packet count is expected to move and the frame kinds are not.
+  defp frame_types(reader) do
+    %{
+      peer_gone: DerpClient.peer_gone_frames(reader),
+      other: DerpClient.other_frames(reader)
+    }
   end
 
   # Delivery is asynchronous, so let the tail of the stream land before the
