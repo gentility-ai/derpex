@@ -66,6 +66,46 @@ defmodule Derpex.ListenerSupervisorTest do
     assert sni_fun.(~c"derp.example.com") == :undefined
   end
 
+  # The chain DERPEX serves is `[leaf, metacertificate]`, which is upstream's
+  # TLS fast-start design rather than a real certificate path, so an OTP client
+  # refuses it and the end-to-end handshake belongs to the Go interoperability
+  # gate. What this asserts is that OTP accepts the certificate and key the
+  # manager issued when the listen socket is opened.
+  test "OTP opens a listen socket with the self-issued certificate and key" do
+    {_server_public, server_private} = Crypto.generate_keypair()
+
+    directory =
+      Path.join(System.tmp_dir!(), "derpex-listener-tls-#{System.unique_integer([:positive])}")
+
+    on_exit(fn -> File.rm_rf!(directory) end)
+
+    manager =
+      start_supervised!(
+        Supervisor.child_spec(
+          {IPManager, directory: directory, issuer: &IPManager.self_signed_issuer/2},
+          id: :tls_manager
+        )
+      )
+
+    listener = [
+      port: 0,
+      num_acceptors: 1,
+      transport_module: ThousandIsland.Transports.SSL,
+      transport_options: [ip: {127, 0, 0, 1}, versions: [:"tlsv1.3"]],
+      ip_certificate_manager: {manager, "127.0.0.1"}
+    ]
+
+    assert {:ok, {_flags, [child_spec]}} =
+             ListenerSupervisor.init({[listener], Secret.wrap(server_private)})
+
+    assert {ThousandIsland, :start_link, [options]} = child_spec.start
+    server = start_supervised!({ThousandIsland, options}, id: :tls_listener)
+    assert {:ok, {{127, 0, 0, 1}, port}} = ThousandIsland.listener_info(server)
+    assert port > 0
+    assert {:ok, socket} = :gen_tcp.connect(~c"127.0.0.1", port, [active: false], 5_000)
+    on_exit(fn -> :gen_tcp.close(socket) end)
+  end
+
   test "leaves a listener alone when no IP certificate issuer is configured" do
     {_server_public, server_private} = Crypto.generate_keypair()
     listener = [port: 0, num_acceptors: 1, transport_options: [ip: {127, 0, 0, 1}]]
