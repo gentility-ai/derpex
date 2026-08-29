@@ -25,6 +25,7 @@ defmodule Derpex.Metrics do
     :peer_gone_not_here_frames,
     :packets_forwarded_out,
     :packets_forwarded_in,
+    :remove_forwarder_other,
     :home_moves_in,
     :home_moves_out,
     :write_errors

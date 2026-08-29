@@ -426,8 +426,12 @@ defmodule Derpex.Router do
 
   def handle_call({:remove_forwarder, key, identity}, _from, state) do
     case Map.fetch(state.forwarders, key) do
-      {:ok, registered} -> {:reply, :ok, drop_forwarder(state, key, identity, registered)}
-      :error -> {:reply, :ok, state}
+      {:ok, registered} ->
+        {:reply, :ok, drop_forwarder(state, key, identity, registered)}
+
+      :error ->
+        note_remove_forwarder_other()
+        {:reply, :ok, state}
     end
   end
 
@@ -522,17 +526,26 @@ defmodule Derpex.Router do
         registered_identity == identity
       end)
 
-    publish_preferred_forwarder(key, entries)
-    forwarders = store_forwarders(state.forwarders, state.routes, key, entries)
+    if length(entries) == length(registered) do
+      note_remove_forwarder_other()
+      state
+    else
+      publish_preferred_forwarder(key, entries)
 
-    forwarder_monitors =
-      if length(entries) == length(registered) do
-        state.forwarder_monitors
-      else
-        remove_forwarder_monitor(state.forwarder_monitors, identity, key)
-      end
+      %{
+        state
+        | forwarders: store_forwarders(state.forwarders, state.routes, key, entries),
+          forwarder_monitors: remove_forwarder_monitor(state.forwarder_monitors, identity, key)
+      }
+    end
+  end
 
-    %{state | forwarders: forwarders, forwarder_monitors: forwarder_monitors}
+  # Go's `removePktForwardOther`: a removal naming a forwarder the map never
+  # held. Go counts only the unknown-identity case because an unknown key
+  # returns before its accounting; DERPEX keeps a single list per key, so both
+  # misses are the same bookkeeping drift and both are counted here.
+  defp note_remove_forwarder_other do
+    :ok = Metrics.add(Metrics.default_handle(), :remove_forwarder_other, 1)
   end
 
   defp remove_dead_forwarder(forwarders, routes, key, identity) do

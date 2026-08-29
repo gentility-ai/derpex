@@ -1,6 +1,7 @@
 defmodule Derpex.RouterTest do
   use ExUnit.Case, async: false
 
+  alias Derpex.Metrics
   alias Derpex.Outbox.Ring
   alias Derpex.Router
   alias Derpex.Router.ReversePaths
@@ -331,6 +332,71 @@ defmodule Derpex.RouterTest do
 
     assert Router.unregister(destination_key, destination) == :ok
     Enum.each([source_connection, destination], &Process.exit(&1, :kill))
+  end
+
+  test "removing one of two forwarders keeps the peer present and still routed" do
+    source = :crypto.strong_rand_bytes(32)
+    sender = :crypto.strong_rand_bytes(32)
+    destination_key = :crypto.strong_rand_bytes(32)
+    destination = spawn(fn -> Process.sleep(:infinity) end)
+    destination_ring = Ring.new(2)
+    first = Ring.new(2)
+    second = Ring.new(2)
+
+    assert Router.register(destination_key, destination, destination_ring) == :ok
+    assert Router.add_forwarder(source, :first, first) == :ok
+    assert Router.add_forwarder(source, :second, second) == :ok
+    assert Router.note_send(source, destination, destination_ring) == :ok
+
+    before = Metrics.snapshot()[:remove_forwarder_other]
+    assert Router.remove_forwarder(source, :first) == :ok
+
+    assert Ring.take(destination_ring) == :empty
+    assert Router.forwarder_count(source) == 1
+    assert Metrics.snapshot()[:remove_forwarder_other] == before
+
+    assert_enqueued(Router.route(sender, source, "still routed"))
+    assert Ring.take(second) == {:ok, {:forward_packet, sender, source, "still routed"}}
+    assert Ring.take(first) == :empty
+
+    assert Router.remove_forwarder(source, :second) == :ok
+    assert Ring.take(destination_ring) == {:ok, {:peer_gone, source, 0x00}}
+
+    assert Router.unregister(destination_key, destination) == :ok
+    Process.exit(destination, :kill)
+  end
+
+  test "removing an unregistered forwarder identity leaves the registered path alone" do
+    source = :crypto.strong_rand_bytes(32)
+    sender = :crypto.strong_rand_bytes(32)
+    destination_key = :crypto.strong_rand_bytes(32)
+    destination = spawn(fn -> Process.sleep(:infinity) end)
+    forwarder_process = spawn(fn -> Process.sleep(:infinity) end)
+    destination_ring = Ring.new(2)
+    forwarder_ring = Ring.new(2)
+
+    assert Router.register(destination_key, destination, destination_ring) == :ok
+    assert Router.add_forwarder(source, forwarder_process, forwarder_ring) == :ok
+    assert Router.note_send(source, destination, destination_ring) == :ok
+
+    before = Metrics.snapshot()[:remove_forwarder_other]
+    assert Router.remove_forwarder(source, :never_registered) == :ok
+    assert Router.remove_forwarder(:crypto.strong_rand_bytes(32), :never_registered) == :ok
+
+    assert Ring.take(destination_ring) == :empty
+    assert Router.forwarder_count(source) == 1
+    assert Metrics.snapshot()[:remove_forwarder_other] == before + 2
+
+    assert_enqueued(Router.route(sender, source, "still routed"))
+    assert Ring.take(forwarder_ring) == {:ok, {:forward_packet, sender, source, "still routed"}}
+
+    # The registered identity is still monitored, so its death still evicts it.
+    Process.exit(forwarder_process, :kill)
+    assert_eventually(fn -> Router.forwarder_count(source) == 0 end)
+    assert Ring.take(destination_ring) == {:ok, {:peer_gone, source, 0x00}}
+
+    assert Router.unregister(destination_key, destination) == :ok
+    Process.exit(destination, :kill)
   end
 
   test "a crashed last forwarder for a remote-only peer announces it as gone" do

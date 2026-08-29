@@ -15,6 +15,11 @@ defmodule Derpex.Router.ReversePaths do
   connection actually holds, not the size of the region.
 
   The tables are created by, and owned by, the `Derpex.Router` process.
+
+  Cost: recording a path is two `ordered_set` inserts, roughly +0.5 us over the
+  single insert this replaced. The writer currently calls `note/3` for every
+  relayed packet, so review B8 (note once per `{destination, source}` pair) is
+  the intended mitigation; until it lands the second insert is paid per packet.
   """
 
   alias Derpex.Outbox.Ring
@@ -37,12 +42,18 @@ defmodule Derpex.Router.ReversePaths do
 
   Repeating the same pair overwrites in place, so a source that keeps talking to
   the same destination never grows the index.
+
+  The two inserts are not atomic, so the order picks which half-written row is
+  survivable. `by_source` is written first: an interrupted `note/3` then leaves
+  a row that `take/1` still notifies and then deletes, which is the failure the
+  peer can recover from. Writing `by_connection` first would instead leave a row
+  that no `take/1` can ever see, silently owing the destination a `peerGone`.
   """
   @spec note(binary(), pid(), Ring.t()) :: :ok
   def note(<<source::binary-size(32)>>, connection, %Ring{} = lifecycle)
       when is_pid(connection) do
-    true = :ets.insert(@by_connection, {{connection, source}, lifecycle})
     true = :ets.insert(@by_source, {{source, connection}, lifecycle})
+    true = :ets.insert(@by_connection, {{connection, source}, lifecycle})
     :ok
   rescue
     ArgumentError -> :ok
@@ -85,10 +96,6 @@ defmodule Derpex.Router.ReversePaths do
   rescue
     ArgumentError -> :ok
   end
-
-  @doc "Returns the number of recorded reverse paths, for assertions and gauges."
-  @spec size() :: non_neg_integer()
-  def size, do: :ets.info(@by_source, :size)
 
   defp table_options do
     [
