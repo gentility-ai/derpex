@@ -1,6 +1,8 @@
 defmodule Derpex.HTTPClient do
   @moduledoc false
 
+  alias Derpex.HTTP1.Scan
+
   @default_timeout_ms 5_000
   @default_max_response_bytes 1_048_576
   @max_response_head_bytes 16_384
@@ -141,7 +143,7 @@ defmodule Derpex.HTTPClient do
   end
 
   defp receive_head(socket, buffer, scanned, deadline) do
-    case match_from(buffer, scanned, "\r\n\r\n") do
+    case Scan.match_from(buffer, scanned, "\r\n\r\n") do
       {length, 4} when length <= @max_response_head_bytes ->
         <<head::binary-size(^length), "\r\n\r\n", read_ahead::binary>> = buffer
         {:ok, head, read_ahead}
@@ -157,13 +159,6 @@ defmodule Derpex.HTTPClient do
           receive_head(socket, buffer <> data, byte_size(buffer), deadline)
         end
     end
-  end
-
-  # Rescans only the bytes that could hold a terminator straddling the previous
-  # read boundary, keeping incremental reads linear rather than quadratic.
-  defp match_from(buffer, scanned, pattern) do
-    start = max(0, scanned - (byte_size(pattern) - 1))
-    :binary.match(buffer, pattern, scope: {start, byte_size(buffer) - start})
   end
 
   defp parse_head(head) do
@@ -297,7 +292,7 @@ defmodule Derpex.HTTPClient do
   defp receive_line(socket, buffer, deadline), do: receive_line(socket, buffer, 0, deadline)
 
   defp receive_line(socket, buffer, scanned, deadline) do
-    case match_from(buffer, scanned, "\r\n") do
+    case Scan.match_from(buffer, scanned, "\r\n") do
       {length, 2} when length <= @max_chunk_line_bytes ->
         <<line::binary-size(^length), "\r\n", rest::binary>> = buffer
         {:ok, line, rest}
@@ -340,7 +335,7 @@ defmodule Derpex.HTTPClient do
     do: {:ok, chunks |> Enum.reverse() |> IO.iodata_to_binary()}
 
   defp receive_trailers(socket, buffer, scanned, deadline, chunks) do
-    case match_from(buffer, scanned, "\r\n\r\n") do
+    case Scan.match_from(buffer, scanned, "\r\n\r\n") do
       {length, 4} when length <= @max_response_head_bytes ->
         {:ok, chunks |> Enum.reverse() |> IO.iodata_to_binary()}
 

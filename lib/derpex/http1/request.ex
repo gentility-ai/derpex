@@ -21,6 +21,13 @@ defmodule Derpex.HTTP1.Request do
     end
   end
 
+  @doc "Returns every value of a case-insensitive header, matching Go Header.Values."
+  @spec header_values(t(), binary()) :: [binary()]
+  def header_values(%__MODULE__{headers: headers}, name) do
+    name = String.downcase(name, :ascii)
+    for {^name, value} <- headers, do: value
+  end
+
   @doc "Returns the normalized request path without a query string."
   @spec path(t()) :: binary()
   def path(%__MODULE__{target: target}) do

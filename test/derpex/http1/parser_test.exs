@@ -55,6 +55,23 @@ defmodule Derpex.HTTP1.ParserTest do
              {:error, :invalid_header}
   end
 
+  test "finds a terminator straddling the boundary at every split offset" do
+    head = "GET / HTTP/1.1\r\nHost: derp.example"
+
+    for split <- 0..3 do
+      <<first::binary-size(^split), second::binary>> = "\r\n\r\n"
+
+      assert {:more, parser} = Parser.push(Parser.new(), head <> first)
+
+      assert {:ok, request, "read-ahead", _parser} =
+               Parser.push(parser, second <> "read-ahead"),
+             "terminator split after #{split} of its 4 bytes was missed"
+
+      assert Request.header(request, "host") == "derp.example"
+    end
+  end
+
+  @tag :performance
   test "scans only the new bytes for the header terminator" do
     header_bytes = 400 * 1_024
     prefix = "GET / HTTP/1.1\r\nHost: derp.example\r\nX-Filler: "
