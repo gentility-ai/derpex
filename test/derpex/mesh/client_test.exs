@@ -3,6 +3,7 @@ defmodule Derpex.Mesh.ClientTest do
 
   alias Derpex.Certificates.Manual
   alias Derpex.ClientInfo
+  alias Derpex.Clock.Manual, as: ManualClock
   alias Derpex.Crypto
   alias Derpex.Frame
   alias Derpex.Frame.Body
@@ -342,6 +343,60 @@ defmodule Derpex.Mesh.ClientTest do
 
     assert_receive {:mesh_event, {:disconnected, :timeout}}, 6_000
     assert_receive {:stalled_authenticated, 2}, 6_000
+  end
+
+  test "a silent peer trips the receive deadline, withdraws forwarders, and reconnects" do
+    parent = self()
+    previous_clock = Application.fetch_env!(:derpex, :clock)
+    Application.put_env(:derpex, :clock, ManualClock)
+    on_exit(fn -> Application.put_env(:derpex, :clock, previous_clock) end)
+    start_supervised!({ManualClock, monotonic_time: 0})
+
+    {_server_public, server_private} = Crypto.generate_keypair()
+    {_local_public, local_private} = Crypto.generate_keypair()
+    mesh_key = :crypto.strong_rand_bytes(32)
+    remote_peer = :crypto.strong_rand_bytes(32)
+
+    {:ok, listener} =
+      :gen_tcp.listen(0, [:binary, packet: :raw, active: false, reuseaddr: true])
+
+    {:ok, {_ip, port}} = :inet.sockname(listener)
+
+    fake =
+      spawn(fn -> stalled_server(listener, server_private, mesh_key, remote_peer, parent) end)
+
+    on_exit(fn ->
+      :gen_tcp.close(listener)
+      if Process.alive?(fake), do: Process.exit(fake, :kill)
+    end)
+
+    _client =
+      start_supervised!(
+        {Client,
+         url: "http://127.0.0.1:#{port}/derp",
+         private_key: Secret.wrap(local_private),
+         mesh_key: Secret.wrap(mesh_key),
+         reconnect_interval: 5_000,
+         event_handler: fn event -> send(parent, {:mesh_event, event}) end}
+      )
+
+    assert_receive {:stalled_authenticated, 1}, 2_000
+    assert_receive {:mesh_event, {:peer_present, ^remote_peer}}, 2_000
+    assert_receive {:mesh_event, {:connected, _server_key}}, 2_000
+
+    source = :crypto.strong_rand_bytes(32)
+    assert Router.route(source, remote_peer, "before") in [{:ok, :wake}, {:ok, :coalesced}]
+
+    ManualClock.advance(119_999)
+    refute_receive {:mesh_event, {:disconnected, _early_reason}}, 100
+
+    ManualClock.advance(1)
+    assert_receive {:mesh_event, {:disconnected, :recv_timeout}}, 2_000
+    assert Router.route(source, remote_peer, "after") == {:dropped, :unknown_destination}
+
+    ManualClock.advance(5_000)
+    assert_receive {:stalled_authenticated, 2}, 2_000
+    assert_receive {:mesh_event, {:connected, _reconnected_key}}, 2_000
   end
 
   defp stalled_tls_server(listener, server_private, mesh_key, remote_peer, parent) do

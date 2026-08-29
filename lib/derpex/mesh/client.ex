@@ -15,6 +15,12 @@ defmodule Derpex.Mesh.Client do
   A timer owned by this process cannot do the job: it cannot interrupt a
   `:ssl.send/2` that is already blocked, and `:ssl.close/2` called from a
   helper deadlocks against that same blocked sender.
+
+  In the other direction a peer that stops speaking is caught by a two minute
+  receive deadline, rearmed on every byte the peer sends, matching the
+  `120 * time.Second` read deadline `derp.Client.Recv` sets before each frame.
+  A peer that misses it has its learned forwarders withdrawn and its
+  connection retried, so mesh routes never outlive the link that taught them.
   """
 
   use GenServer
@@ -34,10 +40,12 @@ defmodule Derpex.Mesh.Client do
 
   @wake_message :derpex_mesh_outbox_ready
   @reconnect_message :derpex_mesh_reconnect
+  @recv_deadline_message :derpex_mesh_recv_deadline
   @default_reconnect_interval 5_000
   @default_connect_timeout 10_000
   @default_queue_capacity 32
   @default_send_timeout 5_000
+  @default_recv_deadline 120_000
   @max_http_head_bytes 1 * 1_024 * 1_024
   @max_server_frame_bytes Frame.max_info_length() + Frame.nonce_length()
 
@@ -92,6 +100,8 @@ defmodule Derpex.Mesh.Client do
         connect_timeout: positive_option!(options, :connect_timeout, @default_connect_timeout),
         queue_capacity: positive_option!(options, :queue_capacity, @default_queue_capacity),
         send_timeout: positive_option!(options, :send_timeout, @default_send_timeout),
+        recv_deadline: positive_option!(options, :recv_deadline, @default_recv_deadline),
+        recv_timer: nil,
         tls_options: Keyword.get(options, :tls_options, []),
         socket: nil,
         decoder: Decoder.new(max_frame_length: @max_server_frame_bytes),
@@ -136,6 +146,12 @@ defmodule Derpex.Mesh.Client do
 
   def handle_info({@reconnect_message, _stale_token}, state), do: {:noreply, state}
 
+  def handle_info({@recv_deadline_message, token}, %{recv_timer: {token, _timer}} = state) do
+    {:noreply, disconnect_and_retry(%{state | recv_timer: nil}, :recv_timeout)}
+  end
+
+  def handle_info({@recv_deadline_message, _stale_token}, state), do: {:noreply, state}
+
   def handle_info(@wake_message, %{socket: nil} = state), do: {:noreply, state}
 
   def handle_info(@wake_message, state) do
@@ -171,6 +187,7 @@ defmodule Derpex.Mesh.Client do
     _state = withdraw_remote_peers(state)
     close_socket(state.socket)
     cancel_reconnect(state.reconnect_timer)
+    _state = cancel_recv_deadline(state)
     close_ring(state.ring)
     :ok
   end
@@ -185,6 +202,7 @@ defmodule Derpex.Mesh.Client do
         with {:ok, state} <- process_server_data(state, read_ahead),
              :ok <- active_once(state.socket),
              :ok <- cache_local_address(state.socket) do
+          state = arm_recv_deadline(state)
           dispatch_event(state, {:connected, state.remote_server_key})
           {:noreply, %{state | last_error: nil}}
         else
@@ -277,6 +295,8 @@ defmodule Derpex.Mesh.Client do
   end
 
   defp receive_socket_data(state, data) do
+    state = arm_recv_deadline(state)
+
     case process_server_data(state, data) do
       {:ok, state} ->
         case active_once(state.socket) do
@@ -363,6 +383,7 @@ defmodule Derpex.Mesh.Client do
     was_connected? = state.socket != nil
     ClientAddressTable.delete(self())
     close_socket(state.socket)
+    state = cancel_recv_deadline(state)
     state = withdraw_remote_peers(state)
     close_ring(state.ring)
 
@@ -418,6 +439,20 @@ defmodule Derpex.Mesh.Client do
   defp cancel_reconnect({_token, timer}) do
     _remaining = Clock.cancel_timer(timer)
     :ok
+  end
+
+  defp arm_recv_deadline(state) do
+    state = cancel_recv_deadline(state)
+    token = make_ref()
+    timer = Clock.send_after(self(), {@recv_deadline_message, token}, state.recv_deadline)
+    %{state | recv_timer: {token, timer}}
+  end
+
+  defp cancel_recv_deadline(%{recv_timer: nil} = state), do: state
+
+  defp cancel_recv_deadline(%{recv_timer: {_token, timer}} = state) do
+    _remaining = Clock.cancel_timer(timer)
+    %{state | recv_timer: nil}
   end
 
   defp new_ring(state) do
