@@ -89,6 +89,37 @@ defmodule Derpex.Certificates.BootTest do
              [ip_certificate_manager: {IPManager, "203.0.113.7"}, port: 443]
   end
 
+  test "refuses the self-signed IP issuer alongside operator certificates" do
+    assert {:error, message} =
+             Boot.plan(
+               ip_certificate_issuer: "self",
+               directory: "/var/lib/derpex",
+               hostname: "203.0.113.7",
+               certfile: "/run/secrets/derpex.crt",
+               keyfile: "/run/secrets/derpex.key"
+             )
+
+    assert message =~ "DERPEX_IP_CERT_ISSUER=self"
+    assert message =~ "DERPEX_TLS_CERTFILE"
+    assert message =~ "DERPEX_TLS_KEYFILE"
+
+    assert {:error, ^message} =
+             Boot.plan(
+               ip_certificate_issuer: "self",
+               directory: "/var/lib/derpex",
+               hostname: "203.0.113.7",
+               certfile: "/run/secrets/derpex.crt"
+             )
+  end
+
+  test "leaves operator certificates alone without the self-signed issuer" do
+    assert {:ok, plan} =
+             Boot.plan(certfile: "/run/secrets/derpex.crt", keyfile: "/run/secrets/derpex.key")
+
+    assert plan.ip_certificate_issuer == nil
+    assert Boot.children(plan) == []
+  end
+
   test "raises the same message it reports when a plan is demanded" do
     assert_raise ArgumentError, ~r/PLAN.md section 2.3/, fn ->
       Boot.plan!(mode: "letsencrypt", directory: "/var/lib/derpex", hostname: "derp.example.com")

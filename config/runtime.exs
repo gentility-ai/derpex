@@ -11,6 +11,26 @@ if config_env() == :prod do
 
   config :derpex, shutdown: [deadline_ms: shutdown_deadline_ms, poll_ms: 25]
 
+  certfile = System.get_env("DERPEX_TLS_CERTFILE")
+  keyfile = System.get_env("DERPEX_TLS_KEYFILE")
+
+  # `manual` is the only certificate mode DERPEX implements. The plan is
+  # resolved before anything else so an unimplemented mode is refused while the
+  # operator is still reading configuration errors, not after a listener has
+  # bound :443 — and it is refused whether or not a listener is configured, so
+  # a mesh-only or misconfigured node cannot hide the mistake.
+  certificate_options = [
+    mode: System.get_env("DERPEX_CERT_MODE", "manual"),
+    directory: System.get_env("DERPEX_CERT_DIR"),
+    hostname: System.get_env("DERPEX_CERT_HOSTNAME"),
+    ip_certificate_issuer: System.get_env("DERPEX_IP_CERT_ISSUER"),
+    certfile: certfile,
+    keyfile: keyfile
+  ]
+
+  certificate_plan = Derpex.Certificates.Boot.plan!(certificate_options)
+  config :derpex, certificates: certificate_options
+
   listen_port = System.get_env("DERPEX_LISTEN_PORT")
 
   if listen_port do
@@ -24,22 +44,7 @@ if config_env() == :prod do
       System.get_env("DERPEX_IDENTITY_PATH") ||
         raise "DERPEX_IDENTITY_PATH is required when a listener is enabled"
 
-    certfile = System.get_env("DERPEX_TLS_CERTFILE")
-    keyfile = System.get_env("DERPEX_TLS_KEYFILE")
     clear_http? = System.get_env("DERPEX_CLEAR_HTTP") == "1"
-
-    # `manual` is the only certificate mode DERPEX implements. Resolving the
-    # plan here refuses `letsencrypt` and `gcp` while the operator is still
-    # reading configuration errors, not after a listener has bound :443.
-    certificate_options = [
-      mode: System.get_env("DERPEX_CERT_MODE", "manual"),
-      directory: System.get_env("DERPEX_CERT_DIR"),
-      hostname: System.get_env("DERPEX_CERT_HOSTNAME"),
-      ip_certificate_issuer: System.get_env("DERPEX_IP_CERT_ISSUER")
-    ]
-
-    certificate_plan = Derpex.Certificates.Boot.plan!(certificate_options)
-
     mesh_key_text = System.get_env("DERPEX_MESH_KEY")
     mesh_with_text = System.get_env("DERPEX_MESH_WITH")
     disallowed_app_names_text = System.get_env("DERPEX_DISALLOWED_APP_NAMES")
@@ -527,7 +532,6 @@ if config_env() == :prod do
 
     config :derpex,
       accept_limit: accept_limit,
-      certificates: certificate_options,
       gentility: gentility,
       identity_path: identity_path,
       listeners: [listener],

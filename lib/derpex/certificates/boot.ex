@@ -35,6 +35,7 @@ defmodule Derpex.Certificates.Boot do
 
     with {:ok, issuer} <- issuer(Keyword.get(options, :ip_certificate_issuer)),
          :ok <- validate_mode(mode, directory, hostname, options),
+         :ok <- validate_operator_certificates(issuer, options),
          :ok <- validate_issuer(issuer, directory, hostname) do
       {:ok,
        %{
@@ -110,6 +111,22 @@ defmodule Derpex.Certificates.Boot do
      "DERPEX_IP_CERT_ISSUER must be \"self\", got #{inspect(other)}. ACME-issued IP " <>
        "certificates need an RFC 8555 client, which DERPEX has not implemented yet " <>
        "(PLAN.md section 2.3 records ACME as pending)."}
+  end
+
+  # Two certificate sources for one listener is an operator mistake with a
+  # silent outcome — whichever the listener happens to bind wins — so it is
+  # refused rather than resolved by precedence.
+  defp validate_operator_certificates(nil, _options), do: :ok
+
+  defp validate_operator_certificates(:self, options) do
+    if is_nil(Keyword.get(options, :certfile)) and is_nil(Keyword.get(options, :keyfile)) do
+      :ok
+    else
+      {:error,
+       "DERPEX_IP_CERT_ISSUER=self issues the listener's certificate itself and cannot be " <>
+         "combined with DERPEX_TLS_CERTFILE or DERPEX_TLS_KEYFILE. Unset the operator " <>
+         "certificate paths, or unset DERPEX_IP_CERT_ISSUER to serve them."}
+    end
   end
 
   defp validate_issuer(nil, _directory, _hostname), do: :ok

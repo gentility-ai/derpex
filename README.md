@@ -128,7 +128,22 @@ with an error naming PLAN.md section 2.3 rather than silently downgraded.
 IP address, the relay issues and caches a persistent self-signed certificate for
 that address (key `0600`, certificate `0644`) and serves it to SNI and no-SNI
 hellos alike. It contacts no certificate authority. Any other value of
-`DERPEX_IP_CERT_ISSUER` is rejected at boot.
+`DERPEX_IP_CERT_ISSUER` is rejected at boot, as is combining it with
+`DERPEX_TLS_CERTFILE` or `DERPEX_TLS_KEYFILE`: two certificate sources for one
+listener is an operator mistake with a silent outcome, so it is refused rather
+than resolved by precedence.
+
+A certificate is served while it is inside its validity window and is renewed in
+the background once less than a third of its lifetime remains, so no handshake
+ever waits on an issuance unless there is nothing valid to serve. A failed
+issuance backs off from one minute to thirty, and the certificate already in hand
+keeps answering throughout. An SNI naming a different IP address, or a DNS name,
+is refused with a TLS `unrecognized_name` alert rather than answered with the
+listener's own certificate.
+
+The certificate plan is resolved before anything else starts, whether or not
+`DERPEX_LISTEN_PORT` is set, so a configuration mistake stops the boot rather
+than surfacing later.
 
 The server identity is created atomically with mode `0600` and is stable across
 restarts. The UDP STUN service listens on port `3478` by default whenever the
