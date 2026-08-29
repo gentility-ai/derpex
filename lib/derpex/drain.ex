@@ -245,7 +245,11 @@ defmodule Derpex.Drain do
       reconnect_ms =
         min(config.reconnect_ms + jitter(state.jitter, config.jitter_ms), @maximum_frame_value)
 
-      case Ring.enqueue(lifecycle, {:restarting, reconnect_ms, config.try_for_ms}) do
+      # The coordinator notifies every home connection in one call, so it never
+      # naps on one connection's ring lock while the rest wait.
+      notice = {:restarting, reconnect_ms, config.try_for_ms}
+
+      case Ring.enqueue(lifecycle, notice, wait: false) do
         {:ok, _result} -> {enqueued + 1, dropped}
         {:dropped, _reason} -> {enqueued, dropped + 1}
       end

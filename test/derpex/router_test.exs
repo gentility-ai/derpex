@@ -358,6 +358,55 @@ defmodule Derpex.RouterTest do
     end)
   end
 
+  test "a watcher whose ring lock is held cannot delay the router" do
+    parent = self()
+    key = :crypto.strong_rand_bytes(32)
+    connection = spawn(fn -> Process.sleep(:infinity) end)
+    ring = Ring.new(2)
+
+    watchers =
+      Enum.map(1..100, fn _index ->
+        watcher_ring = Ring.new(2, test_hook: holding_hook(parent))
+        watcher = spawn(fn -> Process.sleep(:infinity) end)
+        assert Router.watch(watcher, watcher_ring) == :ok
+        holder = spawn(fn -> Ring.enqueue(watcher_ring, :held) end)
+        assert_receive {:holding, ^holder}
+        {watcher, holder}
+      end)
+
+    on_exit(fn ->
+      Router.unregister(key, connection)
+      Process.exit(connection, :kill)
+
+      Enum.each(watchers, fn {watcher, holder} ->
+        Process.exit(holder, :kill)
+        Process.exit(watcher, :kill)
+      end)
+    end)
+
+    {elapsed_microseconds, :ok} =
+      :timer.tc(fn -> Router.register(key, connection, ring, ring, ring) end)
+
+    # Napping on each held lock would cost milliseconds per watcher.
+    assert elapsed_microseconds < 5_000
+  end
+
+  defp holding_hook(parent) do
+    fn
+      :after_journal ->
+        if self() != parent do
+          send(parent, {:holding, self()})
+
+          receive do
+            :release -> :ok
+          end
+        end
+
+      _phase ->
+        :ok
+    end
+  end
+
   defp count_ring(ring, count \\ 0) do
     case Ring.take(ring) do
       {:ok, _message} -> count_ring(ring, count + 1)
