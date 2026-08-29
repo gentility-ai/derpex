@@ -85,6 +85,10 @@ defmodule Derpex.Certificates.Reloader do
 
   @impl true
   def init(options) do
+    # Without this a supervisor shutdown kills the process outright and
+    # `terminate/2` never runs, leaving a stale snapshot in `:persistent_term`.
+    _previous = Process.flag(:trap_exit, true)
+
     state = %{
       snapshot_key: Keyword.fetch!(options, :snapshot_key),
       certificate_path: Keyword.fetch!(options, :certificate_path),

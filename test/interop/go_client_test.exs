@@ -3,12 +3,40 @@ defmodule Derpex.Interop.GoClientTest do
 
   @moduletag :go_interop
 
-  alias Derpex.Certificates
   alias Derpex.Certificates.Manual
   alias Derpex.Crypto
   alias Derpex.Listener.Handler
+  alias Derpex.ListenerSupervisor
   alias Derpex.ServerInfo
   alias Derpex.STUN
+
+  # TLS scenarios run through ListenerSupervisor so the Go and tsnet gates
+  # exercise the certificate reloader's paused-handshake path, not the plain
+  # upstream one.
+  defp start_tls_listener(certificate_path, key_path, server_private) do
+    listener = [
+      port: 0,
+      transport_module: ThousandIsland.Transports.SSL,
+      certificate_reload_interval_ms: 60_000,
+      num_acceptors: 1,
+      transport_options: [
+        certfile: certificate_path,
+        keyfile: key_path,
+        ip: {127, 0, 0, 1},
+        versions: [:"tlsv1.3"],
+        alpn_preferred_protocols: ["http/1.1"],
+        send_timeout: 2_000,
+        send_timeout_close: true
+      ]
+    ]
+
+    start_supervised!({ListenerSupervisor, {[listener], server_private}})
+    |> Supervisor.which_children()
+    |> Enum.find_value(fn
+      {{ThousandIsland, _index}, pid, _type, _modules} -> pid
+      _other -> nil
+    end)
+  end
 
   test "unchanged official derphttp.Client authenticates to DERPEX" do
     upstream =
@@ -188,7 +216,7 @@ defmodule Derpex.Interop.GoClientTest do
 
   test "official Go client uses TLS 1.3 metacertificate fast start" do
     upstream = System.fetch_env!("DERPEX_TAILSCALE_DIR")
-    {server_public, server_private} = Crypto.generate_keypair()
+    {_server_public, server_private} = Crypto.generate_keypair()
     directory = Path.join(System.tmp_dir!(), "derpex-tls-#{System.unique_integer([:positive])}")
     certificate = Path.join(directory, "certificate.pem")
     private_key = Path.join(directory, "private-key.pem")
@@ -220,29 +248,7 @@ defmodule Derpex.Interop.GoClientTest do
 
     assert is_binary(openssl_output)
 
-    transport_options =
-      Certificates.transport_options(certificate, private_key, server_public) ++
-        [
-          ip: {127, 0, 0, 1},
-          versions: [:"tlsv1.3"],
-          alpn_preferred_protocols: ["http/1.1"],
-          send_timeout: 2_000,
-          send_timeout_close: true
-        ]
-
-    {:ok, server} =
-      ThousandIsland.start_link(
-        port: 0,
-        transport_module: ThousandIsland.Transports.SSL,
-        transport_options: transport_options,
-        num_acceptors: 1,
-        handler_module: Handler,
-        handler_options: [server_private_key: server_private]
-      )
-
-    on_exit(fn ->
-      if Process.alive?(server), do: Process.exit(server, :shutdown)
-    end)
+    server = start_tls_listener(certificate, private_key, server_private)
 
     {:ok, {_ip, port}} = ThousandIsland.listener_info(server)
     helper = Path.expand("../../interop/go/tls_smoke.go", __DIR__)
@@ -262,7 +268,7 @@ defmodule Derpex.Interop.GoClientTest do
 
   test "official Go region client accepts a raw-IP certificate pin" do
     upstream = System.fetch_env!("DERPEX_TAILSCALE_DIR")
-    {server_public, server_private} = Crypto.generate_keypair()
+    {_server_public, server_private} = Crypto.generate_keypair()
 
     directory =
       Path.join(System.tmp_dir!(), "derpex-pinned-#{System.unique_integer([:positive])}")
@@ -270,33 +276,7 @@ defmodule Derpex.Interop.GoClientTest do
     on_exit(fn -> File.rm_rf!(directory) end)
     {:ok, manual} = Manual.load_or_create(directory, "127.0.0.1")
 
-    transport_options =
-      Certificates.transport_options(
-        manual.certificate_path,
-        manual.key_path,
-        server_public
-      ) ++
-        [
-          ip: {127, 0, 0, 1},
-          versions: [:"tlsv1.3"],
-          alpn_preferred_protocols: ["http/1.1"],
-          send_timeout: 2_000,
-          send_timeout_close: true
-        ]
-
-    {:ok, server} =
-      ThousandIsland.start_link(
-        port: 0,
-        transport_module: ThousandIsland.Transports.SSL,
-        transport_options: transport_options,
-        num_acceptors: 1,
-        handler_module: Handler,
-        handler_options: [server_private_key: server_private]
-      )
-
-    on_exit(fn ->
-      if Process.alive?(server), do: Process.exit(server, :shutdown)
-    end)
+    server = start_tls_listener(manual.certificate_path, manual.key_path, server_private)
 
     {:ok, {_ip, port}} = ThousandIsland.listener_info(server)
     helper = Path.expand("../../interop/go/pinned_cert_smoke.go", __DIR__)

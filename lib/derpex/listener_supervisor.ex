@@ -74,8 +74,8 @@ defmodule Derpex.ListenerSupervisor do
 
       transport_options =
         transport_options
-        |> Keyword.put(:sni_fun, Reloader.sni_fun(snapshot_key))
-        |> Keyword.put(Transports.SSL.snapshot_option(), snapshot_key)
+        |> put_transport_option(:sni_fun, Reloader.sni_fun(snapshot_key))
+        |> put_transport_option(Transports.SSL.snapshot_option(), snapshot_key)
 
       options = Keyword.put(options, :transport_options, transport_options)
 
@@ -131,10 +131,7 @@ defmodule Derpex.ListenerSupervisor do
         loaded = Certificates.transport_options(certfile, keyfile, server_public_key)
 
         transport_options =
-          transport_options
-          |> Keyword.delete(:certfile)
-          |> Keyword.delete(:keyfile)
-          |> Keyword.merge(loaded)
+          drop_transport_options(transport_options, [:certfile, :keyfile, :certs_keys]) ++ loaded
 
         Keyword.put(options, :transport_options, transport_options)
       else
@@ -143,6 +140,21 @@ defmodule Derpex.ListenerSupervisor do
     else
       options
     end
+  end
+
+  # `transport_options` reach `:ssl.listen/2` and `:gen_tcp.listen/2`, which
+  # accept bare atoms (`:inet6`, `:binary`) and `{:raw, _, _, _}` tuples
+  # alongside `{key, value}` pairs. `Keyword` functions raise on those, so
+  # rewriting the list has to go through proplist-tolerant helpers.
+  defp put_transport_option(options, key, value) do
+    drop_transport_options(options, [key]) ++ [{key, value}]
+  end
+
+  defp drop_transport_options(options, keys) do
+    Enum.reject(options, fn
+      {key, _value} -> key in keys
+      _other_option -> false
+    end)
   end
 
   defp configure_transport(options) do

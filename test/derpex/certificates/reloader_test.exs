@@ -23,7 +23,7 @@ defmodule Derpex.Certificates.ReloaderTest do
         interval_ms: 60_000
       )
 
-    on_exit(fn -> if Process.alive?(reloader), do: GenServer.stop(reloader) end)
+    on_exit(fn -> stop_reloader(reloader) end)
 
     assert current_leaf(snapshot_key) == active.certificate_der
     rotate_files(active, replacement)
@@ -55,7 +55,7 @@ defmodule Derpex.Certificates.ReloaderTest do
         interval_ms: 60_000
       )
 
-    on_exit(fn -> if Process.alive?(reloader), do: GenServer.stop(reloader) end)
+    on_exit(fn -> stop_reloader(reloader) end)
 
     File.cp!(replacement.key_path, active.key_path)
     assert Reloader.reload(reloader) == {:error, :private_key_mismatch}
@@ -71,6 +71,13 @@ defmodule Derpex.Certificates.ReloaderTest do
     assert log =~ "DERP TLS certificate reload failed: invalid_private_key"
     refute log =~ "<<"
     assert %{last_error: :invalid_private_key} = Reloader.stats(reloader)
+
+    File.write!(active.certificate_path, "-----BEGIN NOTHING-----\n")
+    assert Reloader.reload(reloader) == {:error, :invalid_certificate}
+
+    File.cp!(replacement.certificate_path, active.certificate_path)
+    File.rm!(active.key_path)
+    assert Reloader.reload(reloader) == {:error, :missing_key_file}
 
     File.rm!(active.certificate_path)
     assert Reloader.reload(reloader) == {:error, :missing_certificate_file}
@@ -116,8 +123,51 @@ defmodule Derpex.Certificates.ReloaderTest do
     assert ThousandIsland.listener_info(listener_pid) == {:ok, listener_info}
   end
 
+  test "listeners sharing a port but not an address keep their own certificate" do
+    {first, second} = certificate_pair_directories()
+    {_server_public, server_private} = Crypto.generate_keypair()
+    port = free_loopback_port()
+
+    listeners = [
+      listener(first, port: port),
+      listener(second, port: port, ip: {0, 0, 0, 0, 0, 0, 0, 1}, family: :inet6)
+    ]
+
+    supervisor = start_supervised!({ListenerSupervisor, {listeners, server_private}})
+    [first_listener, second_listener] = listener_pids(supervisor)
+
+    assert peer_certificate(first_listener, nil) == first.certificate_der
+    assert peer_certificate(second_listener, nil) == second.certificate_der
+  end
+
+  # The reloader traps exits, so it shuts down with the linking test process
+  # rather than outliving it; the on_exit stop is best effort.
+  defp stop_reloader(reloader) do
+    if Process.alive?(reloader), do: GenServer.stop(reloader)
+    :ok
+  catch
+    :exit, _already_stopping -> :ok
+  end
+
+  defp free_loopback_port do
+    {:ok, socket} = :gen_tcp.listen(0, ip: {127, 0, 0, 1}, reuseaddr: true)
+    {:ok, {_ip, port}} = :inet.sockname(socket)
+    :ok = :gen_tcp.close(socket)
+    port
+  end
+
+  defp listener_pids(supervisor) do
+    supervisor
+    |> Supervisor.which_children()
+    |> Enum.flat_map(fn
+      {{ThousandIsland, index}, pid, _type, _modules} -> [{index, pid}]
+      _other -> []
+    end)
+    |> Enum.sort()
+    |> Enum.map(&elem(&1, 1))
+  end
+
   defp open_idle_connection(listener) do
-    {:ok, {_ip, port}} = ThousandIsland.listener_info(listener)
     openssl = System.find_executable("openssl") || flunk("openssl is required for this test")
     {:ok, existing} = ThousandIsland.connection_pids(listener)
 
@@ -128,7 +178,7 @@ defmodule Derpex.Certificates.ReloaderTest do
           :binary,
           :exit_status,
           :stderr_to_stdout,
-          args: ["s_client", "-connect", "127.0.0.1:#{port}", "-noservername", "-quiet"]
+          args: ["s_client", "-connect", connect_target(listener), "-noservername", "-quiet"]
         ]
       )
 
@@ -152,20 +202,27 @@ defmodule Derpex.Certificates.ReloaderTest do
     end
   end
 
-  defp listener(active) do
+  defp listener(active, overrides \\ []) do
+    {family, overrides} = Keyword.pop(overrides, :family)
+    {ip, overrides} = Keyword.pop(overrides, :ip, {127, 0, 0, 1})
+
+    transport_options =
+      [
+        certfile: active.certificate_path,
+        keyfile: active.key_path,
+        ip: ip,
+        versions: [:"tlsv1.3"],
+        alpn_preferred_protocols: ["http/1.1"]
+      ] ++ List.wrap(family)
+
     [
       port: 0,
       transport_module: ThousandIsland.Transports.SSL,
       certificate_reload_interval_ms: 60_000,
       num_acceptors: 1,
-      transport_options: [
-        certfile: active.certificate_path,
-        keyfile: active.key_path,
-        ip: {127, 0, 0, 1},
-        versions: [:"tlsv1.3"],
-        alpn_preferred_protocols: ["http/1.1"]
-      ]
+      transport_options: transport_options
     ]
+    |> Keyword.merge(overrides)
   end
 
   defp certificate_pair_directories do
@@ -200,8 +257,14 @@ defmodule Derpex.Certificates.ReloaderTest do
     |> tap(&assert(is_pid(&1)))
   end
 
+  defp connect_target(listener) do
+    {:ok, {ip, port}} = ThousandIsland.listener_info(listener)
+    host = ip |> :inet.ntoa() |> List.to_string()
+    host = if tuple_size(ip) == 8, do: "[" <> host <> "]", else: host
+    host <> ":" <> Integer.to_string(port)
+  end
+
   defp peer_certificate(listener, server_name) do
-    {:ok, {_ip, port}} = ThousandIsland.listener_info(listener)
     openssl = System.find_executable("openssl") || flunk("openssl is required for this test")
 
     server_name_arguments =
@@ -215,7 +278,7 @@ defmodule Derpex.Certificates.ReloaderTest do
           :exit_status,
           :stderr_to_stdout,
           args:
-            ["s_client", "-connect", "127.0.0.1:#{port}", "-showcerts"] ++
+            ["s_client", "-connect", connect_target(listener), "-showcerts"] ++
               server_name_arguments
         ]
       )
