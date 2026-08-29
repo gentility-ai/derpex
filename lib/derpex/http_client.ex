@@ -118,7 +118,7 @@ defmodule Derpex.HTTPClient do
   defp close({:ssl, socket}), do: :ssl.close(socket)
 
   defp receive_response(socket, deadline, max_response_bytes) do
-    case receive_head(socket, "", deadline) do
+    case receive_head(socket, "", 0, deadline) do
       {:ok, head, read_ahead} ->
         receive_parsed_response(socket, head, read_ahead, deadline, max_response_bytes)
 
@@ -140,8 +140,8 @@ defmodule Derpex.HTTPClient do
     end
   end
 
-  defp receive_head(socket, buffer, deadline) do
-    case :binary.match(buffer, "\r\n\r\n") do
+  defp receive_head(socket, buffer, scanned, deadline) do
+    case match_from(buffer, scanned, "\r\n\r\n") do
       {length, 4} when length <= @max_response_head_bytes ->
         <<head::binary-size(^length), "\r\n\r\n", read_ahead::binary>> = buffer
         {:ok, head, read_ahead}
@@ -154,9 +154,16 @@ defmodule Derpex.HTTPClient do
 
       :nomatch ->
         with {:ok, data} <- receive_data(socket, deadline) do
-          receive_head(socket, buffer <> data, deadline)
+          receive_head(socket, buffer <> data, byte_size(buffer), deadline)
         end
     end
+  end
+
+  # Rescans only the bytes that could hold a terminator straddling the previous
+  # read boundary, keeping incremental reads linear rather than quadratic.
+  defp match_from(buffer, scanned, pattern) do
+    start = max(0, scanned - (byte_size(pattern) - 1))
+    :binary.match(buffer, pattern, scope: {start, byte_size(buffer) - start})
   end
 
   defp parse_head(head) do
@@ -287,8 +294,10 @@ defmodule Derpex.HTTPClient do
     end
   end
 
-  defp receive_line(socket, buffer, deadline) do
-    case :binary.match(buffer, "\r\n") do
+  defp receive_line(socket, buffer, deadline), do: receive_line(socket, buffer, 0, deadline)
+
+  defp receive_line(socket, buffer, scanned, deadline) do
+    case match_from(buffer, scanned, "\r\n") do
       {length, 2} when length <= @max_chunk_line_bytes ->
         <<line::binary-size(^length), "\r\n", rest::binary>> = buffer
         {:ok, line, rest}
@@ -301,7 +310,7 @@ defmodule Derpex.HTTPClient do
 
       :nomatch ->
         with {:ok, data} <- receive_data(socket, deadline) do
-          receive_line(socket, buffer <> data, deadline)
+          receive_line(socket, buffer <> data, byte_size(buffer), deadline)
         end
     end
   end
@@ -324,11 +333,14 @@ defmodule Derpex.HTTPClient do
     end
   end
 
-  defp receive_trailers(_socket, "\r\n" <> _rest, _deadline, chunks),
+  defp receive_trailers(socket, buffer, deadline, chunks),
+    do: receive_trailers(socket, buffer, 0, deadline, chunks)
+
+  defp receive_trailers(_socket, "\r\n" <> _rest, _scanned, _deadline, chunks),
     do: {:ok, chunks |> Enum.reverse() |> IO.iodata_to_binary()}
 
-  defp receive_trailers(socket, buffer, deadline, chunks) do
-    case :binary.match(buffer, "\r\n\r\n") do
+  defp receive_trailers(socket, buffer, scanned, deadline, chunks) do
+    case match_from(buffer, scanned, "\r\n\r\n") do
       {length, 4} when length <= @max_response_head_bytes ->
         {:ok, chunks |> Enum.reverse() |> IO.iodata_to_binary()}
 
@@ -340,7 +352,7 @@ defmodule Derpex.HTTPClient do
 
       :nomatch ->
         with {:ok, data} <- receive_data(socket, deadline) do
-          receive_trailers(socket, buffer <> data, deadline, chunks)
+          receive_trailers(socket, buffer <> data, byte_size(buffer), deadline, chunks)
         end
     end
   end

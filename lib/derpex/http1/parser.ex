@@ -34,9 +34,10 @@ defmodule Derpex.HTTP1.Parser do
   @spec push(t(), binary()) ::
           {:more, t()} | {:ok, Request.t(), binary(), t()} | {:error, atom()}
   def push(%__MODULE__{} = parser, chunk) when is_binary(chunk) do
-    buffer = parser.buffer <> chunk
+    scanned = parser.buffer
+    buffer = scanned <> chunk
 
-    case :binary.match(buffer, "\r\n\r\n") do
+    case match_terminator(buffer, byte_size(scanned)) do
       {head_length, 4} when head_length + 4 <= parser.max_header_bytes ->
         <<head::binary-size(^head_length), "\r\n\r\n", read_ahead::binary>> = buffer
 
@@ -54,6 +55,14 @@ defmodule Derpex.HTTP1.Parser do
       :nomatch ->
         {:more, %{parser | buffer: buffer}}
     end
+  end
+
+  # Only bytes that could start a terminator straddling the previous chunk
+  # boundary are rescanned, so incremental pushes stay linear in total size
+  # instead of quadratic.
+  defp match_terminator(buffer, already_scanned_bytes) do
+    start = max(0, already_scanned_bytes - 3)
+    :binary.match(buffer, "\r\n\r\n", scope: {start, byte_size(buffer) - start})
   end
 
   defp parse_head(parser, head) do

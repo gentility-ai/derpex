@@ -543,14 +543,18 @@ defmodule Derpex.Mesh.Client do
   end
 
   defp receive_http_upgrade(socket, timeout),
-    do: receive_http_upgrade(socket, "", timeout)
+    do: receive_http_upgrade(socket, "", 0, timeout)
 
-  defp receive_http_upgrade(_socket, buffer, _timeout)
+  defp receive_http_upgrade(_socket, buffer, _scanned, _timeout)
        when byte_size(buffer) > @max_http_head_bytes,
        do: {:error, :http_head_too_large}
 
-  defp receive_http_upgrade(socket, buffer, timeout) do
-    case :binary.match(buffer, "\r\n\r\n") do
+  defp receive_http_upgrade(socket, buffer, scanned, timeout) do
+    # Rescan only the bytes that could hold a terminator straddling the
+    # previous read boundary, keeping incremental reads linear.
+    start = max(0, scanned - 3)
+
+    case :binary.match(buffer, "\r\n\r\n", scope: {start, byte_size(buffer) - start}) do
       {head_length, 4} ->
         <<head::binary-size(^head_length), "\r\n\r\n", read_ahead::binary>> = buffer
 
@@ -561,7 +565,7 @@ defmodule Derpex.Mesh.Client do
 
       :nomatch ->
         case socket_recv(socket, timeout) do
-          {:ok, data} -> receive_http_upgrade(socket, buffer <> data, timeout)
+          {:ok, data} -> receive_http_upgrade(socket, buffer <> data, byte_size(buffer), timeout)
           {:error, reason} -> {:error, reason}
         end
     end
