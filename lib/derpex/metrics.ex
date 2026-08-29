@@ -27,7 +27,8 @@ defmodule Derpex.Metrics do
     :packets_forwarded_in,
     :home_moves_in,
     :home_moves_out,
-    :write_errors
+    :write_errors,
+    :ring_producer_naps
   ]
 
   @drop_reasons [

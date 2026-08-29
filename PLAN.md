@@ -102,6 +102,15 @@ so they are not implemented by accident:
   payload is under 200 bytes and the frame is read before the peer is
   authenticated. A conforming client is never affected; an oversize frame is
   closed at its header instead of after its body.
+- Section 3.3 requires that a sender is never suspended by a destination's
+  queue. DERPEX suspends one for up to about four milliseconds when that
+  destination's outbox ring lock is held for that long, because Go's channel
+  send never loses a packet the queue has room for and DERPEX's ETS lock,
+  unlike a channel, can be held across a scheduler preemption. The budget is
+  wall-clock bounded, the naps inside it are counted as
+  `derp_ring_producer_naps`, exceeding it is a counted tail drop, and callers
+  that must not sleep for one destination — the router and the drain
+  coordinator — enqueue with `wait: false`. See ADR 0001.
 
 ### 2.4 Compatibility precedence
 

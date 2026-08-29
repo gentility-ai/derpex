@@ -16,7 +16,7 @@ of ETS packet slots. Head, size, wake state, closure, and counters live in
 
 - an uncontended enqueue publishes directly into a fixed slot;
 - a full ring overwrites the oldest slot and advances the head;
-- a held lock is retried a bounded number of times and then tail-dropped;
+- a held lock is retried inside a wall-clock budget and then tail-dropped;
 - the writer receives one coalesced atom and pulls packets from ETS;
 - no packet or packet reference is sent to a process mailbox.
 
@@ -51,16 +51,34 @@ number of senders that fan into one destination at once: eight producers
 enqueuing in a tight loop (no work between packets) turn most attempts into
 counted tail drops, while a realistic relay flow drops none.
 
-The retry budget is not an optimisation. Measured against the pinned Go DERP
-prober (100 MB, thirty packets in flight, thirty-two ring slots, so the ring
-always has room), a producer that made a single attempt lost roughly one packet
-per fifteen hundred and failed the interop gate in a fifth of runs. Contended
-acquisitions were rare — about seven in the whole transfer — but a few needed
-hundreds of retries, because the holder can exhaust its reduction budget inside
-the critical section and has to be rescheduled before it can release the lock.
-Dropping a packet the ring has room for is a loss the Go relay does not take, so
-producers yield the scheduler for a bounded number of attempts and then sleep
-for a bounded number of further attempts before dropping.
+The retry budget is a deliberate, documented deviation from PLAN §3.3 and §3.5,
+which say a sender enqueues without ever being suspended. A sender can be
+suspended here, by up to the acquisition budget of about four milliseconds, and
+only when the destination ring's lock is held that long.
+
+The deviation is not an optimisation. Measured against the pinned Go DERP prober
+(100 MB in 1526 packets, thirty in flight, thirty-two ring slots, so the ring
+always has room), producers that made a single lock attempt failed the interop
+gate in four runs out of ten; each failing run showed exactly one counted tail
+drop, and one lost packet is enough, because the prober compares payloads in
+order. Contention itself is rare: with the current budget, instrumented runs of
+the same transfer showed between zero and twelve retried attempts each, and the
+nap tier fired once across eight transfers. What makes the rare case expensive is
+that the lock holder can exhaust its reduction budget inside the critical section
+and has to be rescheduled before it can release. Dropping a packet the ring has
+room for is a loss the Go relay does not take.
+
+The budget is bounded by the wall clock rather than by an attempt count, because
+`:erlang.yield/0` returns in microseconds on an idle node and in tens of
+milliseconds behind a long run queue, so a fixed number of yields is not a bound
+on anything. Producers yield a few times, then nap in one-millisecond steps, and
+every tier re-checks the same deadline. Each nap increments
+`derp_ring_producer_naps`, so a relay that starts paying the budget says so.
+
+Callers that must never sleep on behalf of one destination pass `wait: false`,
+which keeps the yield tier and drops the naps. The router and the drain
+coordinator use it: they are singletons, and a millisecond spent waiting for one
+connection's writer is a millisecond every other connection waits too.
 
 What producers must not have is shared waiting state. An earlier revision
 counted waiting producers and made the consumer defer to that count; a producer
