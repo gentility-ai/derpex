@@ -523,7 +523,10 @@ defmodule Derpex.ACME.Client do
        ) do
     with {:ok, month} <- month_number(month),
          {:ok, at, 0} <- DateTime.from_iso8601("#{year}-#{month}-#{date}T#{time}Z") do
-      at |> DateTime.diff(DateTime.utc_now(), :millisecond) |> max(@minimum_retry_ms)
+      at
+      |> DateTime.to_unix(:millisecond)
+      |> Kernel.-(Clock.system_time(:millisecond))
+      |> max(@minimum_retry_ms)
     else
       _unparsable -> @default_retry_ms
     end

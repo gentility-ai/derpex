@@ -150,8 +150,12 @@ defmodule Derpex.ACME.HTTP do
   # refused rather than followed.
   defp same_origin(_uri, nil), do: :ok
 
-  defp same_origin(%URI{scheme: scheme, host: host} = uri, origin) do
-    if {scheme, host, port(uri)} == origin do
+  defp same_origin(%URI{scheme: scheme, host: host} = uri, {_scheme, expected, _port} = origin) do
+    # A host name is case insensitive, so an authority answering with a
+    # differently cased spelling of its own name is the same authority.
+    origin = put_elem(origin, 1, String.downcase(expected, :ascii))
+
+    if {scheme, String.downcase(host, :ascii), port(uri)} == origin do
       :ok
     else
       {:error, {:acme_cross_origin_url, URI.to_string(uri), origin}}

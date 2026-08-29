@@ -3,8 +3,8 @@ defmodule Derpex.HTTPAdmissionTest do
 
   import ExUnit.CaptureLog
 
-  alias Derpex.Certificates.Manual
   alias Derpex.HTTPAdmission
+  alias Derpex.Test.CertificateAuthority
 
   @node_key :binary.copy(<<0xAB>>, 32)
 
@@ -169,7 +169,11 @@ defmodule Derpex.HTTPAdmissionTest do
   end
 
   test "verifies an HTTPS controller certificate and decision" do
-    assert {:ok, {certificate, private_key}} = Manual.generate_ip("127.0.0.1")
+    # A real chain, because `Derpex.HTTPClient` no longer lets a caller accept a
+    # self-signed peer through a permissive `verify_fun`: the client pins the
+    # root and OTP builds the path, exactly as it would in production.
+    authority = CertificateAuthority.new()
+    {certificate, private_key} = CertificateAuthority.issue_ip(authority, "127.0.0.1")
 
     {:ok, listener} =
       :ssl.listen(0,
@@ -203,27 +207,6 @@ defmodule Derpex.HTTPAdmissionTest do
         end
       end)
 
-    verify_test_certificate = fn otp_certificate, der_certificate, event, state ->
-      case event do
-        {:bad_cert, :selfsigned_peer} ->
-          if der_certificate == certificate and
-               :public_key.pkix_verify_hostname(otp_certificate, ip: {127, 0, 0, 1}) do
-            {:valid, state}
-          else
-            {:fail, event}
-          end
-
-        {:bad_cert, _reason} ->
-          {:fail, event}
-
-        {:extension, _extension} ->
-          {:unknown, state}
-
-        valid when valid in [:valid, :valid_peer] ->
-          {:valid, state}
-      end
-    end
-
     assert :ok =
              HTTPAdmission.admit(
                @node_key,
@@ -231,10 +214,7 @@ defmodule Derpex.HTTPAdmissionTest do
                url: "https://127.0.0.1:#{port}/admit",
                fail_open: false,
                timeout_ms: 1_000,
-               tls_options: [
-                 cacerts: [certificate],
-                 verify_fun: {verify_test_certificate, nil}
-               ]
+               tls_options: [cacerts: [authority.certificate]]
              )
 
     await_server(server)

@@ -81,9 +81,11 @@ defmodule Derpex.ListenerSupervisor do
       |> Keyword.put(:server_private_key, private_key)
       |> Keyword.put(:server_public_key, public_key)
 
+    {listener_maximum, options} = Keyword.pop(options, :max_connections)
+
     options =
       options
-      |> Keyword.put_new(:num_connections, connections_per_acceptor(options))
+      |> Keyword.put_new(:num_connections, connections_per_acceptor(options, listener_maximum))
       |> Keyword.put_new(:read_timeout, read_timeout_ms())
       |> Keyword.put(:handler_module, Handler)
       |> Keyword.put(:handler_options, handler_options)
@@ -97,13 +99,17 @@ defmodule Derpex.ListenerSupervisor do
   # Thousand Island counts connections per acceptor, so a relay with a hundred
   # acceptors and the library default would accept 1.6 million of them. The cap
   # is a whole-listener number, divided by the acceptors that share it.
-  defp connections_per_acceptor(options) do
+  #
+  # A listener may carry its own maximum. Without that, two listeners would each
+  # take the configured global and the relay would accept twice what an operator
+  # asked for — with the extra headroom on the unauthenticated plaintext port.
+  defp connections_per_acceptor(options, listener_maximum) do
     acceptors = Keyword.get(options, :num_acceptors, @default_acceptors)
-    max(div(max_connections(), acceptors), 1)
+    max(div(listener_maximum || max_connections(), acceptors), 1)
   end
 
   defp max_connections do
-    Application.get_env(:derpex, :max_connections, @default_max_connections)
+    Application.get_env(:derpex, :max_connections) || @default_max_connections
   end
 
   # A client that opens a socket, declares a frame and then stops sending holds

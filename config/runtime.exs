@@ -52,6 +52,20 @@ if config_env() == :prod do
       {:error, :invalid_tls_min_version} -> raise Derpex.TLSVersion.message()
     end
 
+  # Published so every outbound dial reads the same floor, including the ones
+  # that are not configured with TLS options of their own: the ACME client and
+  # the client-verification callback both dial through `Derpex.HTTPClient`.
+  config :derpex, tls_versions: tls_versions
+
+  http_max_connections =
+    case Integer.parse(System.get_env("DERPEX_HTTP_MAX_CONNECTIONS", "256")) do
+      {value, ""} when value in 1..1_048_576 ->
+        value
+
+      _invalid ->
+        raise "DERPEX_HTTP_MAX_CONNECTIONS must be an integer from 1 through 1048576"
+    end
+
   # The certificate plan is resolved before anything else so a mode DERPEX
   # cannot honour is refused while the operator is still reading configuration
   # errors, not after a listener has bound :443 — and it is refused whether or
@@ -492,6 +506,10 @@ if config_env() == :prod do
           [
             port: http_port,
             plaintext_challenge: true,
+            # Its own small cap: this listener answers challenges and redirects
+            # and nothing else, and DERPEX_MAX_CONNECTIONS is what an operator
+            # sized for the DERP listener, not for twice that across two.
+            max_connections: http_max_connections,
             handler_options: [plaintext: [allow_upgrade: clear_http?]],
             transport_module: ThousandIsland.Transports.TCP,
             socket_options: [

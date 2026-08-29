@@ -2,6 +2,7 @@ defmodule Derpex.HTTPClient do
   @moduledoc false
 
   alias Derpex.HTTP1.Scan
+  alias Derpex.TLSVersion
 
   @default_timeout_ms 5_000
   @default_max_response_bytes 1_048_576
@@ -95,16 +96,27 @@ defmodule Derpex.HTTPClient do
 
   defp connect(_target, _deadline, _options), do: {:error, :invalid_target}
 
-  # Caller options are applied first and the security-critical ones are forced
-  # after, so no caller can turn peer verification or the hostname check off by
-  # passing `verify: :verify_none`. A caller may still *tighten* trust — pinning
-  # its own `cacerts` is the reason this option exists — because replacing the
-  # trust anchors narrows what is accepted rather than widening it.
+  # A caller may replace the trust anchors, which narrows what is accepted, and
+  # nothing else. Every key that decides *whether* a peer is verified is dropped
+  # from what the caller passed and set here instead, so no caller can weaken a
+  # dial: not with `verify: :verify_none`, not with a permissive `verify_fun`,
+  # not by widening the path with `partial_chain` or a `cacertfile`.
+  #
+  # The minimum TLS version is a floor for the whole relay, so an outbound dial
+  # cannot negotiate lower than the listener will serve, whoever opened it.
+  @caller_forbidden [:verify, :verify_fun, :partial_chain, :cacertfile, :versions]
+
   defp tls_options(host, options) do
+    caller =
+      options
+      |> Keyword.get(:tls_options, [])
+      |> Keyword.drop(@caller_forbidden)
+
     [cacerts: :public_key.cacerts_get()]
-    |> Keyword.merge(Keyword.get(options, :tls_options, []))
+    |> Keyword.merge(caller)
     |> Keyword.merge(
       verify: :verify_peer,
+      versions: tls_versions(),
       server_name_indication: String.to_charlist(host),
       customize_hostname_check: [
         match_fun: :public_key.pkix_verify_hostname_match_fun(:https)
@@ -113,6 +125,10 @@ defmodule Derpex.HTTPClient do
       packet: :raw,
       active: false
     )
+  end
+
+  defp tls_versions do
+    Application.get_env(:derpex, :tls_versions) || TLSVersion.parse!(nil)
   end
 
   defp send_data({:tcp, socket}, data), do: :gen_tcp.send(socket, data)

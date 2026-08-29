@@ -176,6 +176,24 @@ defmodule Derpex.ACME.ClientTest do
     assert elapsed < 10_000
   end
 
+  test "reads the injected clock when an authority names an instant", context do
+    # Frozen a long way from the real epoch: if the HTTP-date branch compared
+    # against the system clock, this date would be decades out and the order
+    # would never finish.
+    start_supervised!({Derpex.Clock.Manual, monotonic_time: 0, system_time: 1_700_000_000_000})
+    previous = Application.fetch_env!(:derpex, :clock)
+    Application.put_env(:derpex, :clock, Derpex.Clock.Manual)
+    on_exit(fn -> Application.put_env(:derpex, :clock, previous) end)
+
+    client = start_client(context)
+    at = 1_700_000_001 |> DateTime.from_unix!() |> imf_fixdate()
+    :ok = FakeACME.defer_order(context.authority, 1, at)
+
+    started = System.monotonic_time(:millisecond)
+    assert {:ok, _certificate} = Client.issue(client, {:ip, "127.0.0.1"}, "shortlived")
+    assert System.monotonic_time(:millisecond) - started < 10_000
+  end
+
   test "does not start a request it has no time to finish", context do
     client = start_client(context)
     :ok = FakeACME.defer_order(context.authority, :forever, "0")

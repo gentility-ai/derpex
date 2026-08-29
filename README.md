@@ -166,6 +166,11 @@ this relay onto another host.
 The account key is created once at `DERPEX_CERT_DIR/acme-account.key` with mode
 `0600` and reused for every order.
 
+`DERPEX_HTTP_MAX_CONNECTIONS` caps the plaintext listener on its own and
+defaults to 256. `DERPEX_MAX_CONNECTIONS` is what an operator sized for the
+DERP listener, so it applies to that listener alone rather than to each of them
+in turn.
+
 The plaintext listener exists to answer challenges, not to serve the relay: it
 answers `/.well-known/acme-challenge/*` and the unauthenticated probes, sends
 any other `GET` or `HEAD` to the same target over HTTPS, and answers anything

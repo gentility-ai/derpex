@@ -1,5 +1,7 @@
 defmodule Derpex.ACME.SecurityTest do
-  use ExUnit.Case, async: true
+  # The TLS floor is a relay-wide setting, so the tests that move it run
+  # alone rather than beside another test that dials.
+  use ExUnit.Case, async: false
 
   import ExUnit.CaptureLog
 
@@ -9,6 +11,7 @@ defmodule Derpex.ACME.SecurityTest do
   alias Derpex.Certificates.Boot
   alias Derpex.Certificates.IPManager
   alias Derpex.HTTPClient
+  alias Derpex.Test.CertificateAuthority
 
   describe "URLs a certificate authority supplies" do
     test "must be HTTPS unless the authority is on loopback" do
@@ -37,6 +40,20 @@ defmodule Derpex.ACME.SecurityTest do
         assert {:error, reason} = HTTP.post(url, "{}", origin: origin)
         assert elem(reason, 0) in [:acme_cross_origin_url, :acme_insecure_url]
       end
+    end
+
+    test "a differently cased host is the same origin" do
+      {:ok, origin} = HTTP.origin("https://ACME.Example.COM/directory")
+
+      # A host name is case insensitive, so neither spelling is a redirect.
+      assert {:error, {:acme_transport, _reason}} =
+               HTTP.post("https://acme.example.com/new-order", "{}",
+                 origin: origin,
+                 timeout_ms: 50
+               )
+
+      assert {:error, {:acme_cross_origin_url, _url, _origin}} =
+               HTTP.post("https://other.example.com/new-order", "{}", origin: origin)
     end
 
     test "an origin is the scheme, host, and effective port" do
@@ -90,8 +107,98 @@ defmodule Derpex.ACME.SecurityTest do
                  tls_options: [verify: :verify_none, cacerts: []]
                )
 
-      refute match?({:tls_alert, {:handshake_failure, _}}, reason) and false
       assert reason != :ok
+    end
+
+    test "a caller cannot weaken verification with a permissive verify_fun" do
+      {port, authority} = tls_server([:"tlsv1.3"])
+      accept_everything = fn _certificate, _event, state -> {:valid, state} end
+
+      # The root is deliberately not pinned, so the only thing that could make
+      # this handshake succeed is the verify_fun — which is dropped.
+      assert {:error, {:connect, {:tls_alert, {:unknown_ca, _detail}}}} =
+               dial(port, tls_options: [verify_fun: {accept_everything, nil}])
+
+      # Pinning the same authority, which narrows trust rather than widening
+      # it, is still allowed and still works.
+      assert {:ok, {204, _headers, _body}} =
+               dial(port, tls_options: [cacerts: [authority.certificate]])
+    end
+
+    test "the configured TLS floor reaches a dial that sets no options" do
+      put_tls_versions([:"tlsv1.2", :"tlsv1.3"])
+      {port, authority} = tls_server([:"tlsv1.2"])
+
+      # A 1.2-only peer is reachable only because the floor was lowered, and
+      # the dial itself asks for nothing.
+      assert {:ok, {204, _headers, _body}} =
+               dial(port, tls_options: [cacerts: [authority.certificate]])
+    end
+
+    test "a caller cannot dial below the configured floor" do
+      put_tls_versions([:"tlsv1.3"])
+      {port, authority} = tls_server([:"tlsv1.2"])
+
+      assert {:error, {:connect, _reason}} =
+               dial(port,
+                 tls_options: [cacerts: [authority.certificate], versions: [:"tlsv1.2"]]
+               )
+    end
+
+    defp put_tls_versions(versions) do
+      previous = Application.get_env(:derpex, :tls_versions)
+      on_exit(fn -> Application.put_env(:derpex, :tls_versions, previous) end)
+      Application.put_env(:derpex, :tls_versions, versions)
+    end
+
+    defp tls_server(versions) do
+      authority = CertificateAuthority.new()
+      {certificate, key} = CertificateAuthority.issue_ip(authority, "127.0.0.1")
+
+      {:ok, listener} =
+        :ssl.listen(0, [
+          {:certs_keys,
+           [
+             %{
+               cert: [certificate],
+               key: {:RSAPrivateKey, :public_key.der_encode(:RSAPrivateKey, key)}
+             }
+           ]},
+          {:ip, {127, 0, 0, 1}},
+          {:versions, versions},
+          {:reuseaddr, true},
+          {:active, false}
+        ])
+
+      on_exit(fn -> :ssl.close(listener) end)
+      {:ok, {_ip, port}} = :ssl.sockname(listener)
+
+      {:ok, _acceptor} = Task.start(fn -> accept_loop(listener) end)
+      {port, authority}
+    end
+
+    # A refused handshake still consumes an accept, and these tests dial twice.
+    defp accept_loop(listener) do
+      case :ssl.transport_accept(listener, 5_000) do
+        {:ok, socket} ->
+          with {:ok, socket} <- :ssl.handshake(socket, 5_000) do
+            :ssl.send(socket, "HTTP/1.1 204 No Content\r\nContent-Length: 0\r\n\r\n")
+            :ssl.close(socket)
+          end
+
+          accept_loop(listener)
+
+        {:error, _closed_or_timed_out} ->
+          :ok
+      end
+    end
+
+    defp dial(port, options) do
+      HTTPClient.request(
+        URI.parse("https://127.0.0.1:#{port}/"),
+        ["GET / HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n"],
+        Keyword.put_new(options, :timeout_ms, 2_000)
+      )
     end
   end
 
