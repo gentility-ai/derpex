@@ -464,6 +464,61 @@ defmodule Derpex.Admission.GentilityTest do
     Process.exit(connection, :kill)
   end
 
+  @tag timeout: 600_000
+  test "renews a whole fleet that came due together before any lease expires" do
+    parent = self()
+    count = 2_000
+    lifetime = 900_000
+
+    controller =
+      start_controller(
+        authority: fn request ->
+          now = Manual.system_time(:millisecond)
+
+          {:ok,
+           signed_lease(request.node_key,
+             issued_at_ms: now,
+             expires_at_ms: now + lifetime,
+             organization_connection_limit: 1_000_000
+           )}
+        end,
+        max_lease_ms: lifetime,
+        max_concurrent_requests: 64,
+        max_cache_entries: 100_000,
+        renewal_retry_ms: 60_000,
+        close_peer: fn key -> send(parent, {:closed, key}) end
+      )
+
+    policy = Gentility.policy(controller)
+
+    connections =
+      Enum.map(1..count, fn index ->
+        node_key = <<index::256>>
+        {:ok, context} = Gentility.authorize(request(node_key), policy)
+        connection = spawn(fn -> Process.sleep(:infinity) end)
+        assert {:ok, ^context} = Gentility.claim(request(node_key), context, connection, policy)
+        connection
+      end)
+
+    # Every lease comes due at once, as a fleet that reconnected together does.
+    # Renewal concurrency is capped, so this only finishes if a completed
+    # renewal hands its slot to the next lease waiting rather than pushing it a
+    # retry interval away.
+    Manual.advance(div(lifetime * 4, 5) + 100)
+
+    eventually(
+      fn -> Gentility.stats(controller).renewals_in_flight == 0 end,
+      2_000
+    )
+
+    # Past the original expiry: not one lease was left behind.
+    Manual.advance(div(lifetime, 5) + 1_000)
+    refute_receive {:closed, _key}, 200
+    assert Gentility.stats(controller).cache_entries == count
+
+    Enum.each(connections, &Process.exit(&1, :kill))
+  end
+
   test "a failed renewal keeps serving the lease until it expires" do
     parent = self()
     node_key = node_key(41)
