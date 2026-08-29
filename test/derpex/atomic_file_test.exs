@@ -50,6 +50,61 @@ defmodule Derpex.AtomicFileTest do
     assert temporary_files(tmp_dir) == []
   end
 
+  @tag :tmp_dir
+  test "never tightens a directory it did not create", %{tmp_dir: tmp_dir} do
+    shared = Path.join(tmp_dir, "shared")
+    :ok = File.mkdir_p(shared)
+    :ok = File.chmod(shared, 0o755)
+
+    assert AtomicFile.write(Path.join(shared, "secret.key"), "payload") == :ok
+    assert file_mode(shared) == 0o755
+    assert file_mode(Path.join(shared, "secret.key")) == 0o600
+
+    created = Path.join(shared, "issued")
+    assert AtomicFile.write(Path.join(created, "secret.key"), "payload") == :ok
+    assert file_mode(created) == 0o700
+    assert file_mode(shared) == 0o755
+  end
+
+  @tag :tmp_dir
+  test "reports directory failures distinctly from open failures", %{tmp_dir: tmp_dir} do
+    blocker = Path.join(tmp_dir, "blocker")
+    :ok = File.write(blocker, "not a directory")
+
+    assert {:error, {:mkdir, _reason}} =
+             AtomicFile.write(Path.join([blocker, "nested", "secret.key"]), "payload")
+  end
+
+  @tag :tmp_dir
+  test "picks an unused temporary name and removes only its own", %{tmp_dir: tmp_dir} do
+    path = Path.join(tmp_dir, "secret.key")
+    foreign = path <> ".tmp.1.AAAAAAAAAAA"
+    :ok = File.write(foreign, "someone else's temporary file")
+
+    assert AtomicFile.write(path, "payload") == :ok
+    assert File.read!(path) == "payload"
+    assert File.read!(foreign) == "someone else's temporary file"
+    assert temporary_files(tmp_dir) == [Path.basename(foreign)]
+  end
+
+  @tag :tmp_dir
+  test "concurrent writers converge on one file with no leftovers", %{tmp_dir: tmp_dir} do
+    path = Path.join([tmp_dir, "concurrent", "secret.key"])
+
+    results =
+      1..25
+      |> Task.async_stream(fn index -> AtomicFile.write(path, "payload-#{index}") end,
+        max_concurrency: 25,
+        ordered: false
+      )
+      |> Enum.map(fn {:ok, result} -> result end)
+
+    assert Enum.uniq(results) == [:ok]
+    assert File.read!(path) =~ "payload-"
+    assert file_mode(path) == 0o600
+    assert temporary_files(Path.dirname(path)) == []
+  end
+
   defp file_mode(path) do
     {:ok, stat} = File.stat(path)
     Bitwise.band(stat.mode, 0o777)
