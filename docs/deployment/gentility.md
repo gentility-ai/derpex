@@ -152,15 +152,21 @@ a change marks the cache dirty and the file is written at most once per
 `DERPEX_GENTILITY_CACHE_PERSIST_MS`, and again when the controller shuts down.
 A burst of reconnections therefore costs one write rather than one per node.
 
-Revocations and reconciliation batches are never deferred — they are the
-security-relevant writes, and each flushes the file synchronously before the
-call returns, so a revocation is durable by the time Gentility is told it was
-applied. Verification-key rotation flushes when its sweep completes.
+Revocations are never deferred, and they do not wait for a snapshot of every
+cached lease either. Each one is appended to a small journal beside the
+snapshot — `<cache path>.revocations` — and flushed before the call returns, so
+a revocation is durable by the time Gentility is told it was applied and that
+cost does not grow with the size of the lease cache. The journal is rewritten
+from the live record set once it outgrows what a snapshot would hold, and a
+torn final record after a crash costs that record and nothing else.
+Verification-key rotation still flushes a full snapshot when its sweep
+completes.
 
-The write itself runs in a dedicated writer process, so the controller pays
-only for encoding the snapshot, never for the disk. At most one write is in
-flight and queued snapshots replace one another, so lease churn cannot build a
-backlog of writes.
+The controller keeps its durable records in a shared ordered table; the sort,
+the encode and the fsync all happen in a dedicated writer process, so a
+hundred-thousand-lease cache costs the controller nothing per revocation. At
+most one snapshot write is in flight and queued requests collapse into one, so
+lease churn cannot build a backlog of writes.
 
 Verification-key rotation re-verifies every cached record, one signature check
 each, in bounded chunks between other messages. A rotation therefore is not

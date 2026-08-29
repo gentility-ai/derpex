@@ -932,15 +932,18 @@ defmodule Derpex.Admission.GentilityTest do
     assert Gentility.stats(controller).cache_entries == 1_000
     refute File.exists?(path)
 
+    # A revocation is durable before the call returns, in its own journal rather
+    # than in a snapshot of every cached lease.
+    journal = Cache.journal_path(path)
     assert Gentility.revoke(controller, signed_revocation(<<1::256>>, 10)) == {:ok, :applied}
-    assert File.exists?(path)
-    revoked_size = File.stat!(path).size
+    assert File.exists?(journal)
+    refute File.exists?(path)
 
     assert {:ok, _context} = Gentility.authorize(request(<<1_001::256>>), policy)
-    assert File.stat!(path).size == revoked_size
+    refute File.exists?(path)
 
     Manual.advance(5_000)
-    eventually(fn -> File.stat!(path).size > revoked_size end)
+    eventually(fn -> File.exists?(path) end)
 
     assert :ok = stop_supervised(Gentility)
 
@@ -1340,6 +1343,73 @@ defmodule Derpex.Admission.GentilityTest do
 
     assert authorize_p99 < 3_000,
            "authorize p99 was #{authorize_p99} us over #{entries} admissions with a cache_path"
+  end
+
+  @tag :tmp_dir
+  @tag timeout: 600_000
+  test "revocation latency stays flat as the cache grows", %{tmp_dir: tmp_dir} do
+    sizes =
+      if System.get_env("DERPEX_SLOW_TESTS") == "1",
+        do: [5_000, 20_000, 50_000],
+        else: [1_000, 5_000]
+
+    now = System.system_time(:millisecond)
+
+    controller =
+      start_supervised!(
+        {Gentility,
+         [
+           authority: fn request -> {:ok, perf_lease(request.node_key, now)} end,
+           verification_keys: %{@signing_key_id => @public_key},
+           clock: Derpex.Clock.System,
+           max_lease_ms: 900_000,
+           max_future_skew_ms: 30_000,
+           max_cache_entries: 100_000,
+           max_revocations: 100_000,
+           cache_path: Path.join(tmp_dir, "admission.cache"),
+           close_peer: fn _key -> 0 end
+         ]}
+      )
+
+    policy = Gentility.policy(controller)
+
+    {_admitted, timings} =
+      Enum.reduce(sizes, {0, []}, fn size, {admitted, timings} ->
+        for index <- (admitted + 1)..size do
+          assert {:ok, _context} = Gentility.authorize(request(<<index::256>>), policy)
+        end
+
+        assert Gentility.stats(controller).cache_entries == size
+
+        # Revoking is what must not scale with the cache: it makes the record
+        # durable before it answers, and that cost is one flush, not one
+        # snapshot of every cached lease.
+        samples =
+          Enum.map(1..3, fn attempt ->
+            key = <<size + 1_000_000 * attempt::256>>
+
+            {microseconds, {:ok, :applied}} =
+              :timer.tc(fn -> Gentility.revoke(controller, perf_revocation(key, now)) end)
+
+            microseconds
+          end)
+
+        {size, [{size, samples |> Enum.sort() |> Enum.at(1)} | timings]}
+      end)
+
+    timings = Enum.reverse(timings)
+    measured = Enum.map(timings, &elem(&1, 1))
+    slowest = Enum.max(measured)
+    fastest = Enum.min(measured)
+
+    # Flat, not fast: the floor here is one fsync, which costs what the
+    # filesystem costs. What must not happen is growth with the cache — a
+    # snapshot-per-revocation shows up as an order of magnitude between the
+    # smallest and largest cache.
+    assert slowest < 3 * fastest + 5_000,
+           "revocation cost grew with the cache: #{inspect(timings)}"
+
+    assert slowest < 50_000, "revoking took #{slowest} us (#{inspect(timings)})"
   end
 
   test "reclaims byte-budget rows on the prune timer, not on the admission path" do
@@ -2001,6 +2071,19 @@ defmodule Derpex.Admission.GentilityTest do
     after
       50 -> keys
     end
+  end
+
+  defp perf_revocation(node_key, now_ms) do
+    revocation = %Revocation{
+      key_id: @signing_key_id,
+      node_key: node_key,
+      policy_revision: 10,
+      revoked_at_ms: now_ms,
+      reason: "node-disabled"
+    }
+
+    {:ok, wire} = Signer.sign_revocation(revocation, @private_key)
+    wire
   end
 
   defp percentile(samples, percentile) do

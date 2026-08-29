@@ -2,30 +2,51 @@ defmodule Derpex.Admission.Gentility.CacheWriter do
   @moduledoc """
   Serializes durable admission-cache writes off the controller process.
 
-  The controller encodes its own snapshot, so what reaches disk is always a
-  consistent view of one moment, but the write and its fsync happen here. At
-  most one write is in flight; snapshots that arrive while it runs replace one
-  another, so a burst of lease churn costs one write rather than a queue of
-  them. Revocation writes are synchronous because their durability is what
-  bounds a revoked node's reconnection window.
+  The controller keeps the records it wants durable in a shared ordered table
+  and asks for a write; the sort, the encode, and the fsync all happen here. A
+  cache of a hundred thousand leases therefore costs the controller nothing per
+  revocation, which is what keeps revocation latency flat as the cache grows.
+
+  At most one write is in flight; requests that arrive while one runs collapse
+  into a single later write, so a burst of lease churn costs one write rather
+  than a queue of them. Revocation writes are synchronous because their
+  durability is what bounds a revoked node's reconnection window.
+
+  Every row is an independently signed record, so a snapshot taken while the
+  controller is still writing rows is a valid cache — never a torn one.
   """
 
   use GenServer
 
   alias Derpex.Admission.Gentility.Cache
 
+  @journal_compaction_floor 1_000
+
   @doc false
   @spec start_link(keyword()) :: GenServer.on_start()
   def start_link(options), do: GenServer.start_link(__MODULE__, options)
 
-  @doc "Queues a snapshot, replacing any snapshot still waiting to be written."
-  @spec write(GenServer.server(), iodata()) :: :ok
-  def write(server, data), do: GenServer.cast(server, {:write, data})
+  @doc "Asks for a write, collapsing into any write still waiting to run."
+  @spec write(GenServer.server()) :: :ok
+  def write(server), do: GenServer.cast(server, :write)
 
-  @doc "Writes a snapshot and waits for it to reach disk."
-  @spec write_sync(GenServer.server(), iodata(), timeout()) :: :ok | {:error, term()}
-  def write_sync(server, data, timeout) do
-    GenServer.call(server, {:write, data}, timeout)
+  @doc """
+  Appends revocations to the journal and waits for them to reach disk.
+
+  This is the durability a revocation actually needs, and it costs one append
+  and one flush however large the lease cache is.
+  """
+  @spec append_revocations(GenServer.server(), [binary()], timeout()) :: :ok | {:error, term()}
+  def append_revocations(server, wires, timeout) do
+    GenServer.call(server, {:append, wires}, timeout)
+  catch
+    :exit, reason -> {:error, {:cache_writer, reason}}
+  end
+
+  @doc "Writes the current snapshot and waits for it to reach disk."
+  @spec write_sync(GenServer.server(), timeout()) :: :ok | {:error, term()}
+  def write_sync(server, timeout) do
+    GenServer.call(server, :write, timeout)
   catch
     :exit, reason -> {:error, {:cache_writer, reason}}
   end
@@ -44,31 +65,107 @@ defmodule Derpex.Admission.Gentility.CacheWriter do
   def init(options) do
     path = Keyword.fetch!(options, :path)
     owner = Keyword.fetch!(options, :owner)
+    table = Keyword.fetch!(options, :table)
 
     if is_binary(path) and path != "" and is_pid(owner) do
-      {:ok, %{path: path, owner: owner, pending: nil}}
+      {:ok,
+       %{
+         path: path,
+         owner: owner,
+         table: table,
+         pending?: false,
+         journal: nil,
+         appended: 0
+       }}
     else
       {:stop, :invalid_cache_writer}
     end
   end
 
   @impl GenServer
-  def handle_call({:write, data}, _from, state) do
-    {:reply, Cache.write(state.path, data), %{state | pending: nil}}
+  def terminate(_reason, state), do: Cache.close_journal(state.journal)
+
+  @impl GenServer
+  def handle_call(:write, _from, state) do
+    {:reply, write_snapshot(state), %{state | pending?: false}}
+  end
+
+  def handle_call({:append, wires}, _from, state) do
+    case journal(state) do
+      {:ok, state} -> append(state, wires)
+      {:error, _reason} = error -> {:reply, error, state}
+    end
   end
 
   @impl GenServer
-  def handle_cast({:write, data}, state) do
+  def handle_cast(:write, state) do
     send(self(), :flush)
-    {:noreply, %{state | pending: data}}
+    {:noreply, %{state | pending?: true}}
   end
 
   @impl GenServer
-  def handle_info(:flush, %{pending: nil} = state), do: {:noreply, state}
+  def handle_info(:flush, %{pending?: false} = state), do: {:noreply, state}
 
   def handle_info(:flush, state) do
-    result = Cache.write(state.path, state.pending)
-    send(state.owner, {__MODULE__, :write_result, result})
-    {:noreply, %{state | pending: nil}}
+    send(state.owner, {__MODULE__, :write_result, write_snapshot(state)})
+    {:noreply, %{state | pending?: false}}
   end
+
+  defp append(state, wires) do
+    case Cache.append_journal(state.journal, wires) do
+      :ok -> {:reply, :ok, compact(%{state | appended: state.appended + length(wires)})}
+      {:error, _reason} = error -> {:reply, error, close(state)}
+    end
+  end
+
+  # The journal only has to cover revocations the last snapshot missed, so it is
+  # rewritten from the live record set once it has grown past what a snapshot
+  # would hold anyway.
+  defp compact(%{appended: appended} = state) when appended <= @journal_compaction_floor,
+    do: state
+
+  defp compact(state) do
+    {_leases, revocations} = snapshot(state.table)
+
+    case Cache.compact_journal(state.path, revocations) do
+      {:ok, journal} ->
+        Cache.close_journal(state.journal)
+        %{state | journal: journal, appended: length(revocations)}
+
+      {:error, _reason} ->
+        close(state)
+    end
+  end
+
+  defp journal(%{journal: nil} = state) do
+    with {:ok, journal} <- Cache.open_journal(state.path) do
+      {:ok, %{state | journal: journal}}
+    end
+  end
+
+  defp journal(state), do: {:ok, state}
+
+  defp close(state) do
+    Cache.close_journal(state.journal)
+    %{state | journal: nil, appended: 0}
+  end
+
+  defp write_snapshot(state) do
+    {leases, revocations} = snapshot(state.table)
+    Cache.write(state.path, Cache.encode(leases, revocations))
+  end
+
+  # The table is an ordered set, so folding from the right yields both record
+  # kinds already in canonical order without a sort.
+  defp snapshot(table) do
+    :ets.foldr(&collect/2, {[], []}, table)
+  rescue
+    ArgumentError -> {[], []}
+  end
+
+  defp collect({{:lease, _node_key}, wire}, {leases, revocations}),
+    do: {[wire | leases], revocations}
+
+  defp collect({{:revocation, _node_key}, wire}, {leases, revocations}),
+    do: {leases, [wire | revocations]}
 end
