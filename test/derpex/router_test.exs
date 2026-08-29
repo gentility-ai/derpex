@@ -269,6 +269,90 @@ defmodule Derpex.RouterTest do
     Enum.each([source_connection, first, second], &Process.exit(&1, :kill))
   end
 
+  test "the last local route leaving while a forwarder remains keeps the peer present" do
+    source = :crypto.strong_rand_bytes(32)
+    destination_key = :crypto.strong_rand_bytes(32)
+    source_connection = spawn(fn -> Process.sleep(:infinity) end)
+    destination = spawn(fn -> Process.sleep(:infinity) end)
+    destination_ring = Ring.new(2)
+    forwarder_ring = Ring.new(2)
+
+    assert Router.register(source, source_connection, Ring.new(1)) == :ok
+    assert Router.register(destination_key, destination, destination_ring) == :ok
+    assert Router.add_forwarder(source, :peer_relay, forwarder_ring) == :ok
+    assert Router.note_send(source, destination, destination_ring) == :ok
+
+    assert Router.unregister(source, source_connection) == :ok
+    assert Ring.take(destination_ring) == :empty
+
+    assert Router.remove_forwarder(source, :peer_relay) == :ok
+    assert Ring.take(destination_ring) == {:ok, {:peer_gone, source, 0x00}}
+
+    assert Router.unregister(destination_key, destination) == :ok
+    Enum.each([source_connection, destination], &Process.exit(&1, :kill))
+  end
+
+  test "the last forwarder leaving with no local route announces the peer as gone" do
+    source = :crypto.strong_rand_bytes(32)
+    destination_key = :crypto.strong_rand_bytes(32)
+    destination = spawn(fn -> Process.sleep(:infinity) end)
+    destination_ring = Ring.new(2)
+    forwarder_ring = Ring.new(2)
+
+    assert Router.register(destination_key, destination, destination_ring) == :ok
+    assert Router.add_forwarder(source, :peer_relay, forwarder_ring) == :ok
+    assert Router.note_send(source, destination, destination_ring) == :ok
+
+    assert Router.remove_forwarder(source, :peer_relay) == :ok
+    assert Ring.take(destination_ring) == {:ok, {:peer_gone, source, 0x00}}
+
+    assert Router.unregister(destination_key, destination) == :ok
+    Process.exit(destination, :kill)
+  end
+
+  test "the last forwarder leaving while a local route remains keeps the peer present" do
+    source = :crypto.strong_rand_bytes(32)
+    destination_key = :crypto.strong_rand_bytes(32)
+    source_connection = spawn(fn -> Process.sleep(:infinity) end)
+    destination = spawn(fn -> Process.sleep(:infinity) end)
+    destination_ring = Ring.new(2)
+    forwarder_ring = Ring.new(2)
+
+    assert Router.register(source, source_connection, Ring.new(1)) == :ok
+    assert Router.register(destination_key, destination, destination_ring) == :ok
+    assert Router.add_forwarder(source, :peer_relay, forwarder_ring) == :ok
+    assert Router.note_send(source, destination, destination_ring) == :ok
+
+    assert Router.remove_forwarder(source, :peer_relay) == :ok
+    assert Ring.take(destination_ring) == :empty
+
+    assert Router.unregister(source, source_connection) == :ok
+    assert Ring.take(destination_ring) == {:ok, {:peer_gone, source, 0x00}}
+
+    assert Router.unregister(destination_key, destination) == :ok
+    Enum.each([source_connection, destination], &Process.exit(&1, :kill))
+  end
+
+  test "a crashed last forwarder for a remote-only peer announces it as gone" do
+    source = :crypto.strong_rand_bytes(32)
+    destination_key = :crypto.strong_rand_bytes(32)
+    destination = spawn(fn -> Process.sleep(:infinity) end)
+    forwarder_process = spawn(fn -> Process.sleep(:infinity) end)
+    destination_ring = Ring.new(2)
+    forwarder_ring = Ring.new(2)
+
+    assert Router.register(destination_key, destination, destination_ring) == :ok
+    assert Router.add_forwarder(source, forwarder_process, forwarder_ring) == :ok
+    assert Router.note_send(source, destination, destination_ring) == :ok
+
+    Process.exit(forwarder_process, :kill)
+    assert_eventually(fn -> Router.forwarder_count(source) == 0 end)
+    assert Ring.take(destination_ring) == {:ok, {:peer_gone, source, 0x00}}
+
+    assert Router.unregister(destination_key, destination) == :ok
+    Process.exit(destination, :kill)
+  end
+
   test "the most recently active duplicate receives packets" do
     key = :crypto.strong_rand_bytes(32)
     source = :crypto.strong_rand_bytes(32)

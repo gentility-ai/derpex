@@ -321,7 +321,7 @@ defmodule Derpex.Router do
 
   def handle_call({:unregister, key, connection}, _from, state) do
     had_key? = Map.has_key?(state.routes, key)
-    routes = remove_route(state.routes, key, connection)
+    routes = remove_route(state.routes, key, connection, state.forwarders)
     monitors = remove_connection_key(state.monitors, connection, key)
 
     if had_key? and not Map.has_key?(routes, key) do
@@ -385,37 +385,10 @@ defmodule Derpex.Router do
   end
 
   def handle_call({:remove_forwarder, key, identity}, _from, state) do
-    registered? =
-      state.forwarders
-      |> Map.get(key, [])
-      |> Enum.any?(fn {registered_identity, _ring, _sequence} ->
-        registered_identity == identity
-      end)
-
-    entries =
-      state.forwarders
-      |> Map.get(key, [])
-      |> Enum.reject(fn {registered_identity, _ring, _sequence} ->
-        registered_identity == identity
-      end)
-
-    publish_preferred_forwarder(key, entries)
-
-    forwarders =
-      if entries == [] do
-        Map.delete(state.forwarders, key)
-      else
-        Map.put(state.forwarders, key, entries)
-      end
-
-    forwarder_monitors =
-      if registered? do
-        remove_forwarder_monitor(state.forwarder_monitors, identity, key)
-      else
-        state.forwarder_monitors
-      end
-
-    {:reply, :ok, %{state | forwarders: forwarders, forwarder_monitors: forwarder_monitors}}
+    case Map.fetch(state.forwarders, key) do
+      {:ok, registered} -> {:reply, :ok, drop_forwarder(state, key, identity, registered)}
+      :error -> {:reply, :ok, state}
+    end
   end
 
   def handle_call({:forwarder_count, key}, _from, state) do
@@ -438,7 +411,8 @@ defmodule Derpex.Router do
   defp handle_connection_down(state, monitor, connection) do
     case state.monitors[connection] do
       {^monitor, keys} ->
-        {routes, gone_keys} = remove_connection_routes(state.routes, keys, connection)
+        {routes, gone_keys} =
+          remove_connection_routes(state.routes, keys, connection, state.forwarders)
 
         Enum.each(gone_keys, &broadcast(state.watchers, {:peer_gone, &1, 0x00}))
         forget_destination(connection)
@@ -460,7 +434,7 @@ defmodule Derpex.Router do
       {^monitor, keys} ->
         forwarders =
           Enum.reduce(keys, state.forwarders, fn key, forwarders ->
-            remove_dead_forwarder(forwarders, key, identity)
+            remove_dead_forwarder(forwarders, state.routes, key, identity)
           end)
 
         %{
@@ -502,7 +476,26 @@ defmodule Derpex.Router do
 
   defp remove_forwarder_monitor(monitors, _identity, _key), do: monitors
 
-  defp remove_dead_forwarder(forwarders, key, identity) do
+  defp drop_forwarder(state, key, identity, registered) do
+    entries =
+      Enum.reject(registered, fn {registered_identity, _ring, _sequence} ->
+        registered_identity == identity
+      end)
+
+    publish_preferred_forwarder(key, entries)
+    forwarders = store_forwarders(state.forwarders, state.routes, key, entries)
+
+    forwarder_monitors =
+      if length(entries) == length(registered) do
+        state.forwarder_monitors
+      else
+        remove_forwarder_monitor(state.forwarder_monitors, identity, key)
+      end
+
+    %{state | forwarders: forwarders, forwarder_monitors: forwarder_monitors}
+  end
+
+  defp remove_dead_forwarder(forwarders, routes, key, identity) do
     entries =
       forwarders
       |> Map.get(key, [])
@@ -511,12 +504,16 @@ defmodule Derpex.Router do
       end)
 
     publish_preferred_forwarder(key, entries)
+    store_forwarders(forwarders, routes, key, entries)
+  end
 
-    if entries == [] do
-      Map.delete(forwarders, key)
-    else
-      Map.put(forwarders, key, entries)
-    end
+  defp store_forwarders(forwarders, routes, key, []) do
+    note_peer_gone_from_region(key, Map.has_key?(routes, key))
+    Map.delete(forwarders, key)
+  end
+
+  defp store_forwarders(forwarders, _routes, key, entries) do
+    Map.put(forwarders, key, entries)
   end
 
   defp keys_for(monitors, connection) do
@@ -543,10 +540,10 @@ defmodule Derpex.Router do
     end
   end
 
-  defp remove_connection_routes(routes, keys, connection) do
+  defp remove_connection_routes(routes, keys, connection, forwarders) do
     Enum.reduce(keys, {routes, []}, fn key, {routes, gone_keys} ->
       had_key? = Map.has_key?(routes, key)
-      routes = remove_route(routes, key, connection)
+      routes = remove_route(routes, key, connection, forwarders)
 
       if had_key? and not Map.has_key?(routes, key) do
         {routes, [key | gone_keys]}
@@ -556,7 +553,7 @@ defmodule Derpex.Router do
     end)
   end
 
-  defp remove_route(routes, key, connection) do
+  defp remove_route(routes, key, connection, forwarders) do
     true = :ets.delete(@registrations_table, {key, connection})
 
     entries =
@@ -578,7 +575,7 @@ defmodule Derpex.Router do
     case entries do
       [] ->
         true = :ets.delete(@table, key)
-        notify_peer_gone(key)
+        note_peer_gone_from_region(key, Map.has_key?(forwarders, key))
         Map.delete(routes, key)
 
       _remaining ->
@@ -599,6 +596,14 @@ defmodule Derpex.Router do
         Map.put(routes, key, entries)
     end
   end
+
+  # Go's `notePeerGoneFromRegionLocked` runs only once the key has left
+  # `clientsMesh` entirely: `unregisterClient` drops the entry only when its
+  # forwarder is nil, and `RemovePacketForwarder` keeps the entry (as nil) while
+  # a local client remains. A peer that still has either path is not gone from
+  # the region, so its reverse paths stay recorded for whichever path leaves last.
+  defp note_peer_gone_from_region(_key, true = _still_reachable?), do: :ok
+  defp note_peer_gone_from_region(key, false = _still_reachable?), do: notify_peer_gone(key)
 
   defp notify_peer_gone(key) do
     key
