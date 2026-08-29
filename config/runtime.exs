@@ -81,6 +81,8 @@ if config_env() == :prod do
     accept_max_tracked_ips_text =
       System.get_env("DERPEX_ACCEPT_MAX_TRACKED_IPS", "16384")
 
+    accept_ipv6_prefix_text = System.get_env("DERPEX_ACCEPT_IPV6_PREFIX", "64")
+
     gentility_adapter_text = System.get_env("DERPEX_GENTILITY_ADAPTER")
     verify_clients_text = System.get_env("DERPEX_VERIFY_CLIENTS", "0")
     tailscaled_socket = System.get_env("DERPEX_TAILSCALED_SOCKET")
@@ -237,6 +239,15 @@ if config_env() == :prod do
         _invalid -> raise "DERPEX_ACCEPT_MAX_TRACKED_IPS must be a positive integer"
       end
 
+    accept_ipv6_prefix =
+      case Integer.parse(accept_ipv6_prefix_text) do
+        {value, ""} when value in 1..128 ->
+          value
+
+        _invalid ->
+          raise "DERPEX_ACCEPT_IPV6_PREFIX must be an integer from 1 through 128"
+      end
+
     accept_limit =
       if is_nil(per_ip_accept_limit) and is_nil(per_ip_connections) do
         global_accept_limit
@@ -245,7 +256,8 @@ if config_env() == :prod do
           global: global_accept_limit,
           per_ip: per_ip_accept_limit,
           per_ip_connections: per_ip_connections,
-          max_tracked_ips: max_tracked_ips
+          max_tracked_ips: max_tracked_ips,
+          ipv6_prefix: accept_ipv6_prefix
         ]
       end
 

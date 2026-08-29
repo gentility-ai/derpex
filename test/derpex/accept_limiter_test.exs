@@ -210,6 +210,84 @@ defmodule Derpex.AcceptLimiterTest do
     assert AcceptLimiter.stats(limiter).tracked_ips == 2
   end
 
+  test "aggregates IPv6 sources by their routed /64 prefix" do
+    limiter =
+      start_supervised!({AcceptLimiter, name: nil, config: [per_ip: {0, 1}, max_tracked_ips: 8]})
+
+    assert AcceptLimiter.claim(limiter, {0x2001, 0xDB8, 0, 1, 0, 0, 0, 1}) == :ok
+
+    # A second address inside the same /64 shares the first address's bucket.
+    assert AcceptLimiter.claim(limiter, {0x2001, 0xDB8, 0, 1, 0xAAAA, 0, 0, 2}) ==
+             {:error, :ip_rate_limited}
+
+    assert AcceptLimiter.claim(limiter, {0x2001, 0xDB8, 0, 1, 0xFFFF, 0xFFFF, 0xFFFF, 0xFFFF}) ==
+             {:error, :ip_rate_limited}
+
+    # A neighbouring /64 is a separate source.
+    assert AcceptLimiter.claim(limiter, {0x2001, 0xDB8, 0, 2, 0, 0, 0, 1}) == :ok
+
+    assert AcceptLimiter.stats(limiter).tracked_ips == 2
+  end
+
+  test "shares one connection slot across a single IPv6 /64" do
+    limiter =
+      start_supervised!(
+        {AcceptLimiter, name: nil, config: [per_ip_connections: 1, max_tracked_ips: 8]}
+      )
+
+    first = start_claimant(limiter, {0x2001, 0xDB8, 0, 1, 0, 0, 0, 1})
+    assert_receive {:claim_result, ^first, :ok}
+
+    sibling = start_claimant(limiter, {0x2001, 0xDB8, 0, 1, 0, 0, 0, 2})
+    assert_receive {:claim_result, ^sibling, {:error, :ip_connection_limited}}
+
+    neighbour = start_claimant(limiter, {0x2001, 0xDB8, 0, 2, 0, 0, 0, 1})
+    assert_receive {:claim_result, ^neighbour, :ok}
+
+    Enum.each([first, sibling, neighbour], &send(&1, :release))
+  end
+
+  test "honours a configured IPv6 aggregation prefix length" do
+    limiter =
+      start_supervised!(
+        {AcceptLimiter, name: nil, config: [per_ip: {0, 1}, max_tracked_ips: 8, ipv6_prefix: 128]}
+      )
+
+    assert AcceptLimiter.claim(limiter, {0x2001, 0xDB8, 0, 1, 0, 0, 0, 1}) == :ok
+    assert AcceptLimiter.claim(limiter, {0x2001, 0xDB8, 0, 1, 0, 0, 0, 2}) == :ok
+
+    assert AcceptLimiter.claim(limiter, {0x2001, 0xDB8, 0, 1, 0, 0, 0, 1}) ==
+             {:error, :ip_rate_limited}
+
+    assert AcceptLimiter.stats(limiter).tracked_ips == 2
+  end
+
+  test "unmaps IPv4-mapped IPv6 sources before aggregating" do
+    limiter =
+      start_supervised!({AcceptLimiter, name: nil, config: [per_ip: {0, 1}, max_tracked_ips: 8]})
+
+    assert AcceptLimiter.claim(limiter, {192, 0, 2, 1}) == :ok
+
+    # ::ffff:192.0.2.1 is the same source as 192.0.2.1.
+    assert AcceptLimiter.claim(limiter, {0, 0, 0, 0, 0, 0xFFFF, 0xC000, 0x0201}) ==
+             {:error, :ip_rate_limited}
+
+    # Mapped addresses must not collapse into one all-zero /64 with each other.
+    assert AcceptLimiter.claim(limiter, {0, 0, 0, 0, 0, 0xFFFF, 0xC633, 0x6401}) == :ok
+    assert AcceptLimiter.claim(limiter, {198, 51, 100, 1}) == {:error, :ip_rate_limited}
+
+    assert AcceptLimiter.stats(limiter).tracked_ips == 2
+  end
+
+  test "rejects an out-of-range IPv6 aggregation prefix" do
+    Process.flag(:trap_exit, true)
+
+    for prefix <- [0, 129, 64.0] do
+      assert {:error, {%ArgumentError{}, _stacktrace}} =
+               AcceptLimiter.start_link(name: nil, config: [per_ip: {1, 1}, ipv6_prefix: prefix])
+    end
+  end
+
   defp start_claimant(limiter, source_ip) do
     parent = self()
 

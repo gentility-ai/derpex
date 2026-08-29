@@ -6,6 +6,15 @@ defmodule Derpex.AcceptLimiter do
   Concurrent connection claims are monitored so abrupt handler exits cannot
   leak capacity.
 
+  A source is keyed by its *allocation*, not its address. An IPv4 address keys
+  itself, but a single IPv6 host is routinely handed a whole /64, so IPv6
+  sources are aggregated to their `ipv6_prefix` (default 64) before any bucket
+  or slot is looked up: otherwise one routed prefix fills the tracking table
+  from a single machine and per-source limits mean nothing. IPv4-mapped IPv6
+  addresses are unmapped first, so `::ffff:198.51.100.1` and `198.51.100.1` are
+  one source rather than two, and mapped addresses never collapse into a shared
+  all-zero prefix.
+
   The tracking set is a memory bound, not an admission bound. When every
   tracked IP holds a live connection there is nothing to evict, so a new source
   is admitted *untracked* rather than refused outright.
@@ -28,6 +37,7 @@ defmodule Derpex.AcceptLimiter do
 
   @default_max_tracked_ips 16_384
   @untracked_connection_factor 16
+  @default_ipv6_prefix 64
 
   @default_settings %{
     global: nil,
@@ -35,7 +45,8 @@ defmodule Derpex.AcceptLimiter do
     per_ip_connections: nil,
     max_tracked_ips: @default_max_tracked_ips,
     overflow: nil,
-    max_untracked_connections: nil
+    max_untracked_connections: nil,
+    ipv6_prefix: @default_ipv6_prefix
   }
 
   @type rate_config :: {number(), pos_integer()}
@@ -119,7 +130,7 @@ defmodule Derpex.AcceptLimiter do
         {:reply, {:error, :ip_connection_limited}, count(state, :ip_connection_limited)}
 
       true ->
-        {reply, state} = claim_connection(state, source_ip, pid)
+        {reply, state} = claim_connection(state, tracking_key(source_ip, state.ipv6_prefix), pid)
         {:reply, reply, state}
     end
   end
@@ -365,6 +376,7 @@ defmodule Derpex.AcceptLimiter do
       max_tracked_ips: settings.max_tracked_ips,
       overflow: new_bucket(settings.overflow),
       max_untracked_connections: settings.max_untracked_connections,
+      ipv6_prefix: settings.ipv6_prefix,
       untracked_connections: 0,
       entries: %{},
       evictable: :gb_trees.empty(),
@@ -402,7 +414,8 @@ defmodule Derpex.AcceptLimiter do
           :max_tracked_ips
         ),
       overflow: parse_overflow!(config, per_ip),
-      max_untracked_connections: parse_untracked_connections!(config, per_ip_connections)
+      max_untracked_connections: parse_untracked_connections!(config, per_ip_connections),
+      ipv6_prefix: prefix!(Keyword.get(config, :ipv6_prefix, @default_ipv6_prefix))
     }
   end
 
@@ -443,10 +456,32 @@ defmodule Derpex.AcceptLimiter do
   defp positive!(value, _name) when is_integer(value) and value > 0, do: value
   defp positive!(_value, name), do: raise(ArgumentError, "#{name} must be a positive integer")
 
+  defp prefix!(value) when is_integer(value) and value in 1..128, do: value
+
+  defp prefix!(_value),
+    do: raise(ArgumentError, "ipv6_prefix must be an integer from 1 through 128")
+
   defp new_bucket(nil), do: nil
   defp new_bucket({rate, burst}), do: RateLimiter.new(rate, burst)
 
   defp count(state, key), do: update_in(state.counters[key], &(&1 + 1))
+
+  defp tracking_key({_a, _b, _c, _d} = address, _prefix), do: address
+
+  defp tracking_key({0, 0, 0, 0, 0, 0xFFFF, high, low}, _prefix) do
+    <<a, b, c, d>> = <<high::16, low::16>>
+    {a, b, c, d}
+  end
+
+  defp tracking_key({a, b, c, d, e, f, g, h}, prefix) do
+    <<network::bits-size(^prefix), _host::bits>> =
+      <<a::16, b::16, c::16, d::16, e::16, f::16, g::16, h::16>>
+
+    <<i::16, j::16, k::16, l::16, m::16, n::16, o::16, p::16>> =
+      <<network::bits, 0::size(128 - prefix)>>
+
+    {i, j, k, l, m, n, o, p}
+  end
 
   defp valid_ip?({a, b, c, d}) do
     values = [a, b, c, d]

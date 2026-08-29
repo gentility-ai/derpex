@@ -261,6 +261,12 @@ buckets are evicted least-recently-used at that hard bound, while active claims
 are process-monitored and never evicted. Limiter metrics aggregate outcomes and
 never use source IPs as labels.
 
+Per-source limits key on the allocation, not the address: IPv6 sources are
+aggregated to `DERPEX_ACCEPT_IPV6_PREFIX` (default `64`, the routed prefix a
+single host is normally handed) so one /64 cannot fill the tracking table or
+buy itself thousands of buckets. IPv4 keys on the full address, and
+IPv4-mapped IPv6 addresses are unmapped before aggregation.
+
 ## Gentility profile
 
 The baseline profile remains the default. A production Gentility deployment
