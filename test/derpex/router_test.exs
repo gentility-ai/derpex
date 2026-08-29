@@ -3,6 +3,7 @@ defmodule Derpex.RouterTest do
 
   alias Derpex.Outbox.Ring
   alias Derpex.Router
+  alias Derpex.Router.ReversePaths
 
   test "successful routing looks up ETS and publishes directly to a bounded ring" do
     source = :crypto.strong_rand_bytes(32)
@@ -216,6 +217,56 @@ defmodule Derpex.RouterTest do
     assert Router.unregister(destination, destination_connection) == :ok
     Process.exit(source_connection, :kill)
     Process.exit(destination_connection, :kill)
+  end
+
+  test "forgetting a destination costs its own reverse paths, not the whole table" do
+    sources = for _index <- 1..100, do: :crypto.strong_rand_bytes(32)
+    connections = for _index <- 1..2_000, do: spawn(fn -> Process.sleep(:infinity) end)
+    shared_ring = Ring.new(1)
+
+    on_exit(fn ->
+      Enum.each(connections, &ReversePaths.forget_connection/1)
+      Enum.each(connections, &Process.exit(&1, :kill))
+    end)
+
+    for connection <- connections, source <- sources do
+      assert Router.note_send(source, connection, shared_ring) == :ok
+    end
+
+    [target | _others] = connections
+    target_key = :crypto.strong_rand_bytes(32)
+    assert Router.register(target_key, target, shared_ring) == :ok
+
+    {elapsed, :ok} = :timer.tc(fn -> Router.unregister(target_key, target) end)
+
+    assert elapsed < 2_000,
+           "unregister scanned the whole reverse table: #{elapsed} us"
+  end
+
+  test "clearing one destination's reverse paths leaves the others subscribed" do
+    source = :crypto.strong_rand_bytes(32)
+    first_key = :crypto.strong_rand_bytes(32)
+    second_key = :crypto.strong_rand_bytes(32)
+    source_connection = spawn(fn -> Process.sleep(:infinity) end)
+    first = spawn(fn -> Process.sleep(:infinity) end)
+    second = spawn(fn -> Process.sleep(:infinity) end)
+    first_ring = Ring.new(1)
+    second_ring = Ring.new(1)
+
+    assert Router.register(source, source_connection, Ring.new(1)) == :ok
+    assert Router.register(first_key, first, first_ring) == :ok
+    assert Router.register(second_key, second, second_ring) == :ok
+    assert Router.note_send(source, first, first_ring) == :ok
+    assert Router.note_send(source, second, second_ring) == :ok
+
+    assert Router.unregister(first_key, first) == :ok
+    assert Router.unregister(source, source_connection) == :ok
+
+    assert Ring.take(second_ring) == {:ok, {:peer_gone, source, 0x00}}
+    assert Ring.take(first_ring) == :empty
+
+    assert Router.unregister(second_key, second) == :ok
+    Enum.each([source_connection, first, second], &Process.exit(&1, :kill))
   end
 
   test "the most recently active duplicate receives packets" do

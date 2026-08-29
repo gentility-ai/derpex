@@ -11,9 +11,9 @@ defmodule Derpex.Router do
   alias Derpex.Disco
   alias Derpex.Metrics
   alias Derpex.Outbox.Ring
+  alias Derpex.Router.ReversePaths
 
   @table __MODULE__.Routes
-  @reverse_table __MODULE__.ReversePaths
   @registrations_table __MODULE__.Registrations
   @duplicates_table __MODULE__.Duplicates
   @forwarders_table __MODULE__.Forwarders
@@ -157,10 +157,7 @@ defmodule Derpex.Router do
   @spec note_send(binary(), pid(), Ring.t()) :: :ok
   def note_send(<<source::binary-size(32)>>, destination_connection, %Ring{} = lifecycle)
       when is_pid(destination_connection) do
-    true = :ets.insert(@reverse_table, {{source, destination_connection}, lifecycle})
-    :ok
-  rescue
-    ArgumentError -> :ok
+    ReversePaths.note(source, destination_connection, lifecycle)
   end
 
   @doc "Promotes a duplicate connection when it is the latest one to send a frame."
@@ -219,14 +216,7 @@ defmodule Derpex.Router do
         read_concurrency: true
       ])
 
-    reverse_table =
-      :ets.new(@reverse_table, [
-        :named_table,
-        :set,
-        :public,
-        read_concurrency: true,
-        write_concurrency: true
-      ])
+    :ok = ReversePaths.new()
 
     registrations_table =
       :ets.new(@registrations_table, [
@@ -256,7 +246,6 @@ defmodule Derpex.Router do
     {:ok,
      %{
        table: table,
-       reverse_table: reverse_table,
        registrations_table: registrations_table,
        duplicates_table: duplicates_table,
        forwarders_table: forwarders_table,
@@ -612,17 +601,15 @@ defmodule Derpex.Router do
   end
 
   defp notify_peer_gone(key) do
-    @reverse_table
-    |> :ets.match_object({{key, :_}, :_})
-    |> Enum.each(fn {{^key, _destination_connection}, lifecycle} = entry ->
-      true = :ets.delete_object(@reverse_table, entry)
+    key
+    |> ReversePaths.take()
+    |> Enum.each(fn {_destination_connection, lifecycle} ->
       _enqueue_result = safe_enqueue(lifecycle, {:peer_gone, key, 0x00})
     end)
   end
 
   defp forget_destination(connection) do
-    true = :ets.match_delete(@reverse_table, {{:_, connection}, :_})
-    :ok
+    ReversePaths.forget_connection(connection)
   end
 
   defp update_duplicate_marker(key, entries) do
