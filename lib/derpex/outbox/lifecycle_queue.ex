@@ -261,6 +261,15 @@ defmodule Derpex.Outbox.LifecycleQueue do
     end
   end
 
+  @doc """
+  True when `count` more frames fit under the soft cap.
+
+  A producer that can wait asks first rather than overflowing a watcher that is
+  merely behind.
+  """
+  @spec room_for?(t(), pos_integer()) :: boolean()
+  def room_for?(%__MODULE__{} = queue, count), do: size(queue) + count <= queue.soft_cap
+
   @doc "Returns the queue table's memory footprint in machine words."
   @spec memory_words(t()) :: non_neg_integer()
   def memory_words(%__MODULE__{} = queue), do: :ets.info(queue.table, :memory)

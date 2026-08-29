@@ -34,6 +34,14 @@ not care which one they hold).
   a frame.
 - Packets keep their fixed rings. Only lifecycle frames live here.
 
+A frame that loses the queue's lock is never dropped. The router parks it in
+arrival order and retries it on its own timer, counting `derp_lifecycle_contention`,
+because a presence change that vanishes leaves a watcher's view wrong with
+nothing to correct it. The snapshot a new watcher is owed is streamed in chunks
+of 1024 rather than sent inside the `watch` call: a region-sized snapshot would
+otherwise hold the router for tens of thousands of frames and overflow a
+watcher that is merely behind.
+
 There is a **soft cap** of 65,536 frames. Beyond it the queue refuses the frame,
 counts `derp_lifecycle_queue_overflows`, and tells its owner — the connection —
 to close, which the handler does with a logged reason.

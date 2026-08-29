@@ -2,7 +2,9 @@ defmodule Derpex.RouterTest do
   use ExUnit.Case, async: false
 
   alias Derpex.Metrics
+  alias Derpex.Outbox
   alias Derpex.Outbox.LifecycleQueue
+  alias Derpex.Outbox.Lock
   alias Derpex.Outbox.Ring
   alias Derpex.Router
   alias Derpex.Router.ReversePaths
@@ -551,7 +553,9 @@ defmodule Derpex.RouterTest do
 
     assert Router.watch(watcher, watcher_ring) == :ok
 
-    assert Ring.take(watcher_ring) ==
+    # The snapshot streams in chunks between everything else the router does,
+    # so it arrives shortly after the call returns rather than inside it.
+    assert take_when_ready(watcher_ring) ==
              {:ok,
               {:peer_present, first_key, first_presence.ip, first_presence.port,
                first_presence.flags, first_presence.app_name}}
@@ -579,6 +583,109 @@ defmodule Derpex.RouterTest do
     Process.exit(watcher, :kill)
   end
 
+  @tag :performance
+  @tag timeout: 120_000
+  test "a region-sized snapshot reaches a new watcher without stalling the router" do
+    parent = self()
+    connection = spawn(fn -> Process.sleep(:infinity) end)
+    ring = Ring.new(1)
+    total = 70_000
+    peers = for _index <- 1..total, do: :crypto.strong_rand_bytes(32)
+
+    on_exit(fn ->
+      Enum.each(peers, &Router.unregister(&1, connection))
+      Process.exit(connection, :kill)
+    end)
+
+    Enum.each(peers, &(:ok = Router.register(&1, connection, ring)))
+
+    # A real watcher drains as it reads, which is what lets the router stream a
+    # region larger than the queue's soft cap.
+    watcher = spawn_link(fn -> await_snapshot(parent, total) end)
+    lifecycle = LifecycleQueue.new(notifier: watcher, owner: watcher)
+    send(watcher, {:queue, lifecycle})
+    assert Router.watch(watcher, lifecycle) == :ok
+
+    # The router keeps answering while the snapshot streams: sending it from
+    # inside the watch call held the router for all seventy thousand frames.
+    source = :crypto.strong_rand_bytes(32)
+    destination = hd(peers)
+
+    latencies =
+      for _probe <- 1..200 do
+        {microseconds, _result} = :timer.tc(fn -> Router.route(source, destination, "probe") end)
+        Process.sleep(1)
+        microseconds
+      end
+
+    assert_receive {:snapshot_complete, ^total}, 60_000
+    assert Enum.max(latencies) < 5_000
+  end
+
+  defp await_snapshot(parent, total) do
+    receive do
+      {:queue, queue} -> collect_present(queue, MapSet.new(), parent, total)
+    end
+  end
+
+  defp collect_present(queue, seen, parent, total) do
+    case LifecycleQueue.take(queue) do
+      {:ok, {:peer_present, key, _ip, _port, _flags, _app}} ->
+        seen = MapSet.put(seen, key)
+
+        if MapSet.size(seen) == total do
+          send(parent, {:snapshot_complete, total})
+        else
+          collect_present(queue, seen, parent, total)
+        end
+
+      {:ok, _other} ->
+        collect_present(queue, seen, parent, total)
+
+      :busy ->
+        collect_present(queue, seen, parent, total)
+
+      _empty_or_closed ->
+        receive do
+          :derpex_outbox_ready -> collect_present(queue, seen, parent, total)
+        after
+          30_000 -> send(parent, {:snapshot_complete, MapSet.size(seen)})
+        end
+    end
+  end
+
+  test "a presence change that loses the queue lock is delivered, not dropped" do
+    watcher = spawn(fn -> Process.sleep(:infinity) end)
+    connection = spawn(fn -> Process.sleep(:infinity) end)
+    queue = LifecycleQueue.new(notifier: watcher, owner: watcher)
+    key = :crypto.strong_rand_bytes(32)
+
+    on_exit(fn ->
+      Router.unregister(key, connection)
+      Process.exit(connection, :kill)
+      Process.exit(watcher, :kill)
+    end)
+
+    assert Router.watch(watcher, queue) == :ok
+
+    # Hold the watcher's queue the way its own writer does mid-drain.
+    {:ok, token} = Lock.acquire_producer(queue.table, false, nil)
+    before = Metrics.snapshot()
+    assert Router.register(key, connection, Ring.new(1)) == :ok
+
+    assert_eventually(fn -> :ets.info(Derpex.Router.PendingLifecycle, :size) > 0 end, 200)
+    assert LifecycleQueue.size(queue) == 0
+
+    assert Metrics.snapshot()[:lifecycle_contention] > before[:lifecycle_contention]
+
+    # ADR 0003 promises a watcher's view is complete or absent: the frame waited
+    # for the lock rather than disappearing behind it.
+    Lock.release(queue.table, token)
+    assert_eventually(fn -> LifecycleQueue.size(queue) == 1 end, 200)
+
+    assert {:ok, {:peer_present, ^key, _ip, _port, _flags, _app}} = LifecycleQueue.take(queue)
+  end
+
   test "a stalled watcher still learns about every peer that arrived" do
     watcher = spawn(fn -> Process.sleep(:infinity) end)
     lifecycle = LifecycleQueue.new(notifier: watcher, owner: watcher)
@@ -596,6 +703,8 @@ defmodule Derpex.RouterTest do
     Enum.each(peers, fn peer ->
       assert Router.register(peer, watcher, Ring.new(1), Ring.new(1), lifecycle) == :ok
     end)
+
+    assert_eventually(fn -> LifecycleQueue.size(lifecycle) == 100 end, 200)
 
     present =
       Stream.repeatedly(fn -> LifecycleQueue.take(lifecycle) end)
@@ -768,6 +877,22 @@ defmodule Derpex.RouterTest do
   # Only the process that marked itself the holder parks inside the lock. The
   # router runs this same hook whenever it publishes into one of these rings,
   # and parking it there would wedge the singleton for every other test.
+  # A snapshot frame arrives from the router's own stream, so the first take
+  # after watch/2 waits for it.
+  defp take_when_ready(outbox, attempts \\ 200)
+  defp take_when_ready(outbox, 0), do: Outbox.take(outbox)
+
+  defp take_when_ready(outbox, attempts) do
+    case Outbox.take(outbox) do
+      :empty ->
+        Process.sleep(2)
+        take_when_ready(outbox, attempts - 1)
+
+      result ->
+        result
+    end
+  end
+
   defp holding_hook(parent) do
     fn
       :after_journal ->

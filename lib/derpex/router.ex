@@ -13,6 +13,7 @@ defmodule Derpex.Router do
   require Derpex.Outbox
 
   alias Derpex.Outbox
+  alias Derpex.Outbox.LifecycleQueue
   alias Derpex.Outbox.Ring
   alias Derpex.Router.ReversePaths
 
@@ -28,6 +29,15 @@ defmodule Derpex.Router do
   @activity_slot 1
   @duplicate_slot 2
   @activity_cache __MODULE__.CachedActivity
+
+  # A snapshot of a busy region is tens of thousands of frames; this is how many
+  # the router publishes before serving anything else.
+  @snapshot_chunk 1_024
+  @snapshot_pause_ms 5
+  # Frames that lost their watcher's queue lock, retried in order.
+  @pending_table __MODULE__.PendingLifecycle
+  @flush_budget 256
+  @flush_retry_ms 1
 
   @default_presence %{
     ip: <<0::128>>,
@@ -260,6 +270,13 @@ defmodule Derpex.Router do
 
     :ok = ReversePaths.new()
 
+    _pending_table =
+      :ets.new(@pending_table, [
+        :named_table,
+        :ordered_set,
+        :public
+      ])
+
     registrations_table =
       :ets.new(@registrations_table, [
         :named_table,
@@ -292,6 +309,7 @@ defmodule Derpex.Router do
        duplicates_table: duplicates_table,
        forwarders_table: forwarders_table,
        watchers: %{},
+       snapshots: %{},
        monitors: %{},
        forwarder_monitors: %{},
        routes: %{},
@@ -372,25 +390,30 @@ defmodule Derpex.Router do
     end
 
     forget_destination(connection)
+    _forgotten = forget_parked(connection)
     watchers = Map.delete(state.watchers, connection)
-    {:reply, :ok, %{state | monitors: monitors, routes: routes, watchers: watchers}}
+    snapshots = Map.delete(state.snapshots, connection)
+
+    {:reply, :ok,
+     %{state | monitors: monitors, routes: routes, watchers: watchers, snapshots: snapshots}}
   end
 
+  # The snapshot of a full region is tens of thousands of frames. Sending it
+  # from inside this call would hold the router for all of them and would
+  # overflow a watcher whose queue is already near its cap, so the keys are
+  # remembered and streamed a chunk at a time, between everything else the
+  # router has to do.
   def handle_call({:watch, connection, lifecycle}, _from, state) do
-    state.routes
-    |> snapshot_presence()
-    |> Enum.each(fn message ->
-      _enqueue_result = notify_enqueue(lifecycle, message)
-    end)
-
     {monitor, monitors} = ensure_monitor(state.monitors, connection)
     monitors = Map.put(monitors, connection, {monitor, keys_for(monitors, connection)})
+    send(self(), {:snapshot_chunk, connection})
 
     {:reply, :ok,
      %{
        state
        | monitors: monitors,
-         watchers: Map.put(state.watchers, connection, lifecycle)
+         watchers: Map.put(state.watchers, connection, lifecycle),
+         snapshots: Map.put(state.snapshots, connection, Map.keys(state.routes))
      }}
   end
 
@@ -443,6 +466,15 @@ defmodule Derpex.Router do
   end
 
   @impl true
+  def handle_info(:derpex_flush_lifecycle, state) do
+    :ok = flush_parked(@flush_budget)
+    {:noreply, state}
+  end
+
+  def handle_info({:snapshot_chunk, connection}, state) do
+    {:noreply, stream_snapshot(state, connection)}
+  end
+
   def handle_info({:DOWN, monitor, :process, connection, _reason}, state) do
     state = handle_connection_down(state, monitor, connection)
     {:noreply, handle_forwarder_down(state, monitor, connection)}
@@ -463,12 +495,14 @@ defmodule Derpex.Router do
 
         Enum.each(gone_keys, &broadcast(state.watchers, {:peer_gone, &1, 0x00}))
         forget_destination(connection)
+        _forgotten = forget_parked(connection)
 
         %{
           state
           | monitors: Map.delete(state.monitors, connection),
             routes: routes,
-            watchers: Map.delete(state.watchers, connection)
+            watchers: Map.delete(state.watchers, connection),
+            snapshots: Map.delete(state.snapshots, connection)
         }
 
       _different_or_missing_monitor ->
@@ -692,6 +726,54 @@ defmodule Derpex.Router do
     :atomics.put(activity, @duplicate_slot, duplicate)
   end
 
+  # One chunk per message: the router serves everything else between them, and a
+  # watcher that is already behind is waited for rather than overflowed.
+  defp stream_snapshot(state, connection) do
+    with {:ok, keys} <- Map.fetch(state.snapshots, connection),
+         {:ok, lifecycle} <- Map.fetch(state.watchers, connection) do
+      send_snapshot_chunk(state, connection, lifecycle, keys)
+    else
+      :error -> %{state | snapshots: Map.delete(state.snapshots, connection)}
+    end
+  end
+
+  defp send_snapshot_chunk(state, connection, _lifecycle, []) do
+    %{state | snapshots: Map.delete(state.snapshots, connection)}
+  end
+
+  defp send_snapshot_chunk(state, connection, lifecycle, keys) do
+    if room_for_snapshot_chunk?(lifecycle) do
+      {chunk, rest} = Enum.split(keys, @snapshot_chunk)
+
+      state.routes
+      |> snapshot_presence(chunk)
+      |> Enum.each(fn message ->
+        _enqueue_result = notify_enqueue(lifecycle, message, connection)
+      end)
+
+      if rest == [] do
+        %{state | snapshots: Map.delete(state.snapshots, connection)}
+      else
+        send(self(), {:snapshot_chunk, connection})
+        %{state | snapshots: Map.put(state.snapshots, connection, rest)}
+      end
+    else
+      _timer = Process.send_after(self(), {:snapshot_chunk, connection}, @snapshot_pause_ms)
+      state
+    end
+  end
+
+  defp room_for_snapshot_chunk?(%LifecycleQueue{} = queue),
+    do: LifecycleQueue.room_for?(queue, @snapshot_chunk)
+
+  defp room_for_snapshot_chunk?(_ring), do: true
+
+  defp snapshot_presence(routes, keys) do
+    routes
+    |> Map.take(keys)
+    |> snapshot_presence()
+  end
+
   defp snapshot_presence(routes) do
     Enum.flat_map(routes, fn {key, entries} ->
       case :ets.lookup(@table, key) do
@@ -714,8 +796,8 @@ defmodule Derpex.Router do
   end
 
   defp broadcast(watchers, message) do
-    Enum.each(watchers, fn {_connection, lifecycle} ->
-      _enqueue_result = notify_enqueue(lifecycle, message)
+    Enum.each(watchers, fn {connection, lifecycle} ->
+      _enqueue_result = notify_enqueue(lifecycle, message, connection)
     end)
 
     :ok
@@ -760,10 +842,71 @@ defmodule Derpex.Router do
     Metrics.add_drop(Metrics.default_handle(), :gone_disconnected, kind, byte_size(packet))
   end
 
-  # The router is a singleton. Waiting a millisecond for one connection's writer
+  # The router is a singleton: waiting a millisecond for one connection's writer
   # is a millisecond every other connection waits for the router, so lifecycle
-  # fan-out never naps on a held ring lock.
-  defp notify_enqueue(ring, message), do: safe_enqueue(ring, message, wait: false)
+  # fan-out never naps on a held queue lock. It does not drop the frame either.
+  # A presence change is state, and ADR 0003 promises a watcher's view is
+  # complete or absent, so a frame that loses the lock is parked and retried in
+  # order, and a watcher whose parked frames pass the soft cap is closed.
+  defp notify_enqueue(ring, message), do: notify_enqueue(ring, message, nil)
+
+  defp notify_enqueue(ring, message, nil), do: safe_enqueue(ring, message, wait: false)
+
+  defp notify_enqueue(ring, message, connection) do
+    if parked?(connection) do
+      park(connection, ring, message)
+    else
+      case safe_enqueue(ring, message, wait: false) do
+        {:dropped, :contention} -> park(connection, ring, message)
+        result -> result
+      end
+    end
+  end
+
+  defp parked?(connection) do
+    case :ets.next(@pending_table, {connection, -1}) do
+      {^connection, _sequence} -> true
+      _none -> false
+    end
+  end
+
+  defp park(connection, ring, message) do
+    :ok = Metrics.add(Metrics.default_handle(), :lifecycle_contention, 1)
+    sequence = :erlang.unique_integer([:positive, :monotonic])
+    true = :ets.insert(@pending_table, {{connection, sequence}, ring, message})
+    send(self(), :derpex_flush_lifecycle)
+    {:ok, :parked}
+  end
+
+  # One bounded pass per message, so flushing a backlog never holds the router.
+  defp flush_parked(0) do
+    send(self(), :derpex_flush_lifecycle)
+    :ok
+  end
+
+  defp flush_parked(budget) do
+    case :ets.first(@pending_table) do
+      :"$end_of_table" ->
+        :ok
+
+      key ->
+        [{^key, ring, message}] = :ets.lookup(@pending_table, key)
+
+        case safe_enqueue(ring, message, wait: false) do
+          {:dropped, :contention} ->
+            _timer = Process.send_after(self(), :derpex_flush_lifecycle, @flush_retry_ms)
+            :ok
+
+          _delivered_or_closed ->
+            true = :ets.delete(@pending_table, key)
+            flush_parked(budget - 1)
+        end
+    end
+  end
+
+  defp forget_parked(connection) do
+    :ets.select_delete(@pending_table, [{{{connection, :_}, :_, :_}, [], [true]}])
+  end
 
   defp route_forwarder(source, destination, packet) do
     case :ets.lookup(@forwarders_table, destination) do
