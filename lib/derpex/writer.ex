@@ -20,6 +20,7 @@ defmodule Derpex.Writer do
   @wake_message :derpex_outbox_ready
   @retry_message :derpex_outbox_retry
   @retry_interval_ms 5
+  @websocket_chunk_size 16 * 1_024
   @packet_classes [:ordinary, :disco, :pong]
 
   @type rings :: %{
@@ -298,10 +299,34 @@ defmodule Derpex.Writer do
   defp send_data(%{wire_mode: :native} = state, data),
     do: state.transport.send(state.socket, data)
 
-  # One WebSocket message per DERP frame, as iodata. Splitting a frame into
-  # 16 KB messages restarted the socket's write deadline on every chunk, so a
-  # stalled client could hold the writer far longer than its write timeout, and
-  # flattening the iodata copied every relayed packet.
-  defp send_data(%{wire_mode: :websocket} = state, data),
-    do: state.transport.send(state.socket, WebSocketFrame.encode_binary(data))
+  # The pinned Go client reads WebSocket messages with a 32 KB limit, so a
+  # 64 KB DERP frame has to arrive as several messages. The split happens over
+  # the iodata: only the binary straddling a chunk boundary is divided, and
+  # into sub-binaries, so no relayed packet is ever copied.
+  defp send_data(%{wire_mode: :websocket} = state, data) do
+    data
+    |> :erlang.iolist_to_iovec()
+    |> send_websocket_chunks(state)
+  end
+
+  defp send_websocket_chunks(iovec, state) do
+    {chunk, rest} = take_chunk(iovec, @websocket_chunk_size, [])
+
+    case state.transport.send(state.socket, WebSocketFrame.encode_binary(chunk)) do
+      :ok -> if rest == [], do: :ok, else: send_websocket_chunks(rest, state)
+      {:error, _reason} = error -> error
+    end
+  end
+
+  defp take_chunk([], _remaining, taken), do: {Enum.reverse(taken), []}
+  defp take_chunk(rest, 0, taken), do: {Enum.reverse(taken), rest}
+
+  defp take_chunk([binary | rest], remaining, taken) when byte_size(binary) <= remaining do
+    take_chunk(rest, remaining - byte_size(binary), [binary | taken])
+  end
+
+  defp take_chunk([binary | rest], remaining, taken) do
+    <<head::binary-size(^remaining), tail::binary>> = binary
+    {Enum.reverse([head | taken]), [tail | rest]}
+  end
 end
