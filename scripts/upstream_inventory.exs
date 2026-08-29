@@ -122,6 +122,10 @@ defmodule Derpex.UpstreamInventory do
       "ported conditional abuse, policy, disabled-status, and debug homepage sections in test/derpex/home_page_test.exs",
     {"cmd/derper/derper_test.go", "TestNoContent"} =>
       "ported all challenge validity cases in test/derpex/http1_test.exs",
+    {"cmd/derper/ipcert_test.go", "TestIPCertManager"} =>
+      "ported IPv4/IPv6 issuance with the shortlived profile, SNI checks, HTTP-01 routing and disk-cache reuse in test/derpex/certificates/ip_manager_test.exs, driven end to end against the ported fake certificate authority in test/derpex/acme/client_test.exs",
+    {"cmd/derper/ipcert_test.go", "TestIPCertManagerNextProvider"} =>
+      "ported DNS-SNI delegation without creating an IP certificate order in test/derpex/certificates/ip_manager_test.exs; a configured DNS hostname is ordered by the same manager rather than handed on",
     {"cmd/derper/ipcert_test.go", "TestCertModeIPCertsGating"} =>
       "ported certificate-mode/IP-host gating in test/derpex/certificates/mode_test.exs and the boot-time refusal of unimplemented modes in test/derpex/certificates/boot_test.exs",
     {"prober/derp_test.go", "TestDerpProber"} =>
@@ -164,16 +168,8 @@ defmodule Derpex.UpstreamInventory do
       "duplicate routing is compared step for step against the pinned Go server in test/interop/differential_test.exs; the connection lifecycle cases are in test/derpex/router_test.exs"
   }
 
-  # Rows that stay release-blocking until the work they name exists. Both
-  # ipcert rows drive an ACME issuance flow against a fake ACME server; DERPEX
-  # has no RFC 8555 client yet, so its IP certificate manager is only reachable
-  # behind DERPEX_IP_CERT_ISSUER=self and cannot claim the port.
-  @pending %{
-    {"cmd/derper/ipcert_test.go", "TestIPCertManager"} =>
-      "upstream drives issuance against a fake ACME server; DERPEX has no RFC 8555 client (PLAN.md section 2.3), so only the self-signed issuer behind DERPEX_IP_CERT_ISSUER=self is wired",
-    {"cmd/derper/ipcert_test.go", "TestIPCertManagerNextProvider"} =>
-      "the `:next_provider` hook exists but has no production caller — nothing can supply a DNS hostname provider until the ACME client does — so the delegation test in test/derpex/certificates/ip_manager_test.exs exercises a test-only fixture and does not close this row; PLAN.md section 2.3 records ACME as pending"
-  }
+  # Rows that stay release-blocking until the work they name exists.
+  @pending %{}
 
   # A row about a Go implementation detail. The behavior it protects is still
   # gated here, so each of these cites the artifact that gates it.

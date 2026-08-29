@@ -82,16 +82,30 @@ The separate Linux XDP package is not part of the current `cmd/derper` request
 path; its tests are recorded as implementation-specific unless later evidence
 shows an observable server requirement.
 
-ACME (RFC 8555) is **pending, not excepted**. The `letsencrypt` and `gcp`
-certificate modes and ACME-issued IP certificates are still required for
-compatibility; DERPEX has simply not written the client yet, so
-`DERPEX_CERT_MODE=letsencrypt` and `DERPEX_CERT_MODE=gcp` are rejected at boot
-with an error naming this section rather than silently downgraded to a
-self-signed certificate. `Derpex.Certificates.IPManager` is reachable only
-behind `DERPEX_IP_CERT_ISSUER=self`, which issues persistent self-signed per-IP
-certificates and contacts no certificate authority. The `TestIPCertManager` and
-`TestIPCertManagerNextProvider` inventory rows stay `pending` — release-blocking
-— until Milestone 9 lands the client and its fake-ACME tests.
+ACME (RFC 8555) is **implemented**, not excepted. `DERPEX_CERT_MODE=letsencrypt`
+and `DERPEX_CERT_MODE=gcp` obtain certificates through `Derpex.ACME`: ES256 JWS,
+an optional external account binding for GCP, `newOrder` with one DNS or IP
+identifier and the RFC 8555 profiles extension, HTTP-01 answered on the
+plaintext port, a single-SAN certificate request, finalize and chain download.
+No published Hex ACME library carries IP identifiers or the profiles extension,
+and adopting one would have widened the release's twelve-application runtime
+closure, so the client is written against OTP alone; ADR 0004 records the
+survey and the decision.
+
+Two consequences are worth stating rather than discovering:
+
+- An ACME mode requires `DERPEX_HTTP_PORT`. A certificate authority validates
+  HTTP-01 by connecting to port 80 at the identifier being validated, so the
+  configuration is refused at boot without a plaintext listener rather than
+  failing on the first order.
+- A listen socket binds one certificate and cannot be told about a renewal, so
+  the certificate manager publishes each issuance into the same
+  `:persistent_term` snapshot a rotated file-backed certificate uses, and
+  `Derpex.Listener.Transports.SSL` reads it per connection. A renewed
+  certificate therefore reaches hellos with and without SNI alike.
+
+`DERPEX_IP_CERT_ISSUER=self` remains as a local alternative: persistent
+self-signed per-IP certificates that contact no certificate authority.
 
 The following are recorded as explicit, user-approved compatibility exceptions
 so they are not implemented by accident:

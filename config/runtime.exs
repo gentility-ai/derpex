@@ -14,16 +14,36 @@ if config_env() == :prod do
   certfile = System.get_env("DERPEX_TLS_CERTFILE")
   keyfile = System.get_env("DERPEX_TLS_KEYFILE")
 
-  # `manual` is the only certificate mode DERPEX implements. The plan is
-  # resolved before anything else so an unimplemented mode is refused while the
-  # operator is still reading configuration errors, not after a listener has
-  # bound :443 — and it is refused whether or not a listener is configured, so
-  # a mesh-only or misconfigured node cannot hide the mistake.
+  # An ACME certificate authority validates HTTP-01 over plaintext HTTP, so the
+  # cleartext port is part of the certificate configuration rather than an
+  # afterthought: without it an ACME mode could never complete an order.
+  http_port =
+    case System.get_env("DERPEX_HTTP_PORT") do
+      nil ->
+        nil
+
+      text ->
+        case Integer.parse(text) do
+          {port, ""} when port in 1..65_535 -> port
+          _invalid -> raise "DERPEX_HTTP_PORT must be an integer from 1 through 65535"
+        end
+    end
+
+  # The certificate plan is resolved before anything else so a mode DERPEX
+  # cannot honour is refused while the operator is still reading configuration
+  # errors, not after a listener has bound :443 — and it is refused whether or
+  # not a listener is configured, so a mesh-only or misconfigured node cannot
+  # hide the mistake.
   certificate_options = [
     mode: System.get_env("DERPEX_CERT_MODE", "manual"),
     directory: System.get_env("DERPEX_CERT_DIR"),
     hostname: System.get_env("DERPEX_CERT_HOSTNAME"),
     ip_certificate_issuer: System.get_env("DERPEX_IP_CERT_ISSUER"),
+    email: System.get_env("DERPEX_ACME_EMAIL"),
+    eab_kid: System.get_env("DERPEX_ACME_EAB_KID"),
+    eab_key: System.get_env("DERPEX_ACME_EAB_KEY"),
+    directory_url: System.get_env("DERPEX_ACME_DIRECTORY_URL"),
+    challenge_listener: not is_nil(http_port),
     certfile: certfile,
     keyfile: keyfile
   ]
@@ -373,7 +393,7 @@ if config_env() == :prod do
 
     listener =
       cond do
-        certificate_plan.ip_certificate_issuer == :self ->
+        certificate_plan.ip_certificate_issuer != nil ->
           [
             port: port,
             transport_module: ThousandIsland.Transports.SSL,
@@ -418,7 +438,28 @@ if config_env() == :prod do
           ]
 
         true ->
-          raise "set DERPEX_TLS_CERTFILE and DERPEX_TLS_KEYFILE, set DERPEX_IP_CERT_ISSUER=self, or explicitly opt into DERPEX_CLEAR_HTTP=1"
+          raise "set DERPEX_TLS_CERTFILE and DERPEX_TLS_KEYFILE, set DERPEX_CERT_MODE=letsencrypt or DERPEX_IP_CERT_ISSUER=self, or explicitly opt into DERPEX_CLEAR_HTTP=1"
+      end
+
+    # A plaintext listener whose only reason to exist is answering HTTP-01
+    # challenges and the unauthenticated probe endpoints. It never carries a
+    # certificate, and `Derpex.Certificates.Boot` gives it the challenge source.
+    challenge_listener =
+      if http_port do
+        [
+          [
+            port: http_port,
+            plaintext_challenge: true,
+            transport_module: ThousandIsland.Transports.TCP,
+            socket_options: [
+              keepalive_ms: tcp_keepalive_ms,
+              user_timeout_ms: tcp_user_timeout_ms,
+              write_timeout_ms: tcp_write_timeout_ms
+            ]
+          ]
+        ]
+      else
+        []
       end
 
     disallowed_app_names =
@@ -534,7 +575,7 @@ if config_env() == :prod do
       accept_limit: accept_limit,
       gentility: gentility,
       identity_path: identity_path,
-      listeners: [listener],
+      listeners: [listener | challenge_listener],
       mesh_key: mesh_key,
       mesh_peers: mesh_peers,
       rate_config_path: rate_config_path,

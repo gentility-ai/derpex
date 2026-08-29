@@ -119,11 +119,37 @@ certificate, which is the intended stable pinned-certificate path.
 ### Certificate modes
 
 `DERPEX_CERT_MODE` selects the certificate provider and defaults to `manual`,
-the file-backed listener above. `letsencrypt` and `gcp` need an RFC 8555 ACME
-client, which DERPEX has not implemented yet, so both are **rejected at boot**
-with an error naming PLAN.md section 2.3 rather than silently downgraded.
+the file-backed listener above.
 
-`DERPEX_IP_CERT_ISSUER=self` is the one alternative: with
+`letsencrypt` obtains certificates over ACME (RFC 8555). It needs
+`DERPEX_CERT_DIR`, `DERPEX_CERT_HOSTNAME`, and `DERPEX_HTTP_PORT` — a
+certificate authority validates HTTP-01 by connecting to port 80 at the name or
+address being validated, so a configuration without a plaintext listener is
+refused at boot rather than failing on the first order:
+
+```sh
+DERPEX_LISTEN_PORT=443 \
+DERPEX_HTTP_PORT=80 \
+DERPEX_IDENTITY_PATH=/var/lib/derpex/derpex.key \
+DERPEX_CERT_MODE=letsencrypt \
+DERPEX_CERT_DIR=/var/lib/derpex/certs \
+DERPEX_CERT_HOSTNAME=derp.example.com \
+DERPEX_ACME_EMAIL=security@example.com \
+bin/derpex start
+```
+
+Set `DERPEX_IP_CERT_ISSUER=acme` with an IP address as
+`DERPEX_CERT_HOSTNAME` to order short-lived certificates for the address a
+connection arrives on, which is upstream's `--acme-ip-certs`. `gcp` is the same
+flow against Google's endpoint and additionally requires
+`DERPEX_ACME_EAB_KID`, `DERPEX_ACME_EAB_KEY`, and `DERPEX_ACME_EMAIL`.
+`DERPEX_ACME_DIRECTORY_URL` overrides the directory, which is how the tests
+point the client at a fake authority.
+
+The account key is created once at `DERPEX_CERT_DIR/acme-account.key` with mode
+`0600` and reused for every order.
+
+`DERPEX_IP_CERT_ISSUER=self` needs no certificate authority at all: with
 `DERPEX_CERT_DIR=/var/lib/derpex/certs` and `DERPEX_CERT_HOSTNAME` set to a bare
 IP address, the relay issues and caches a persistent self-signed certificate for
 that address (key `0600`, certificate `0644`) and serves it to SNI and no-SNI
@@ -135,11 +161,20 @@ than resolved by precedence.
 
 A certificate is served while it is inside its validity window and is renewed in
 the background once less than a third of its lifetime remains, so no handshake
-ever waits on an issuance unless there is nothing valid to serve. A failed
-issuance backs off from one minute to thirty, and the certificate already in hand
-keeps answering throughout. An SNI naming a different IP address, or a DNS name,
-is refused with a TLS `unrecognized_name` alert rather than answered with the
-listener's own certificate.
+ever waits on an issuance unless there is nothing valid to serve. Issuance runs
+in its own process, so an authority that takes minutes cannot stall a handshake
+for another address, and concurrent requests for one address share a single
+order. A failed issuance backs off from one minute to thirty, and the
+certificate already in hand keeps answering throughout. An SNI naming a
+different IP address, or an unconfigured DNS name, is refused with a TLS
+`unrecognized_name` alert rather than answered with the listener's own
+certificate.
+
+A listen socket binds one certificate and cannot be told about a renewal, so the
+relay binds whatever it has at boot — a cached certificate, or a self-signed one
+if the authority is unreachable — and publishes each issuance into the snapshot
+the TLS transport reads per connection. A renewed certificate therefore reaches
+clients that send SNI and clients that do not.
 
 The certificate plan is resolved before anything else starts, whether or not
 `DERPEX_LISTEN_PORT` is set, so a configuration mistake stops the boot rather

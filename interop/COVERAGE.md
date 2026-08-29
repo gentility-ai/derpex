@@ -23,10 +23,10 @@ a repository path that exists, and every `ported`, `black-box`, and
 | State | Count |
 | --- | ---: |
 | Total | 69 |
-| Ported | 52 |
+| Ported | 54 |
 | Black-box | 9 |
 | Differential | 2 |
-| Pending (release-blocking) | 2 |
+| Pending (release-blocking) | 0 |
 | Implementation-specific | 4 |
 
 | Area | Upstream test | Source | Disposition | Gate/notes |
@@ -92,8 +92,8 @@ a repository path that exists, and every `ported`, `black-box`, and
 | cmd/derper | `TestNoContent` | `cmd/derper/derper_test.go:42` | `ported` | ported all challenge validity cases in test/derpex/http1_test.exs |
 | cmd/derper | `TestDeps` | `cmd/derper/derper_test.go:101` | `implementation-specific` | Go dependency graph; the release's runtime application closure is held to an allowlist by scripts/dependency_closure.exs, which mix quality runs |
 | cmd/derper | `TestTemplate` | `cmd/derper/derper_test.go:116` | `ported` | ported conditional abuse, policy, disabled-status, and debug homepage sections in test/derpex/home_page_test.exs |
-| cmd/derper | `TestIPCertManager` | `cmd/derper/ipcert_test.go:328` | `pending` | upstream drives issuance against a fake ACME server; DERPEX has no RFC 8555 client (PLAN.md section 2.3), so only the self-signed issuer behind DERPEX_IP_CERT_ISSUER=self is wired |
-| cmd/derper | `TestIPCertManagerNextProvider` | `cmd/derper/ipcert_test.go:426` | `pending` | the `:next_provider` hook exists but has no production caller — nothing can supply a DNS hostname provider until the ACME client does — so the delegation test in test/derpex/certificates/ip_manager_test.exs exercises a test-only fixture and does not close this row; PLAN.md section 2.3 records ACME as pending |
+| cmd/derper | `TestIPCertManager` | `cmd/derper/ipcert_test.go:328` | `ported` | ported IPv4/IPv6 issuance with the shortlived profile, SNI checks, HTTP-01 routing and disk-cache reuse in test/derpex/certificates/ip_manager_test.exs, driven end to end against the ported fake certificate authority in test/derpex/acme/client_test.exs |
+| cmd/derper | `TestIPCertManagerNextProvider` | `cmd/derper/ipcert_test.go:426` | `ported` | ported DNS-SNI delegation without creating an IP certificate order in test/derpex/certificates/ip_manager_test.exs; a configured DNS hostname is ordered by the same manager rather than handed on |
 | cmd/derper | `TestCertModeIPCertsGating` | `cmd/derper/ipcert_test.go:448` | `ported` | ported certificate-mode/IP-host gating in test/derpex/certificates/mode_test.exs and the boot-time refusal of unimplemented modes in test/derpex/certificates/boot_test.exs |
 | DERP prober | `TestDerpProber` | `prober/derp_test.go:25` | `ported` | ported dynamic region filtering, probe inventory, and add/remove reconciliation in test/derpex/prober_test.exs |
 | DERP prober | `TestRunDerpProbeNodePair` | `prober/derp_test.go:146` | `black-box` | upstream 100 MB transfer and 30-packet in-flight bound run through DERPEX with unchanged official clients in test/interop/go_client_test.exs |

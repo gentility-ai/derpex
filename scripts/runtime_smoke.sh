@@ -5,10 +5,12 @@ image=${1:?usage: scripts/runtime_smoke.sh IMAGE}
 smoke_root=$(mktemp -d "${TMPDIR:-/tmp}/derpex-runtime-smoke.XXXXXX")
 container="derpex-runtime-smoke-$$"
 self_issuer_container="derpex-runtime-smoke-self-$$"
+acme_container="derpex-runtime-smoke-acme-$$"
 
 cleanup() {
   docker rm --force "$container" >/dev/null 2>&1 || true
   docker rm --force "$self_issuer_container" >/dev/null 2>&1 || true
+  docker rm --force "$acme_container" >/dev/null 2>&1 || true
   rm -rf "$smoke_root"
 }
 
@@ -110,9 +112,9 @@ fi
 
 echo "compiler-free runtime served TLS and hot-reloaded its certificate"
 
-# A certificate mode DERPEX cannot honour has to stop the container, not fall
-# back to some other certificate. PLAN.md section 2.3 records ACME as pending,
-# and the boot error has to say so where an operator will read it.
+# An ACME certificate mode answers HTTP-01 over plaintext HTTP, so a
+# configuration without a cleartext listener could never complete an order and
+# has to stop the container rather than fail on the first renewal.
 acme_status=0
 acme_output=$(
   docker run \
@@ -126,18 +128,64 @@ acme_output=$(
 ) || acme_status=$?
 
 if [[ "$acme_status" -eq 0 ]]; then
-  echo "runtime started with DERPEX_CERT_MODE=letsencrypt instead of refusing it" >&2
+  echo "runtime started an ACME mode with no plaintext listener" >&2
   printf '%s\n' "$acme_output" >&2
   exit 1
 fi
 
-if ! grep -q "PLAN.md section 2.3" <<<"$acme_output"; then
-  echo "letsencrypt refusal did not name PLAN.md section 2.3" >&2
+if ! grep -q "DERPEX_HTTP_PORT" <<<"$acme_output"; then
+  echo "ACME refusal did not name DERPEX_HTTP_PORT" >&2
   printf '%s\n' "$acme_output" >&2
   exit 1
 fi
 
-echo "runtime refused the unimplemented letsencrypt certificate mode"
+echo "runtime refused an ACME certificate mode with nowhere to answer a challenge"
+
+# With a plaintext listener the relay boots, binds TLS on a self-signed
+# certificate while the first order is outstanding, and answers the HTTP-01
+# path. The order itself cannot complete here — a real certificate authority
+# cannot reach this container — so the ACME flow proper is gated by the fake
+# authority in test/support/fake_acme.ex, which drives it over real sockets.
+docker run \
+  --rm \
+  --detach \
+  --name "$acme_container" \
+  --publish 127.0.0.1::80 \
+  --env DERPEX_LISTEN_PORT=443 \
+  --env DERPEX_HTTP_PORT=80 \
+  --env DERPEX_IDENTITY_PATH=/tmp/derpex.key \
+  --env DERPEX_CERT_MODE=letsencrypt \
+  --env DERPEX_CERT_DIR=/tmp/derpex-certs \
+  --env DERPEX_CERT_HOSTNAME=derp.example.com \
+  --env DERPEX_ACME_DIRECTORY_URL=http://127.0.0.1:1/directory \
+  --env DERPEX_STUN=0 \
+  "$image" >/dev/null
+
+acme_published=$(docker port "$acme_container" 80/tcp)
+acme_port=${acme_published##*:}
+acme_up=0
+
+for _attempt in {1..40}; do
+  status=$(
+    curl --silent --output /dev/null --write-out '%{http_code}' --max-time 2 \
+      "http://127.0.0.1:$acme_port/.well-known/acme-challenge/absent" || true
+  )
+
+  if [[ "$status" == "404" ]]; then
+    acme_up=1
+    break
+  fi
+
+  sleep 0.25
+done
+
+if [[ "$acme_up" -ne 1 ]]; then
+  echo "runtime did not answer the HTTP-01 challenge path" >&2
+  docker logs "$acme_container" >&2
+  exit 1
+fi
+
+echo "compiler-free runtime booted an ACME mode and answered its challenge path"
 
 # The one certificate source DERPEX can supply on its own: a self-signed
 # per-IP certificate, issued at boot and served to a client that sends no SNI.
