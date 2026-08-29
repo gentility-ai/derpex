@@ -724,14 +724,15 @@ defmodule Derpex.Listener.HandlerTest do
     assert_eventually(fn -> Manual.pending_timer_count() == 0 end)
   end
 
-  test "server_info reaches a client before any packet queued for it" do
+  test "a packet sent during a handshake is queued, and server_info still goes first" do
     {server_public, server_private} = Crypto.generate_keypair()
     {sender_public, sender_private} = Crypto.generate_keypair()
     {recipient_public, recipient_private} = Crypto.generate_keypair()
     parent = self()
 
-    # Registration publishes the recipient's rings; blocking here holds the
-    # handler at exactly that point while the sender floods the new route.
+    # Registration makes the recipient routable; blocking here holds the handler
+    # at exactly that point, before its server info is written and before its
+    # send loop starts, while the sender floods the new route.
     event_handler = fn
       {:authenticated, ^recipient_public, _info} = event ->
         send(parent, {:registering, self()})
@@ -777,10 +778,11 @@ defmodule Derpex.Listener.HandlerTest do
     assert_receive {:registering, handler}, 2_000
 
     packet = IO.iodata_to_binary(Frame.encode(:send_packet, [recipient_public, "flood"]))
+    before = Metrics.snapshot()
     for _ <- 1..64, do: :ok = :gen_tcp.send(sender, packet)
     assert_receive {:client_message, {:send_packet, ^recipient_public, "flood"}}, 2_000
 
-    # The flood is in the recipient's rings and its writer is draining them.
+    # The flood is in the recipient's queues, which no writer is draining yet.
     Process.sleep(50)
     send(handler, :flooded)
 
@@ -792,6 +794,18 @@ defmodule Derpex.Listener.HandlerTest do
 
     assert Handshake.decode_server_info(body, recipient_private, server_public) ==
              {:ok, %Derpex.ServerInfo{version: 2}}
+
+    # The packets that arrived mid-handshake were queued, not refused: the
+    # recipient was already registered when they were routed.
+    assert {:ok, <<packet_type, _length::unsigned-big-32>>} = :gen_tcp.recv(recipient, 5, 2_000)
+    assert packet_type == Frame.type(:recv_packet)
+
+    current = Metrics.snapshot()
+
+    for kind <- [:disco, :other] do
+      assert current[{:packets_dropped, :unknown_dest, kind}] ==
+               before[{:packets_dropped, :unknown_dest, kind}]
+    end
 
     :gen_tcp.close(sender)
     :gen_tcp.close(recipient)

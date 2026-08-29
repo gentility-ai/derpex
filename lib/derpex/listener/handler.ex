@@ -100,13 +100,6 @@ defmodule Derpex.Listener.Handler do
              wake_message: Writer.wake_message(),
              metrics: metrics
            ),
-         :ok <-
-           Writer.attach(writer, %{
-             ordinary: ordinary,
-             disco: disco,
-             pong: pong,
-             lifecycle: lifecycle
-           }),
          {:ok, session, actions} <-
            Session.new(
              private_key,
@@ -514,12 +507,27 @@ defmodule Derpex.Listener.Handler do
     end
   end
 
-  # Registering publishes this connection's rings, so its writer starts sending
-  # the moment it happens. Go starts its send loop only after writing server
-  # info, and this action runs after that write for the same reason.
+  # Go registers the client, writes its server info, and only then runs the
+  # send loop. Registering makes packets for this key land in its queues; they
+  # stay there, because the writer is given those queues by :start_send_loop,
+  # after the server info is written.
   defp execute_action(socket, state, {:register, key, info, can_mesh}) do
     with {:ok, state} <- register_authenticated(state, key, info, can_mesh) do
       {:ok, maybe_start_tcp_rtt(socket, state)}
+    end
+  end
+
+  defp execute_action(_socket, state, :start_send_loop) do
+    rings = %{
+      ordinary: state.ordinary,
+      disco: state.disco,
+      pong: state.pong,
+      lifecycle: state.lifecycle
+    }
+
+    case Writer.attach(state.writer, rings) do
+      :ok -> {:ok, state}
+      {:error, reason} -> {:error, {:send, reason}, state}
     end
   end
 

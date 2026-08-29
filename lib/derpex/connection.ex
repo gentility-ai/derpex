@@ -2,11 +2,13 @@ defmodule Derpex.Connection do
   @moduledoc """
   Pure protocol state machine for one DERP connection.
 
-  Socket adapters execute returned actions in order. A client is admitted,
-  then its server info is written, and only then is it registered for routing:
-  the order Go uses, and the reason no packet can overtake handshake
-  completion. No action sends packet data through a process mailbox; packet
-  messages are consumed synchronously by the reader.
+  Socket adapters execute returned actions in order, and the order is Go's: a
+  client is admitted, registered for routing, sent its server info, and only
+  then does its send loop start. Registering first means a packet sent to the
+  new client during its handshake is queued rather than dropped as unknown;
+  starting the send loop last means no queued packet can overtake the server
+  info. No action sends packet data through a process mailbox; packet messages
+  are consumed synchronously by the reader.
   """
 
   alias Derpex.ClientInfo
@@ -51,6 +53,7 @@ defmodule Derpex.Connection do
           | {:cancel_timeout, :handshake}
           | {:authenticated, binary(), ClientInfo.t(), boolean()}
           | {:register, binary(), ClientInfo.t(), boolean()}
+          | :start_send_loop
           | {:rate_limit, non_neg_integer()}
           | :activity
           | {:server_message, Body.server_message()}
@@ -227,8 +230,9 @@ defmodule Derpex.Connection do
 
       actions = [
         {:authenticated, client_public_key, client_info, can_mesh},
-        {:send, server_info},
         {:register, client_public_key, client_info, can_mesh},
+        {:send, server_info},
+        :start_send_loop,
         {:cancel_timeout, :handshake},
         {:set_timeout, :keep_alive, state.keep_alive_interval}
       ]
