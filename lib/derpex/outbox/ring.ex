@@ -172,6 +172,31 @@ defmodule Derpex.Outbox.Ring do
     end
   end
 
+  @doc """
+  Closes the ring and drops its ETS table. Idempotent.
+
+  A ring whose owner outlives it — the mesh client rebuilds one per reconnect —
+  must be deleted rather than merely closed, because the table is reclaimed
+  only when its owner dies. Call it from the process that owns the table.
+
+  The closed flag is raised before `close/1` rather than by it: `close/1`
+  reports `:busy` and leaves the flag alone when a producer holds the lock, and
+  the table is dropped either way. Without the flag first, a stale `%Ring{}`
+  still held by a producer would take the open path into a table identifier the
+  runtime is free to have handed to somebody else. With it, every later
+  `enqueue/2` answers `{:dropped, :closed}` off the atomics without touching
+  ETS at all.
+  """
+  @spec delete(t()) :: :ok
+  def delete(%__MODULE__{} = ring) do
+    :atomics.put(ring.state, @closed, 1)
+    _closed = close(ring)
+    true = :ets.delete(ring.table)
+    :ok
+  rescue
+    ArgumentError -> :ok
+  end
+
   defp enqueue_locked(ring, item, lock_token) do
     if atomic_get(ring, @closed) == 1 do
       record_drop(ring, item, :gone_disconnected)

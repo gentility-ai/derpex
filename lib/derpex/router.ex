@@ -409,7 +409,7 @@ defmodule Derpex.Router do
     if Enum.any?(entries, fn {registered_identity, _ring, _sequence} ->
          registered_identity == identity
        end) do
-      {:reply, :ok, state}
+      {:reply, :ok, replace_forwarder_ring(state, key, entries, identity, ring)}
     else
       entries = entries ++ [{identity, ring, activity_sequence()}]
       publish_preferred_forwarder(key, entries)
@@ -716,6 +716,21 @@ defmodule Derpex.Router do
     end)
 
     :ok
+  end
+
+  # A re-registering identity brings a fresh ring: a mesh client builds a new
+  # one per reconnect and deletes the old. Keeping the ring already on file
+  # would publish a table that no longer exists, so swap it in place and leave
+  # the sequence alone so preference order does not shift under the swap.
+  defp replace_forwarder_ring(state, key, entries, identity, ring) do
+    entries =
+      Enum.map(entries, fn
+        {^identity, _stale_ring, sequence} -> {identity, ring, sequence}
+        entry -> entry
+      end)
+
+    publish_preferred_forwarder(key, entries)
+    %{state | forwarders: Map.put(state.forwarders, key, entries)}
   end
 
   defp safe_enqueue(ring, message) do
