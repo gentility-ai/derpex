@@ -3,13 +3,25 @@
 # SPDX-License-Identifier: BSD-3-Clause
 
 defmodule Derpex.Certificates.IPManager do
-  @moduledoc "Caches and serves per-destination-IP certificates from an ACME issuer."
+  @moduledoc """
+  Caches and serves per-destination-IP certificates from an injected issuer.
+
+  A cached certificate is served only while `Derpex.Clock` reports a time
+  inside its validity window, and is reissued once less than a third of its
+  lifetime remains — upstream `certNeedsRenewal`, which replaces a six-day
+  LetsEncrypt short-lived certificate after roughly four days.
+
+  The only issuer DERPEX ships is `self_signed_issuer/2`, reachable through
+  `DERPEX_IP_CERT_ISSUER=self`. The ACME issuer this manager was modelled on
+  is pending; PLAN.md section 2.3 records that.
+  """
 
   use GenServer
 
   alias Derpex.AtomicFile
   alias Derpex.Certificates
   alias Derpex.Certificates.Manual
+  alias Derpex.Clock
   alias Derpex.MetaCertificate
 
   @short_lived_profile "shortlived"
@@ -185,18 +197,36 @@ defmodule Derpex.Certificates.IPManager do
 
   defp certificate_for_ip(state, ip) do
     case Map.fetch(state.certificates, ip) do
-      {:ok, certificate} ->
-        {:ok, certificate, state}
+      {:ok, entry} ->
+        serve_or_renew(state, ip, entry)
 
       :error ->
         load_or_issue(state, ip)
     end
   end
 
+  defp serve_or_renew(state, ip, entry) do
+    cond do
+      not valid_now?(entry) -> load_or_issue(state, ip)
+      needs_renewal?(entry) -> renew(state, ip, entry)
+      true -> {:ok, entry.certificate, state}
+    end
+  end
+
+  # A renewal that cannot reach its issuer must not take a listener's working
+  # certificate away: upstream keeps serving the cached leaf until NotAfter and
+  # retries, so a failed renewal falls back to the certificate still in hand.
+  defp renew(state, ip, entry) do
+    case issue(state, ip) do
+      {:ok, certificate, state} -> {:ok, certificate, state}
+      {:error, _reason, state} -> {:ok, entry.certificate, state}
+    end
+  end
+
   defp load_or_issue(state, ip) do
     case load_cached(state.directory, ip) do
-      {:ok, certificate} ->
-        {:ok, certificate, cache_certificate(state, ip, certificate)}
+      {:ok, entry} ->
+        {:ok, entry.certificate, put_entry(state, ip, entry)}
 
       {:error, _cache_reason} ->
         issue(state, ip)
@@ -207,8 +237,9 @@ defmodule Derpex.Certificates.IPManager do
     case state.issuer.(ip, @short_lived_profile) do
       {:ok, %{certificate_der: certificate_der, private_key: private_key} = certificate} ->
         with :ok <- Manual.verify_certificate(certificate_der, ip),
+             {:ok, entry} <- valid_entry(certificate),
              :ok <- write_cached(state.directory, ip, certificate_der, private_key) do
-          {:ok, certificate, cache_certificate(state, ip, certificate)}
+          {:ok, certificate, put_entry(state, ip, entry)}
         else
           {:error, reason} -> {:error, {:issuance, reason}, state}
         end
@@ -218,8 +249,8 @@ defmodule Derpex.Certificates.IPManager do
     end
   end
 
-  defp cache_certificate(state, ip, certificate) do
-    %{state | certificates: Map.put(state.certificates, ip, certificate)}
+  defp put_entry(state, ip, entry) do
+    %{state | certificates: Map.put(state.certificates, ip, entry)}
   end
 
   defp load_cached(directory, ip) do
@@ -229,13 +260,80 @@ defmodule Derpex.Certificates.IPManager do
            certificate_path |> File.read!() |> :public_key.pem_decode(),
          [key_entry | _rest] <- key_path |> File.read!() |> :public_key.pem_decode(),
          private_key <- :public_key.pem_entry_decode(key_entry),
-         :ok <- Manual.verify_certificate(certificate_der, ip) do
-      {:ok, %{certificate_der: certificate_der, private_key: private_key}}
+         :ok <- Manual.verify_certificate(certificate_der, ip),
+         {:ok, entry} <-
+           valid_entry(%{certificate_der: certificate_der, private_key: private_key}),
+         false <- needs_renewal?(entry) do
+      {:ok, entry}
     else
       _invalid -> {:error, :invalid_cache}
     end
   rescue
     _error -> {:error, :cache_miss}
+  end
+
+  # `Derpex.Clock` is the only time source: renewal and expiry are observable
+  # server behavior, so they have to be steerable from a test clock.
+  defp valid_entry(certificate) do
+    case validity(certificate.certificate_der) do
+      {:ok, {not_before, not_after}} ->
+        entry = %{certificate: certificate, not_before: not_before, not_after: not_after}
+
+        if valid_now?(entry) do
+          {:ok, entry}
+        else
+          {:error, {:certificate_not_valid_now, not_before, not_after}}
+        end
+
+      :error ->
+        {:error, :unreadable_certificate_validity}
+    end
+  end
+
+  defp valid_now?(entry) do
+    now = Clock.system_time(:second)
+    now >= entry.not_before and now <= entry.not_after
+  end
+
+  # Upstream `certNeedsRenewal`: renew once less than a third of the lifetime
+  # remains, so a six-day LetsEncrypt short-lived certificate is replaced after
+  # roughly four.
+  defp needs_renewal?(entry) do
+    now = Clock.system_time(:second)
+    entry.not_after - now < div(entry.not_after - entry.not_before, 3)
+  end
+
+  defp validity(certificate_der) do
+    {:Validity, not_before, not_after} =
+      certificate_der
+      |> :public_key.pkix_decode_cert(:otp)
+      |> elem(1)
+      |> elem(5)
+
+    {:ok, {unix_seconds!(not_before), unix_seconds!(not_after)}}
+  rescue
+    _unreadable -> :error
+  end
+
+  # RFC 5280: a two-digit `utcTime` year of 50 or more is 19xx, otherwise 20xx.
+  defp unix_seconds!({:utcTime, characters}) do
+    <<year::binary-size(2), rest::binary>> = IO.chardata_to_string(characters)
+    century = if String.to_integer(year) >= 50, do: "19", else: "20"
+    unix_seconds!(century <> year <> rest)
+  end
+
+  defp unix_seconds!({:generalTime, characters}) do
+    unix_seconds!(IO.chardata_to_string(characters))
+  end
+
+  defp unix_seconds!(
+         <<year::binary-size(4), month::binary-size(2), day::binary-size(2), hour::binary-size(2),
+           minute::binary-size(2), second::binary-size(2), "Z">>
+       ) do
+    {:ok, datetime, 0} =
+      DateTime.from_iso8601("#{year}-#{month}-#{day}T#{hour}:#{minute}:#{second}Z")
+
+    DateTime.to_unix(datetime)
   end
 
   defp write_cached(directory, ip, certificate_der, private_key) do
