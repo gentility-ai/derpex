@@ -16,6 +16,17 @@ defmodule Derpex.UpstreamInventory do
     {"XDP", ["derp/xdp/xdp_linux_test.go"]}
   ]
 
+  # Rows that stay release-blocking until the work they name exists. The
+  # `ipcert` rows both drive an ACME issuance flow against a fake ACME server;
+  # DERPEX has no RFC 8555 client yet, so its IP certificate manager is only
+  # reachable behind `DERPEX_IP_CERT_ISSUER=self` and cannot claim the port.
+  @pending %{
+    {"cmd/derper/ipcert_test.go", "TestIPCertManager"} =>
+      "upstream drives issuance against a fake ACME server; DERPEX has no RFC 8555 client (PLAN.md section 2.3), so only the self-signed issuer behind DERPEX_IP_CERT_ISSUER=self is wired",
+    {"cmd/derper/ipcert_test.go", "TestIPCertManagerNextProvider"} =>
+      "next-provider delegation is only observable once an ACME hostname provider exists; PLAN.md section 2.3 records ACME as pending"
+  }
+
   @implementation_specific %{
     {"cmd/derper/derper_test.go", "TestDeps"} =>
       "Go dependency graph; protected behavior maps to the runtime-boundary artifact gate",
@@ -128,10 +139,6 @@ defmodule Derpex.UpstreamInventory do
       "ported conditional abuse, policy, disabled-status, and debug homepage sections",
     {"cmd/derper/ipcert_test.go", "TestCertModeIPCertsGating"} =>
       "ported certificate-mode/IP-host gating and optional hostname-provider composition",
-    {"cmd/derper/ipcert_test.go", "TestIPCertManager"} =>
-      "ported IPv4/IPv6 issuance with shortlived profile, SNI checks, HTTP-01 routing, and disk-cache reuse",
-    {"cmd/derper/ipcert_test.go", "TestIPCertManagerNextProvider"} =>
-      "ported DNS-SNI delegation to the next provider without creating an IP certificate order",
     {"cmd/derper/derper_test.go", "TestNoContent"} =>
       "ported all challenge validity cases in test/derpex/http1_test.exs",
     {"derp/derp_test.go", "TestClientInfoUnmarshal"} =>
@@ -221,6 +228,9 @@ defmodule Derpex.UpstreamInventory do
 
       note = @implementation_specific[{file, name}] ->
         {area, file, line, name, "implementation-specific", note}
+
+      note = @pending[{file, name}] ->
+        {area, file, line, name, "pending", note}
 
       true ->
         {area, file, line, name, "pending", "release-blocking mapping not yet implemented"}

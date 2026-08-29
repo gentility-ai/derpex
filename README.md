@@ -106,6 +106,20 @@ files leave the last good certificate active. Set
 polling. Raw-IP clients do not send SNI and continue to use the startup manual
 certificate, which is the intended stable pinned-certificate path.
 
+### Certificate modes
+
+`DERPEX_CERT_MODE` selects the certificate provider and defaults to `manual`,
+the file-backed listener above. `letsencrypt` and `gcp` need an RFC 8555 ACME
+client, which DERPEX has not implemented yet, so both are **rejected at boot**
+with an error naming PLAN.md section 2.3 rather than silently downgraded.
+
+`DERPEX_IP_CERT_ISSUER=self` is the one alternative: with
+`DERPEX_CERT_DIR=/var/lib/derpex/certs` and `DERPEX_CERT_HOSTNAME` set to a bare
+IP address, the relay issues and caches a persistent self-signed certificate for
+that address (key `0600`, certificate `0644`) and serves it to SNI and no-SNI
+hellos alike. It contacts no certificate authority. Any other value of
+`DERPEX_IP_CERT_ISSUER` is rejected at boot.
+
 The server identity is created atomically with mode `0600` and is stable across
 restarts. The UDP STUN service listens on port `3478` by default whenever the
 DERP listener is enabled. Set `DERPEX_STUN_PORT` to change it or

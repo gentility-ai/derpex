@@ -12,8 +12,8 @@ disposition map and review that change together with `interop/upstream.lock`.
 | State | Count |
 | --- | ---: |
 | Total | 69 |
-| Ported | 65 |
-| Pending (release-blocking) | 0 |
+| Ported | 63 |
+| Pending (release-blocking) | 2 |
 | Implementation-specific | 4 |
 
 | Area | Upstream test | Source | Disposition | Gate/notes |
@@ -79,8 +79,8 @@ disposition map and review that change together with `interop/upstream.lock`.
 | cmd/derper | `TestNoContent` | `cmd/derper/derper_test.go:42` | `ported` | ported all challenge validity cases in test/derpex/http1_test.exs |
 | cmd/derper | `TestDeps` | `cmd/derper/derper_test.go:101` | `implementation-specific` | Go dependency graph; protected behavior maps to the runtime-boundary artifact gate |
 | cmd/derper | `TestTemplate` | `cmd/derper/derper_test.go:116` | `ported` | ported conditional abuse, policy, disabled-status, and debug homepage sections |
-| cmd/derper | `TestIPCertManager` | `cmd/derper/ipcert_test.go:328` | `ported` | ported IPv4/IPv6 issuance with shortlived profile, SNI checks, HTTP-01 routing, and disk-cache reuse |
-| cmd/derper | `TestIPCertManagerNextProvider` | `cmd/derper/ipcert_test.go:426` | `ported` | ported DNS-SNI delegation to the next provider without creating an IP certificate order |
+| cmd/derper | `TestIPCertManager` | `cmd/derper/ipcert_test.go:328` | `pending` | upstream drives issuance against a fake ACME server; DERPEX has no RFC 8555 client (PLAN.md section 2.3), so only the self-signed issuer behind DERPEX_IP_CERT_ISSUER=self is wired |
+| cmd/derper | `TestIPCertManagerNextProvider` | `cmd/derper/ipcert_test.go:426` | `pending` | next-provider delegation is only observable once an ACME hostname provider exists; PLAN.md section 2.3 records ACME as pending |
 | cmd/derper | `TestCertModeIPCertsGating` | `cmd/derper/ipcert_test.go:448` | `ported` | ported certificate-mode/IP-host gating and optional hostname-provider composition |
 | DERP prober | `TestDerpProber` | `prober/derp_test.go:25` | `ported` | ported dynamic region filtering, probe inventory, and add/remove reconciliation in test/derpex/prober_test.exs |
 | DERP prober | `TestRunDerpProbeNodePair` | `prober/derp_test.go:146` | `ported` | upstream 100 MB transfer and 30-packet in-flight bound run through DERPEX with unchanged official clients |

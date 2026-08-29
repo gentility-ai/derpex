@@ -27,6 +27,19 @@ if config_env() == :prod do
     certfile = System.get_env("DERPEX_TLS_CERTFILE")
     keyfile = System.get_env("DERPEX_TLS_KEYFILE")
     clear_http? = System.get_env("DERPEX_CLEAR_HTTP") == "1"
+
+    # `manual` is the only certificate mode DERPEX implements. Resolving the
+    # plan here refuses `letsencrypt` and `gcp` while the operator is still
+    # reading configuration errors, not after a listener has bound :443.
+    certificate_options = [
+      mode: System.get_env("DERPEX_CERT_MODE", "manual"),
+      directory: System.get_env("DERPEX_CERT_DIR"),
+      hostname: System.get_env("DERPEX_CERT_HOSTNAME"),
+      ip_certificate_issuer: System.get_env("DERPEX_IP_CERT_ISSUER")
+    ]
+
+    certificate_plan = Derpex.Certificates.Boot.plan!(certificate_options)
+
     mesh_key_text = System.get_env("DERPEX_MESH_KEY")
     mesh_with_text = System.get_env("DERPEX_MESH_WITH")
     disallowed_app_names_text = System.get_env("DERPEX_DISALLOWED_APP_NAMES")
@@ -308,6 +321,21 @@ if config_env() == :prod do
 
     listener =
       cond do
+        certificate_plan.ip_certificate_issuer == :self ->
+          [
+            port: port,
+            transport_module: ThousandIsland.Transports.SSL,
+            socket_options: [
+              keepalive_ms: tcp_keepalive_ms,
+              user_timeout_ms: tcp_user_timeout_ms,
+              write_timeout_ms: tcp_write_timeout_ms
+            ],
+            transport_options: [
+              versions: [:"tlsv1.3"],
+              alpn_preferred_protocols: ["http/1.1"]
+            ]
+          ]
+
         certfile && keyfile ->
           [
             port: port,
@@ -338,7 +366,7 @@ if config_env() == :prod do
           ]
 
         true ->
-          raise "set DERPEX_TLS_CERTFILE and DERPEX_TLS_KEYFILE, or explicitly opt into DERPEX_CLEAR_HTTP=1"
+          raise "set DERPEX_TLS_CERTFILE and DERPEX_TLS_KEYFILE, set DERPEX_IP_CERT_ISSUER=self, or explicitly opt into DERPEX_CLEAR_HTTP=1"
       end
 
     disallowed_app_names =
@@ -452,6 +480,7 @@ if config_env() == :prod do
 
     config :derpex,
       accept_limit: accept_limit,
+      certificates: certificate_options,
       gentility: gentility,
       identity_path: identity_path,
       listeners: [listener],

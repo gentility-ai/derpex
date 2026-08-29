@@ -8,7 +8,9 @@ defmodule Derpex.Certificates.IPManager do
   use GenServer
 
   alias Derpex.AtomicFile
+  alias Derpex.Certificates
   alias Derpex.Certificates.Manual
+  alias Derpex.MetaCertificate
 
   @short_lived_profile "shortlived"
   @challenge_prefix "/.well-known/acme-challenge/"
@@ -48,6 +50,54 @@ defmodule Derpex.Certificates.IPManager do
   @doc "The ACME profile required for short-lived IP certificates."
   @spec profile() :: binary()
   def profile, do: @short_lived_profile
+
+  @doc """
+  Issues a persistent self-signed certificate for `ip`.
+
+  This is the only issuer DERPEX ships. It contacts no certificate authority,
+  so `DERPEX_IP_CERT_ISSUER=self` never depends on the ACME client that
+  PLAN.md section 2.3 records as pending.
+  """
+  @spec self_signed_issuer(binary(), binary()) :: {:ok, certificate()} | {:error, term()}
+  def self_signed_issuer(ip, _profile) do
+    with {:ok, {certificate_der, private_key}} <- Manual.generate_ip(ip) do
+      {:ok, %{certificate_der: certificate_der, private_key: private_key}}
+    end
+  end
+
+  @doc "Returns OTP TLS options for one managed certificate, DERP metacertificate appended."
+  @spec tls_options(certificate(), binary()) :: keyword()
+  def tls_options(certificate, <<server_public_key::binary-size(32)>>) do
+    certificate_options(certificate, MetaCertificate.generate(server_public_key))
+  end
+
+  @doc """
+  Returns an OTP SNI callback backed by this manager.
+
+  OTP consults `sni_fun` only for a hello that carries a `server_name`, so a
+  no-SNI hello keeps the certificate the listener bound for `local_ip`. Both
+  paths therefore answer for the same local address, and a name the manager
+  refuses — a mismatched IP, or a DNS name with no next provider — declines
+  the handshake instead of serving the wrong certificate.
+  """
+  @spec sni_fun(GenServer.server(), binary(), binary()) ::
+          (charlist() -> keyword() | :undefined)
+  def sni_fun(manager, local_ip, <<server_public_key::binary-size(32)>>) do
+    # The metacertificate only carries the server node key, so it is built once
+    # per listener rather than per hello: an RSA key pair on the handshake path
+    # would cost more than the DERP handshake it advertises.
+    meta_certificate = MetaCertificate.generate(server_public_key)
+
+    fn server_name ->
+      case certificate(manager, local_ip, IO.chardata_to_string(server_name)) do
+        {:ok, %{certificate_der: _der, private_key: _key} = certificate} ->
+          certificate_options(certificate, meta_certificate)
+
+        _no_certificate_for_this_name ->
+          :undefined
+      end
+    end
+  end
 
   @impl true
   def init(options) do
@@ -202,6 +252,25 @@ defmodule Derpex.Certificates.IPManager do
     with :ok <- AtomicFile.write(certificate_path, certificate_pem, mode: @certificate_mode) do
       AtomicFile.write(key_path, key_pem, mode: @key_mode)
     end
+  end
+
+  defp certificate_options(
+         %{certificate_der: certificate_der, private_key: private_key},
+         meta_certificate
+       ) do
+    [
+      certs_keys: [
+        %{
+          cert: Certificates.append_meta_certificate([certificate_der], meta_certificate),
+          key: tls_private_key(private_key)
+        }
+      ]
+    ]
+  end
+
+  defp tls_private_key(private_key) do
+    type = elem(private_key, 0)
+    {type, :public_key.der_encode(type, private_key)}
   end
 
   defp certificate_paths(directory, ip) do
