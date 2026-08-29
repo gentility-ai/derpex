@@ -1,6 +1,7 @@
 defmodule Derpex.WriterTest do
   use ExUnit.Case, async: true
 
+  alias Derpex.Outbox.LifecycleQueue
   alias Derpex.Outbox.Ring
   alias Derpex.Router
   alias Derpex.Writer
@@ -340,6 +341,51 @@ defmodule Derpex.WriterTest do
     assert Writer.write_control(writer, "server-info", mesh_timeout + 1_000) == :ok
   end
 
+  test "a reverse path is recorded before the packet is written" do
+    {:ok, writer} =
+      Writer.start_link(
+        owner: self(),
+        transport: ControlledTransport,
+        socket: {self(), :blocking, :blocked}
+      )
+
+    rings = rings(writer)
+    source = :crypto.strong_rand_bytes(32)
+    on_exit(fn -> Router.ReversePaths.take(source) end)
+
+    enqueue_until_accepted(rings.ordinary, {:recv_packet, source, "in flight"})
+    assert_receive {:write_blocked, :blocking, ^writer, _frame}
+
+    # The write has not returned, and the source may already be gone: Go
+    # records its watcher before writing for exactly this reason.
+    assert reverse_paths_for(source) == 1
+    assert [{connection, _lifecycle}] = Router.ReversePaths.take(source)
+    assert connection == self()
+
+    send(writer, :unblock_write)
+  end
+
+  test "a writer that stops takes its reverse paths with it" do
+    {:ok, writer} =
+      Writer.start_link(
+        owner: self(),
+        transport: ControlledTransport,
+        socket: {self(), :orphan, :open}
+      )
+
+    rings = rings(writer)
+    source = :crypto.strong_rand_bytes(32)
+
+    enqueue_until_accepted(rings.ordinary, {:recv_packet, source, "packet"})
+    assert_receive {:write_finished, :orphan, _frame}
+    assert reverse_paths_for(source) == 1
+
+    # The queue dies with the connection, so a row still pointing at it would
+    # be a peer-gone frame published into a table that no longer exists.
+    :ok = GenServer.stop(writer)
+    assert reverse_paths_for(source) == 0
+  end
+
   test "a source is noted once until it goes away and comes back" do
     {:ok, writer} =
       Writer.start_link(
@@ -399,17 +445,25 @@ defmodule Derpex.WriterTest do
         socket: {self(), :fair, :open}
       )
 
-    rings = rings(writer)
     source = :crypto.strong_rand_bytes(32)
 
-    # Fill the ordinary ring before the writer can drain it, so every ordinary
-    # packet is older than the pong and the disco packet that follow.
+    rings = %{
+      ordinary: Ring.new(32, notifier: writer, wake_message: Writer.wake_message()),
+      disco: Ring.new(32, notifier: writer, wake_message: Writer.wake_message()),
+      pong: Ring.new(1, notifier: writer, wake_message: Writer.wake_message(), full: :reject),
+      lifecycle: LifecycleQueue.new(notifier: writer, wake_message: Writer.wake_message())
+    }
+
+    # Everything is queued before the writer is given the rings, so every
+    # ordinary packet is older than the pong and the disco packet, and none of
+    # them can be written before the comparison starts.
     for sequence <- 1..32 do
       enqueue_until_accepted(rings.ordinary, {:recv_packet, source, <<sequence::32>>})
     end
 
     enqueue_until_accepted(rings.pong, {:pong, "12345678"})
     enqueue_until_accepted(rings.disco, {:recv_packet, source, disco_packet()})
+    :ok = Writer.attach(writer, rings)
 
     frames = collect_frames(20)
     pong_position = Enum.find_index(frames, &match?({:pong, _payload}, &1))

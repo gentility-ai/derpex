@@ -11,6 +11,9 @@ defmodule Derpex.ClientInfo do
   @min_integer -9_223_372_036_854_775_808
   @max_integer 9_223_372_036_854_775_807
 
+  # The peer's mesh key authenticates it to this relay. It has no business in a
+  # crash report, a log line, or anything else that renders process state.
+  @derive {Inspect, except: [:mesh_key]}
   defstruct mesh_key: nil,
             version: 0,
             can_ack_pings: false,

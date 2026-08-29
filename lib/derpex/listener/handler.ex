@@ -5,6 +5,10 @@ defmodule Derpex.Listener.Handler do
 
   require Logger
 
+  # What a paced connection may hold while it waits: one segment's worth, not a
+  # client's entire send buffer.
+  @paced_read_limit 64 * 1_024
+
   alias Derpex.AcceptLimiter
   alias Derpex.Admission
   alias Derpex.Admission.Request, as: AdmissionRequest
@@ -178,19 +182,37 @@ defmodule Derpex.Listener.Handler do
     end
   end
 
+  # Thousand Island re-arms the socket on its way out of every handle_data, so a
+  # paced connection is handed one more segment per cycle however passive we
+  # make it in between. That is fine while it is one segment; it is not fine
+  # unbounded, so what a paced connection may hold is capped, and a client that
+  # keeps sending past the cap is closed rather than buffered.
   @impl ThousandIsland.Handler
-  def handle_data(data, socket, %{wire_mode: :websocket} = state) do
-    case receive_websocket_data(socket, state, data) do
-      {:ok, state} -> {:continue, state}
-      {:close, state} -> {:close, state}
-      {:error, reason, state} -> {:error, reason, state}
+  def handle_data(data, _socket, %{paced: paced} = state) when paced != nil do
+    buffered = state.paced_data <> data
+
+    if byte_size(buffered) > @paced_read_limit do
+      :ok = Metrics.add(state.metrics, :paced_read_overruns, 1)
+      {:error, {:paced_read_overrun, byte_size(buffered)}, state}
+    else
+      {:continue, %{state | paced_data: buffered}, {:continue, :derpex_pause_reads}}
     end
   end
 
-  # While paced the socket is passive, but one message may already have been in
-  # flight. It waits with the rest of the client's bytes.
-  def handle_data(data, _socket, %{paced: paced} = state) when paced != nil do
-    {:continue, %{state | paced_data: state.paced_data <> data}, {:continue, :derpex_pause_reads}}
+  def handle_data(data, socket, %{wire_mode: :websocket} = state) do
+    case receive_websocket_data(socket, state, data) do
+      {:ok, state} ->
+        {:continue, state}
+
+      {:pace, delay, state, actions, events} ->
+        {:continue, pace(state, delay, actions, events), {:continue, :derpex_pause_reads}}
+
+      {:close, state} ->
+        {:close, state}
+
+      {:error, reason, state} ->
+        {:error, reason, state}
+    end
   end
 
   def handle_data(data, socket, state) do
@@ -225,9 +247,9 @@ defmodule Derpex.Listener.Handler do
 
   def handle_info(
         {:derpex_rate_limit_ready, token},
-        {socket, %{paced: {token, _timer, pending}} = state}
+        {socket, %{paced: {token, _timer, actions, events}} = state}
       ) do
-    resume_reads(socket, %{state | paced: nil}, pending)
+    resume_reads(socket, %{state | paced: nil}, actions, events)
   end
 
   def handle_info({:derpex_rate_limit_ready, _stale_token}, {socket, state}) do
@@ -379,23 +401,66 @@ defmodule Derpex.Listener.Handler do
     {:noreply, {socket, state}}
   end
 
-  # Finishing the paced frame can pace again on the next one, and the data that
-  # arrived just before the socket went passive is parsed here rather than
-  # thrown away.
-  # Finishing the paced frame can pace again on the next one, and the data that
-  # arrived just before the socket went passive is parsed here rather than
-  # thrown away.
-  defp resume_reads(socket, state, pending_actions) do
+  # Finishing the paced frame can pace again on the next one, and both the
+  # messages that arrived with it and the bytes that arrived just before the
+  # socket went passive are handled here rather than thrown away.
+  defp resume_reads(socket, state, pending_actions, pending_events) do
     socket
     |> execute_actions(state, pending_actions)
-    |> continue_paced(socket)
+    |> continue_paced(socket, pending_events)
   end
+
+  defp continue_paced({:ok, state}, socket, events) do
+    case process_websocket_events(socket, state, events) do
+      {:ok, state} ->
+        resume_paced_data(socket, state)
+
+      {:pace, delay, state, actions, rest} ->
+        {:noreply, {socket, pace(state, delay, actions, rest)}}
+
+      {:close, state} ->
+        resume(socket, {:close, state})
+
+      {:error, reason, state} ->
+        resume(socket, {:error, reason, state})
+    end
+  end
+
+  defp continue_paced({:pace, delay, state, actions}, socket, events),
+    do: {:noreply, {socket, pace(state, delay, actions, events)}}
+
+  defp continue_paced({:error, {:admission, _reason}, state}, socket, _events),
+    do: resume(socket, {:close, state})
+
+  defp continue_paced({:error, {:connection_close, _reason}, state}, socket, _events),
+    do: resume(socket, {:close, state})
+
+  defp continue_paced({:error, reason, state}, socket, _events),
+    do: resume(socket, {:error, reason, state})
 
   defp resume_paced_data(socket, %{paced_data: <<>>} = state) do
     # Back through Thousand Island's own continuation, so re-arming the socket
     # also resets its read timer, and so a FIN that arrived while the socket
     # was passive is delivered as {:tcp_closed, _} as soon as it is re-armed.
     resume(socket, {:continue, state})
+  end
+
+  defp resume_paced_data(socket, %{wire_mode: :websocket} = state) do
+    data = state.paced_data
+
+    case receive_websocket_data(socket, %{state | paced_data: <<>>}, data) do
+      {:ok, state} ->
+        resume_paced_data(socket, state)
+
+      {:pace, delay, state, actions, events} ->
+        {:noreply, {socket, pace(state, delay, actions, events)}}
+
+      {:close, state} ->
+        resume(socket, {:close, state})
+
+      {:error, reason, state} ->
+        resume(socket, {:error, reason, state})
+    end
   end
 
   defp resume_paced_data(socket, state) do
@@ -406,7 +471,7 @@ defmodule Derpex.Listener.Handler do
       {:ok, session, actions} ->
         socket
         |> execute_actions(%{state | session: session}, actions)
-        |> continue_paced(socket)
+        |> continue_paced(socket, [])
 
       {:close, session, _reason, actions} ->
         case execute_actions(socket, %{state | session: session}, actions) do
@@ -417,20 +482,6 @@ defmodule Derpex.Listener.Handler do
     end
   end
 
-  defp continue_paced({:ok, state}, socket), do: resume_paced_data(socket, state)
-
-  defp continue_paced({:pace, delay, state, pending}, socket),
-    do: {:noreply, {socket, pace(state, delay, pending)}}
-
-  defp continue_paced({:error, {:admission, _reason}, state}, socket),
-    do: resume(socket, {:close, state})
-
-  defp continue_paced({:error, {:connection_close, _reason}, state}, socket),
-    do: resume(socket, {:close, state})
-
-  defp continue_paced({:error, reason, state}, socket),
-    do: resume(socket, {:error, reason, state})
-
   defp resume(socket, continuation) do
     ThousandIsland.Handler.handle_continuation(continuation, socket)
   end
@@ -438,11 +489,11 @@ defmodule Derpex.Listener.Handler do
   # Pacing is a state, not a pause in the code: the handler keeps answering
   # keepalives, rate updates and close requests while the client's own bytes
   # wait in the kernel buffer.
-  defp pace(state, delay_microseconds, pending_actions) do
+  defp pace(state, delay_microseconds, pending_actions, pending_events \\ []) do
     token = make_ref()
     milliseconds = max(div(delay_microseconds + 999, 1_000), 1)
     timer = Clock.send_after(self(), {:derpex_rate_limit_ready, token}, milliseconds)
-    %{state | paced: {token, timer, pending_actions}}
+    %{state | paced: {token, timer, pending_actions, pending_events}}
   end
 
   # A control write may not give up before the socket does. The socket's own
@@ -727,12 +778,15 @@ defmodule Derpex.Listener.Handler do
       {:ok, session, actions} ->
         case execute_actions(socket, %{state | session: session}, actions) do
           {:ok, state} -> process_websocket_events(socket, state, rest)
+          # The messages this one arrived with wait with it.
+          {:pace, delay, state, actions} -> {:pace, delay, state, actions, rest}
           {:error, reason, state} -> close_or_error(reason, state)
         end
 
       {:close, session, _reason, actions} ->
         case execute_actions(socket, %{state | session: session}, actions) do
           {:ok, state} -> {:close, state}
+          {:pace, _delay, state, _actions} -> {:close, state}
           {:error, reason, state} -> {:error, reason, state}
         end
     end

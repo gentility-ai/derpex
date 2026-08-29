@@ -111,14 +111,31 @@ defmodule Derpex.Connection do
   def receive_data(%__MODULE__{} = state, chunk) when is_binary(chunk) do
     case Decoder.push(state.decoder, chunk) do
       {:ok, frames, decoder} ->
+        {actions, decoder} = charge(state, decoder)
+
         state
         |> Map.put(:decoder, decoder)
-        |> process_frames(frames, [])
+        |> process_frames(frames, actions)
 
       {:error, reason} ->
         close(state, reason, [])
     end
   end
+
+  # The limiter is charged for every byte a header declared, before the frames
+  # in this chunk are acted on and before the rest of a large body has arrived.
+  # Before authentication there is no per-client limiter - as in Go, where
+  # rateLimit runs only in the authenticated read loop - so what a pipelined
+  # frame declared stays on the decoder's tally and is charged on the next
+  # chunk, which for a large body is the next chunk of that same body.
+  defp charge(%__MODULE__{phase: :authenticated}, decoder) do
+    case Decoder.take_charge(decoder) do
+      {0, decoder} -> {[], decoder}
+      {charged, decoder} -> {[{:rate_limit, charged}], decoder}
+    end
+  end
+
+  defp charge(_state, decoder), do: {[], decoder}
 
   @doc "Applies a named protocol deadline."
   @spec timeout(t(), atom()) :: {:ok, t(), []} | {:close, t(), atom(), []}
@@ -162,10 +179,10 @@ defmodule Derpex.Connection do
 
   defp process_frames(
          %__MODULE__{phase: :authenticated} = state,
-         [{_type, {:discarded, length}} | rest],
+         [{_type, {:discarded, _length}} | rest],
          actions
        ) do
-    process_frames(state, rest, [:activity, {:rate_limit, length} | actions])
+    process_frames(state, rest, [:activity | actions])
   end
 
   defp process_frames(%__MODULE__{phase: :authenticated} = state, [frame | rest], actions) do
@@ -176,21 +193,15 @@ defmodule Derpex.Connection do
   end
 
   defp process_buffered_frame(state, rest, actions, frame) do
-    length = frame |> elem(1) |> byte_size()
-
     case decode_client_frame(state, frame) do
       {:ok, message} ->
-        process_frames(
-          state,
-          rest,
-          [{:client_message, message}, :activity, {:rate_limit, length} | actions]
-        )
+        process_frames(state, rest, [{:client_message, message}, :activity | actions])
 
       :ignore ->
-        process_frames(state, rest, [:activity, {:rate_limit, length} | actions])
+        process_frames(state, rest, [:activity | actions])
 
       {:error, reason} ->
-        close(state, reason, Enum.reverse([:activity, {:rate_limit, length} | actions]))
+        close(state, reason, Enum.reverse([:activity | actions]))
     end
   end
 
@@ -222,10 +233,9 @@ defmodule Derpex.Connection do
           client_info: client_info,
           can_mesh: can_mesh,
           decoder:
-            Decoder.with_frame_policy(
-              state.decoder,
-              &authenticated_frame_policy(&1, &2, can_mesh)
-            )
+            state.decoder
+            |> Decoder.discharge(byte_size(body))
+            |> Decoder.with_frame_policy(&authenticated_frame_policy(&1, &2, can_mesh))
       }
 
       actions = [

@@ -27,14 +27,22 @@ published slot or discards an unpublished reservation. Closing clears all
 slots and prevents further publication.
 
 The single writer drains until `:empty`; observing empty clears the wake flag
-while holding the lock. Enqueue signals before publication while holding that
-same lock, so the consumer cannot observe the wake before the operation is
-committed or recovered. A writer that finds a ring locked ends the drain and
-schedules one short retry: it never re-sends itself a wakeup, because the
-producer holding the lock may have coalesced its signal into the wakeup being
-handled, and a self-wakeup would then spin until that producer commits. The
-writer also drains once when its rings are attached, since a wakeup raised
-before attachment has no rings to drain and is not repeated.
+while holding the lock. Enqueue claims the wakeup under that lock and sends it
+after releasing: the consumer therefore cannot observe a wakeup before the
+operation it is being woken for is committed, and it is never woken into a lock
+the producer still holds. The message is sent before the flag is set, so a
+producer that dies mid-signal leaves a flag that says "not yet woken" and the
+next enqueue wakes the writer rather than coalescing into a message that was
+never sent. A writer that finds a ring locked yields for the same bounded budget a producer
+gets, and only then ends the drain and schedules one short retry (five
+milliseconds). It never re-sends itself a wakeup, because the producer holding
+the lock may have coalesced its signal into the wakeup being handled, and a
+self-wakeup would spin until that producer commits. The retry is a safety net,
+not a mechanism: when it was reached on the ordinary path — a writer woken from
+inside the lock, missing on a single attempt — it put a 6 ms mode into the
+relay's latency, recorded in `docs/benchmarks/2026-08-29.md`. The writer also
+drains once when its rings are attached, since a wakeup raised before
+attachment has no rings to drain and is not repeated.
 
 ## Consequences
 

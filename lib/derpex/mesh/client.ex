@@ -53,6 +53,7 @@ defmodule Derpex.Mesh.Client do
   alias Derpex.Secret
 
   @wake_message :derpex_mesh_outbox_ready
+  @busy_retry_ms 5
   @reconnect_message :derpex_mesh_reconnect
   @recv_deadline_message :derpex_mesh_recv_deadline
   @default_reconnect_interval 5_000
@@ -407,7 +408,10 @@ defmodule Derpex.Mesh.Client do
         :ok
 
       :busy ->
-        send(self(), @wake_message)
+        # A producer holds the ring. Re-waking immediately spins against it;
+        # the producer will signal after it publishes, and this timer is the
+        # safety net for the wakeup it may have coalesced into this one.
+        _timer = Process.send_after(self(), @wake_message, @busy_retry_ms)
         :ok
 
       :closed ->

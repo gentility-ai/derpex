@@ -79,9 +79,15 @@ defmodule Derpex.Outbox.Lock do
     end
   end
 
-  @doc "Acquires for the single consumer: one attempt, never a wait."
+  @doc """
+  Acquires for the single consumer: the same yields a producer gets, no naps.
+
+  A writer woken by a publish that has not yet released the lock would
+  otherwise miss on its one attempt and wait for its retry timer, turning a
+  microsecond of overlap into milliseconds of latency.
+  """
   @spec acquire_consumer(:ets.tid()) :: result()
-  def acquire_consumer(table), do: try_acquire_or_reclaim(table)
+  def acquire_consumer(table), do: acquire_producer(table, false, nil)
 
   @doc "Acquires for an administrative caller: yields inside the same budget."
   @spec acquire(:ets.tid()) :: result()

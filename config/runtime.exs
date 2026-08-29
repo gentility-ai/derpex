@@ -11,6 +11,20 @@ if config_env() == :prod do
 
   config :derpex, shutdown: [deadline_ms: shutdown_deadline_ms, poll_ms: 25]
 
+  max_connections =
+    case Integer.parse(System.get_env("DERPEX_MAX_CONNECTIONS", "65536")) do
+      {value, ""} when value in 1..16_777_216 -> value
+      _invalid -> raise "DERPEX_MAX_CONNECTIONS must be an integer from 1 through 16777216"
+    end
+
+  read_timeout_ms =
+    case Integer.parse(System.get_env("DERPEX_READ_TIMEOUT_MS", "60000")) do
+      {value, ""} when value in 1_000..86_400_000 -> value
+      _invalid -> raise "DERPEX_READ_TIMEOUT_MS must be an integer from 1000 through 86400000"
+    end
+
+  config :derpex, max_connections: max_connections, read_timeout_ms: read_timeout_ms
+
   certfile = System.get_env("DERPEX_TLS_CERTFILE")
   keyfile = System.get_env("DERPEX_TLS_KEYFILE")
 

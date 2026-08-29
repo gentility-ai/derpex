@@ -213,7 +213,6 @@ defmodule Derpex.Outbox.RingTest do
     ring = Ring.new(4, wake_message: :ready, test_hook: holding_hook(parent))
     {holder, holder_monitor} = spawn_monitor(fn -> Ring.enqueue(ring, :held) end)
 
-    assert_receive :ready
     assert_receive {:holding, ^holder}
 
     Enum.each(1..5, fn _attempt ->
@@ -227,6 +226,9 @@ defmodule Derpex.Outbox.RingTest do
     send(holder, :release)
     assert_receive {:DOWN, ^holder_monitor, :process, ^holder, :normal}
 
+    # The wakeup follows the release, not the publish, so it arrives once the
+    # writer can actually take what it is being woken for.
+    assert_receive :ready
     assert Ring.take(ring) == {:ok, :held}
   end
 
@@ -324,11 +326,16 @@ defmodule Derpex.Outbox.RingTest do
 
     ring = Ring.new(1, wake_message: :ready, test_hook: hook)
     {producer, monitor} = spawn_monitor(fn -> Ring.enqueue(ring, :packet) end)
-    assert_receive :ready
     assert_receive {:stopped, ^producer}
     Process.exit(producer, :kill)
     assert_receive {:DOWN, ^monitor, :process, ^producer, :killed}
     assert Ring.take(ring) == expected
+
+    # A producer that died mid-publish sent no wakeup, and left none claimed:
+    # the next enqueue wakes the writer rather than coalescing into a message
+    # that was never sent.
+    assert Ring.enqueue(ring, :after_the_kill) == {:ok, :wake}
+    assert_receive :ready
   end
 
   defp holding_hook(parent) do

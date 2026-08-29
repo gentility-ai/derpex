@@ -10,6 +10,10 @@ defmodule Derpex.ListenerSupervisor do
 
   use Supervisor
 
+  @default_max_connections 65_536
+  @default_read_timeout_ms 60_000
+  @default_acceptors 100
+
   require Logger
 
   alias Derpex.Admission.Gentility
@@ -79,6 +83,8 @@ defmodule Derpex.ListenerSupervisor do
 
     options =
       options
+      |> Keyword.put_new(:num_connections, connections_per_acceptor(options))
+      |> Keyword.put_new(:read_timeout, read_timeout_ms())
       |> Keyword.put(:handler_module, Handler)
       |> Keyword.put(:handler_options, handler_options)
       |> configure_tls(public_key, certificate_manager)
@@ -86,6 +92,24 @@ defmodule Derpex.ListenerSupervisor do
       |> configure_transport()
 
     Supervisor.child_spec({ThousandIsland, options}, id: {ThousandIsland, index})
+  end
+
+  # Thousand Island counts connections per acceptor, so a relay with a hundred
+  # acceptors and the library default would accept 1.6 million of them. The cap
+  # is a whole-listener number, divided by the acceptors that share it.
+  defp connections_per_acceptor(options) do
+    acceptors = Keyword.get(options, :num_acceptors, @default_acceptors)
+    max(div(max_connections(), acceptors), 1)
+  end
+
+  defp max_connections do
+    Application.get_env(:derpex, :max_connections, @default_max_connections)
+  end
+
+  # A client that opens a socket, declares a frame and then stops sending holds
+  # a connection and its buffers until something closes it.
+  defp read_timeout_ms do
+    Application.get_env(:derpex, :read_timeout_ms, @default_read_timeout_ms)
   end
 
   defp server_public_key!(private_key) do
