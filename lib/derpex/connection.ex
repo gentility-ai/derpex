@@ -241,18 +241,25 @@ defmodule Derpex.Connection do
 
   defp authorize_client_message(_state, message), do: {:ok, message}
 
+  # Go's `recvClientKey` rejects a first frame whose header type is not
+  # `client_info`, so the body of such a frame is never read. Once the
+  # client-info header is admitted, later headers pipelined into the same chunk
+  # are governed by the authenticated policy with mesh permission still pending.
   defp handshake_frame_policy(type, length) do
     cond do
-      type == Frame.type(:client_info) and length > @max_client_info_length ->
+      type != Frame.type(:client_info) ->
+        {:error, {:unexpected_handshake_frame, type}}
+
+      length > @max_client_info_length ->
         {:error, {:frame_too_large, length, @max_client_info_length}}
 
-      type == Frame.type(:client_info) ->
-        :buffer
-
       true ->
-        authenticated_frame_policy(type, length, :pending)
+        {:buffer, &pending_frame_policy/2}
     end
   end
+
+  defp pending_frame_policy(type, length),
+    do: authenticated_frame_policy(type, length, :pending)
 
   defp authenticated_frame_policy(type, length, mesh_permission) do
     case Frame.type_name(type) do

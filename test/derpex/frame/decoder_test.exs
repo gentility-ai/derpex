@@ -86,6 +86,34 @@ defmodule Derpex.Frame.DecoderTest do
     assert Decoder.finish(decoder) == :ok
   end
 
+  test "hands later headers in the same chunk to the successor policy" do
+    successor = fn
+      0xFE, _length -> :discard
+      type, _length -> {:error, {:unexpected, type}}
+    end
+
+    first = fn
+      0xFD, _length -> {:buffer, successor}
+      type, _length -> {:error, {:unexpected, type}}
+    end
+
+    decoder = Decoder.new(frame_policy: first)
+
+    chunk =
+      IO.iodata_to_binary([
+        Frame.encode(0xFD, "opening"),
+        Frame.encode(0xFE, "later")
+      ])
+
+    assert {:ok, [{0xFD, "opening"}, {0xFE, {:discarded, 5}}], decoder} =
+             Decoder.push(decoder, chunk)
+
+    assert Decoder.finish(decoder) == :ok
+
+    assert Decoder.push(decoder, Frame.encode_header(0xFD, 0)) ==
+             {:error, {:unexpected, 0xFD}}
+  end
+
   defp decode_chunks(chunks) do
     {frames, decoder} =
       Enum.reduce(chunks, {[], Decoder.new()}, fn chunk, {frames, decoder} ->

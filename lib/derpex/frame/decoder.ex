@@ -21,8 +21,11 @@ defmodule Derpex.Frame.Decoder do
             frame_policy: nil
 
   @type frame :: {Frame.type_code(), binary() | {:discarded, non_neg_integer()}}
+  @type frame_mode :: :buffer | :discard
   @type frame_policy :: (Frame.type_code(), non_neg_integer() ->
-                           :buffer | :discard | {:error, term()})
+                           frame_mode()
+                           | {frame_mode(), frame_policy()}
+                           | {:error, term()})
   @opaque t :: %__MODULE__{
             header: binary(),
             type: nil | Frame.type_code(),
@@ -53,7 +56,12 @@ defmodule Derpex.Frame.Decoder do
     %{decoder | max_frame_length: max_frame_length}
   end
 
-  @doc "Changes the header policy used for buffering, bounded discard, or rejection."
+  @doc """
+  Changes the header policy used for buffering, bounded discard, or rejection.
+
+  A policy may also return `{mode, next_policy}` to govern only the frame it
+  just admitted and hand every later header in the same chunk to `next_policy`.
+  """
   @spec with_frame_policy(t(), frame_policy()) :: t()
   def with_frame_policy(%__MODULE__{} = decoder, frame_policy)
       when is_function(frame_policy, 2) do
@@ -97,9 +105,15 @@ defmodule Derpex.Frame.Decoder do
 
   defp start_payload(decoder, type, payload_length, chunk, frames) do
     case frame_policy(decoder, type, payload_length) do
-      :buffer -> start_frame(decoder, type, payload_length, :buffer, chunk, frames)
-      :discard -> start_frame(decoder, type, payload_length, :discard, chunk, frames)
-      {:error, reason} -> {:error, reason}
+      mode when mode in [:buffer, :discard] ->
+        start_frame(decoder, type, payload_length, mode, chunk, frames)
+
+      {mode, next_policy} when mode in [:buffer, :discard] ->
+        decoder = %{decoder | frame_policy: next_policy}
+        start_frame(decoder, type, payload_length, mode, chunk, frames)
+
+      {:error, reason} ->
+        {:error, reason}
     end
   end
 

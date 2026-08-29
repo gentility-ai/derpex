@@ -218,6 +218,18 @@ defmodule Derpex.ConnectionTest do
     assert state.decoder.fragments == []
   end
 
+  test "closes a wrong first frame on its header rather than after its body" do
+    {_server_public, server_private} = Crypto.generate_keypair()
+    {:ok, state, _actions} = Connection.new(server_private)
+
+    {microseconds, result} =
+      :timer.tc(fn -> Connection.receive_data(state, <<0xFF, 0xFFFFFFFF::32>>) end)
+
+    assert {:close, closed, {:unexpected_handshake_frame, 0xFF}, []} = result
+    assert Connection.info(closed).phase == :closed
+    assert microseconds < 100_000
+  end
+
   test "closes on a client-info frame above the pre-authentication cap" do
     {_server_public, server_private} = Crypto.generate_keypair()
     {:ok, state, _actions} = Connection.new(server_private)
