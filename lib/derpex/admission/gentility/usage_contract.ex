@@ -178,6 +178,9 @@ defmodule Derpex.Admission.Gentility.UsageContract do
     end
   end
 
+  # Must stay identical to `Usage`'s `row_identity/1` ordering, which pre-sorts a
+  # window into this exact order so a window can be cut into batches without
+  # re-sorting and without an entry moving between batches.
   defp entry_identity(entry) do
     {entry.organization_id, entry.node_id, entry.owner_kind, entry.deployment_id}
   end

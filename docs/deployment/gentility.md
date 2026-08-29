@@ -73,13 +73,19 @@ means the cache bound is below the instance's working set: raise
 
 ## Usage export
 
-Each fixed window is exported as one or more batches of at most 10 000 sender
-attributions; a busier window simply produces more batches with the same
-window bounds. A batch the contract cannot encode is logged, counted in
-`derpex_gentility_usage_dropped_rows`, and its rows are deleted, because a
-window that can never be encoded would otherwise block the spool and shed every
-relayed packet behind it. Any increase in that counter is an accounting loss
-and must alert.
+Each fixed window is exported as one or more batches with the same window
+bounds. A batch is bounded twice: at most 10 000 sender attributions, and at
+most 8 MiB on the wire. The window is ordered once and cut into batches of
+10 000; a cut still too large for the wire — long identities make that
+possible well below 10 000 entries — is bisected and retried until each half
+encodes. A busier or wider window therefore produces more batches, never a
+loss.
+
+Only a single row that cannot encode on its own is discarded. It is logged,
+counted in `derpex_gentility_usage_dropped_rows`, and deleted, because a row
+that can never be encoded would otherwise block the spool and shed every
+relayed packet behind it. Every other row sharing its window is still
+exported. Any increase in that counter is an accounting loss and must alert.
 
 ## Milestone 0 launch inputs
 

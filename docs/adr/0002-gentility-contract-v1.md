@@ -62,8 +62,8 @@ the DERPEX instance, region, fixed window, and sorted sender-attribution
 entries. Entries contain Gentility node, organization, owner kind, deployment,
 and accepted/dropped packet and byte totals. They never contain a destination,
 peer relationship, payload, source IP, or packet timing. A batch carries at most 10 000
-entries; a window with more sender attributions is exported as several batches
-that share its bounds, each content-addressed independently. The SHA-256 digest
+entries and at most 8 MiB of wire; a window exceeding either bound is exported
+as several batches that share its bounds, each content-addressed independently. The SHA-256 digest
 of the complete record is its idempotency key. Export transport must authenticate
 the DERPEX instance; usage records are not bearer authorization and are not
 individually signed. `UsageContractTest` fixes the cross-language vector.
@@ -76,9 +76,10 @@ individually signed. `UsageContractTest` fixes the cross-language vector.
 - The format deliberately avoids JSON canonicalization and serialization
   libraries in the relay critical path.
 - Contract evolution requires a new version; unknown versions fail closed.
-- A batch that cannot be encoded is dropped rather than retried forever: it is
-  logged, its rows are counted in `derpex_gentility_usage_dropped_rows`, and
-  they are deleted. Losing bounded accounting is preferable to a window that
-  can never drain and therefore sheds every relayed packet behind it.
+- A batch that cannot be encoded is bisected, not discarded. Only a single row
+  that still fails alone is dropped: it is logged, counted in
+  `derpex_gentility_usage_dropped_rows`, and deleted. Losing one row of
+  accounting is preferable to a window that can never drain and therefore sheds
+  every relayed packet behind it; losing the window with it is not.
 - Regional budgets are authoritative local allocations. Global coordination
   and billing export remain separate protocols layered on the lease fields.

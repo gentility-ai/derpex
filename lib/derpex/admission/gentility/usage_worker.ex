@@ -219,23 +219,36 @@ defmodule Derpex.Admission.Gentility.UsageWorker do
   defp rotate_usage(state) do
     now = state.clock.system_time(:millisecond)
 
-    case Usage.oldest_closed(
-           state.table,
-           state.window_ms,
-           state.instance_id,
-           state.region_id,
-           now,
-           UsageContract.max_entries()
-         ) do
+    case Usage.oldest_closed(state.table, state.window_ms, now) do
       nil -> state
-      {batch, rows} -> commit_batch(state, batch, rows)
+      {window_start, rows} -> drain_window(state, window_start, rows)
     end
   end
 
-  defp commit_batch(state, batch, rows) do
+  # The window is snapshotted and ordered once; it is then cut into batches the
+  # contract accepts. A cut that is still too large for the wire is bisected
+  # rather than discarded, so a window of large identities is exported in full.
+  defp drain_window(state, _window_start, []), do: state
+
+  defp drain_window(state, window_start, rows) do
+    {chunk, rest} = Enum.split(rows, UsageContract.max_entries())
+
+    case commit_rows(state, window_start, chunk) do
+      {:ok, state} when rest == [] -> rotate_usage(state)
+      {:ok, state} -> drain_window(state, window_start, rest)
+      {:blocked, state} -> state
+    end
+  end
+
+  defp commit_rows(state, _window_start, []), do: {:ok, state}
+
+  defp commit_rows(state, window_start, rows) do
+    batch =
+      Usage.batch(state.instance_id, state.region_id, window_start, state.window_ms, rows)
+
     case UsageContract.encode(batch) do
       {:ok, encoded} -> spool_batch(state, encoded, rows)
-      {:error, reason} -> drop_batch(state, batch, rows, reason)
+      {:error, reason} -> bisect_or_drop(state, window_start, rows, reason)
     end
   end
 
@@ -244,25 +257,39 @@ defmodule Derpex.Admission.Gentility.UsageWorker do
       {:ok, spool} ->
         :ok = Usage.delete_rows(state.table, rows)
         :atomics.put(state.blocked, 1, 0)
-        rotate_usage(%{state | spool: spool, last_error: nil})
+        {:ok, %{state | spool: spool, last_error: nil}}
 
       {:error, reason} ->
         :atomics.put(state.blocked, 1, 1)
-        %{state | last_error: reason}
+        {:blocked, %{state | last_error: reason}}
     end
   end
 
-  # A batch the contract cannot encode would otherwise be retried forever and
-  # block every packet behind the billing ledger. Account for the loss, drop
-  # the rows, and keep draining the window.
-  defp drop_batch(state, batch, rows, reason) do
-    Logger.warning(
-      "gentility usage batch dropped: #{inspect(reason)} " <>
-        "(window #{batch.window_start_ms}, #{length(rows)} rows)"
-    )
+  # Halving isolates whatever the contract rejects. Only a single row that still
+  # cannot encode on its own is dropped: everything that shares the window with
+  # it is exported normally.
+  defp bisect_or_drop(state, window_start, [row], reason) do
+    {:ok, drop_row(state, window_start, row, reason)}
+  end
 
-    :ok = Usage.delete_rows(state.table, rows)
-    rotate_usage(%{state | dropped_rows: state.dropped_rows + length(rows)})
+  defp bisect_or_drop(state, window_start, rows, _reason) do
+    {left, right} = Enum.split(rows, div(length(rows), 2))
+
+    case commit_rows(state, window_start, left) do
+      {:ok, state} -> commit_rows(state, window_start, right)
+      {:blocked, state} -> {:blocked, state}
+    end
+  end
+
+  # A row the contract can never encode would otherwise be retried forever and
+  # block every packet behind the billing ledger. Account for the loss, delete
+  # it, and keep draining the window.
+  defp drop_row(state, window_start, row, reason) do
+    Logger.warning("gentility usage row dropped: #{inspect(reason)} (window #{window_start})")
+
+    :ok = Usage.delete_rows(state.table, [row])
+    :atomics.put(state.blocked, 1, 0)
+    %{state | dropped_rows: state.dropped_rows + 1, last_error: nil}
   end
 
   defp start_export(%{export: export} = state) when not is_nil(export), do: state

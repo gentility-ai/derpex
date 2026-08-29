@@ -3,7 +3,6 @@ defmodule Derpex.Admission.Gentility.Usage do
 
   alias Derpex.Admission.Gentility.UsageBatch
   alias Derpex.Admission.Gentility.UsageBatch.Entry
-  alias Derpex.Admission.Gentility.UsageContract
 
   @type outcome :: :accepted | :dropped
 
@@ -38,28 +37,14 @@ defmodule Derpex.Admission.Gentility.Usage do
   end
 
   @doc """
-  Snapshots up to `max_entries` rows of the oldest complete window without deleting them.
+  Snapshots every row of the oldest complete window without deleting them.
 
-  A window with more sender attributions than one contract batch may carry is
-  drained across successive calls, so no window can grow past the point where
-  it can be exported.
+  Rows come back in canonical entry order, so the caller sorts a window once
+  and then splits it into as many batches as the contract needs.
   """
-  @spec oldest_closed(
-          :ets.tid(),
-          pos_integer(),
-          binary(),
-          non_neg_integer(),
-          integer(),
-          pos_integer()
-        ) :: nil | {UsageBatch.t(), [tuple()]}
-  def oldest_closed(
-        table,
-        window_ms,
-        instance_id,
-        region_id,
-        now_ms,
-        max_entries \\ UsageContract.max_entries()
-      ) do
+  @spec oldest_closed(:ets.tid(), pos_integer(), integer()) ::
+          nil | {non_neg_integer(), [tuple()]}
+  def oldest_closed(table, window_ms, now_ms) do
     current_window = div(now_ms, window_ms) * window_ms
 
     case oldest_window(table, current_window) do
@@ -71,20 +56,24 @@ defmodule Derpex.Admission.Gentility.Usage do
           table
           |> :ets.match_object({{window_start, :_, :_, :_, :_}, :_, :_, :_, :_})
           |> Enum.sort_by(&row_identity/1)
-          |> Enum.take(max_entries)
 
-        batch = %UsageBatch{
-          instance_id: instance_id,
-          region_id: region_id,
-          window_start_ms: window_start,
-          window_end_ms: window_start + window_ms,
-          entries: Enum.map(rows, &entry/1)
-        }
-
-        {batch, rows}
+        {window_start, rows}
     end
   rescue
     ArgumentError -> nil
+  end
+
+  @doc "Builds the contract batch covering one already-ordered slice of a window."
+  @spec batch(binary(), non_neg_integer(), non_neg_integer(), pos_integer(), [tuple()]) ::
+          UsageBatch.t()
+  def batch(instance_id, region_id, window_start_ms, window_ms, rows) do
+    %UsageBatch{
+      instance_id: instance_id,
+      region_id: region_id,
+      window_start_ms: window_start_ms,
+      window_end_ms: window_start_ms + window_ms,
+      entries: Enum.map(rows, &entry/1)
+    }
   end
 
   @doc "Subtracts precisely the counters durably committed to a batch."
@@ -122,6 +111,9 @@ defmodule Derpex.Admission.Gentility.Usage do
     ArgumentError -> %{entries: 0, windows: 0}
   end
 
+  # Must stay identical to `UsageContract`'s `entry_identity/1` ordering: rows are
+  # sorted here once so that every batch cut from a window is already in the
+  # canonical order the contract encodes, and a chunk boundary is stable.
   defp row_identity(
          {{_window, node_id, organization_id, owner_kind, deployment_id}, _ap, _ab, _dp, _db}
        ) do
