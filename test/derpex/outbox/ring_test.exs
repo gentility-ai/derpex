@@ -1,15 +1,13 @@
 defmodule Derpex.Outbox.RingTest do
   use ExUnit.Case, async: true
 
+  alias Derpex.Outbox.Lock
   alias Derpex.Outbox.Ring
 
   @enqueue_results [{:ok, :wake}, {:ok, :coalesced}, {:ok, :replaced}, {:dropped, :contention}]
   # Roughly two hundred microseconds of work between packets, so that eight
   # senders keep the schedulers busy without saturating them.
   @pacing_iterations 100_000
-  # The ring's own acquisition budget and the number of naps that fit in it.
-  @acquire_budget_microseconds 4_000
-  @producer_naps 4
 
   test "coalesces wakeups and replaces the oldest item at fixed capacity" do
     ring = Ring.new(2, wake_message: :ready)
@@ -22,6 +20,7 @@ defmodule Derpex.Outbox.RingTest do
 
     assert Ring.stats(ring) == %{
              capacity: 2,
+             full_policy: :replace,
              size: 2,
              wake_pending: true,
              head_drops: 1,
@@ -179,10 +178,11 @@ defmodule Derpex.Outbox.RingTest do
     # A one-millisecond nap costs a millisecond only on an idle node; behind a
     # busy run queue it costs whatever rescheduling costs. Calibrating against
     # that same load while the producers run keeps the ceiling a statement
-    # about the ring — its four-millisecond budget and the naps that fit in it
-    # — rather than about the machine.
-    nap_cost = Enum.max(for _sample <- 1..25, do: elem(:timer.tc(&Process.sleep/1, [1]), 0))
-    ceiling = @acquire_budget_microseconds + @producer_naps * nap_cost
+    # about the ring — its budget and the naps that fit in it — rather than
+    # about the machine. A hundred samples rather than a handful, because it is
+    # the tail of that cost the ceiling has to cover.
+    nap_cost = Enum.max(for _sample <- 1..100, do: elem(:timer.tc(&Process.sleep/1, [1]), 0))
+    ceiling = Lock.budget_microseconds() + Lock.nap_allowance() * nap_cost
 
     latencies =
       Enum.flat_map(producers, fn {producer, monitor} ->
@@ -224,6 +224,68 @@ defmodule Derpex.Outbox.RingTest do
   test "recovers a producer killed before or after slot publication" do
     assert_stale_producer_recovery(:after_journal, :empty)
     assert_stale_producer_recovery(:after_publish, {:ok, :packet})
+  end
+
+  test "a ring carrying both classes labels each drop from the packet" do
+    ring = Ring.new(1, metrics: Derpex.Metrics.default_handle(), metric_kind: :by_packet)
+    disco = <<0x54, 0x53, 0xF0, 0x9F, 0x92, 0xAC>> <> :binary.copy(<<7>>, 56)
+    before = Derpex.Metrics.snapshot()
+
+    assert Ring.enqueue(ring, {:forward_packet, <<0::256>>, <<1::256>>, disco}) == {:ok, :wake}
+
+    assert Ring.enqueue(ring, {:forward_packet, <<0::256>>, <<1::256>>, "plain"}) ==
+             {:ok, :replaced}
+
+    assert Ring.enqueue(ring, {:forward_packet, <<0::256>>, <<1::256>>, "again"}) ==
+             {:ok, :replaced}
+
+    current = Derpex.Metrics.snapshot()
+
+    assert current[{:packets_dropped, :queue_head, :disco}] -
+             before[{:packets_dropped, :queue_head, :disco}] == 1
+
+    assert current[{:packets_dropped, :queue_head, :other}] -
+             before[{:packets_dropped, :queue_head, :other}] == 1
+
+    assert current[{:bytes_dropped, :queue_head, :disco}] -
+             before[{:bytes_dropped, :queue_head, :disco}] == byte_size(disco)
+  end
+
+  test "a ring that refuses replacement keeps the item it already holds" do
+    ring = Ring.new(1, wake_message: :ready, full: :reject)
+
+    assert Ring.enqueue(ring, :first) == {:ok, :wake}
+    assert Ring.enqueue(ring, :second) == {:dropped, :queue_full}
+    assert Ring.stats(ring).tail_drops == 1
+    assert Ring.take(ring) == {:ok, :first}
+    assert Ring.take(ring) == :empty
+  end
+
+  test "replacing the oldest packet still records how long it waited" do
+    ring =
+      Ring.new(1,
+        wake_message: :ready,
+        metrics: Derpex.Metrics.default_handle(),
+        metric_kind: :other
+      )
+
+    assert Ring.enqueue(ring, {:recv_packet, <<0::256>>, "first"}) == {:ok, :wake}
+    Process.sleep(2)
+    before = Derpex.Metrics.snapshot().average_queue_duration_ms
+    assert Ring.enqueue(ring, {:recv_packet, <<0::256>>, "second"}) == {:ok, :replaced}
+
+    # Go feeds a head-dropped packet's residence time into the same moving
+    # average as a delivered one, so a queue that is dropping still shows how
+    # long it is making packets wait.
+    assert Derpex.Metrics.snapshot().average_queue_duration_ms != before
+  end
+
+  test "an idle ring costs a bounded amount of table memory" do
+    ring = Ring.new(32)
+
+    # Every access is serialised by the ring lock, so the table needs none of
+    # the per-scheduler structures that decorated concurrency options allocate.
+    assert Ring.memory_words(ring) < 4_096
   end
 
   test "close is idempotent and clears every retained reference" do

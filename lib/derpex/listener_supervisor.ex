@@ -68,6 +68,12 @@ defmodule Derpex.ListenerSupervisor do
       |> Keyword.get(:handler_options, [])
       |> resolve_admission()
       |> Keyword.put_new(:mesh_write_timeout, SocketOptions.mesh_write_timeout_ms())
+      # A control write may not give up before the socket does, so the handler
+      # is told the same write timeout the listen socket was configured with.
+      |> Keyword.put_new(
+        :write_timeout_ms,
+        Keyword.get(socket_options, :write_timeout_ms, SocketOptions.default_write_timeout_ms())
+      )
       |> Keyword.put(:server_private_key, private_key)
       |> Keyword.put(:server_public_key, public_key)
 

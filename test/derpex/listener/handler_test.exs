@@ -11,6 +11,7 @@ defmodule Derpex.Listener.HandlerTest do
   alias Derpex.Handshake
   alias Derpex.Listener.Handler
   alias Derpex.Metrics
+  alias Derpex.Outbox.LifecycleQueue
   alias Derpex.Outbox.Ring
   alias Derpex.RateConfig
   alias Derpex.RateController
@@ -352,6 +353,78 @@ defmodule Derpex.Listener.HandlerTest do
     :gen_tcp.close(socket)
   end
 
+  test "a paced connection still keeps alive and still closes on demand" do
+    start_supervised!({Manual, monotonic_time: 0})
+    previous_clock = Application.fetch_env!(:derpex, :clock)
+    Application.put_env(:derpex, :clock, Manual)
+    on_exit(fn -> Application.put_env(:derpex, :clock, previous_clock) end)
+
+    # One byte per second, with the smallest burst the config allows: the first
+    # frame is admitted from the burst, the second waits most of a day.
+    rate_controller =
+      start_supervised!(
+        {RateController,
+         name: nil,
+         config: %RateConfig{
+           per_client_rate_limit_bytes_per_second: 1,
+           per_client_rate_burst_bytes: RateConfig.minimum_burst()
+         }}
+      )
+
+    {server_public, server_private} = Crypto.generate_keypair()
+    {_client_public, client_private} = Crypto.generate_keypair()
+    destination = :crypto.strong_rand_bytes(32)
+    payload = :binary.copy(<<0xA5>>, 65_536)
+    parent = self()
+
+    event_handler = fn event ->
+      send(parent, {:handler_event, self(), event})
+      :ok
+    end
+
+    {:ok, server} =
+      ThousandIsland.start_link(
+        port: 0,
+        transport_options: [ip: {127, 0, 0, 1}],
+        num_acceptors: 1,
+        handler_module: Handler,
+        handler_options: [
+          server_private_key: Secret.wrap(server_private),
+          server_public_key: server_public,
+          event_handler: event_handler,
+          rate_controller: rate_controller
+        ]
+      )
+
+    stop_server_on_exit(server)
+    {:ok, {_ip, port}} = ThousandIsland.listener_info(server)
+    socket = connect_and_send_info(port, server_public, client_private, %ClientInfo{version: 2})
+    assert_receive {:handler_event, handler, {:authenticated, _key, %ClientInfo{}}}, 2_000
+    assert {:ok, <<_server_info_type, length::unsigned-big-32>>} = :gen_tcp.recv(socket, 5, 2_000)
+    assert {:ok, _server_info} = :gen_tcp.recv(socket, length, 2_000)
+
+    packet = IO.iodata_to_binary(Frame.encode(:send_packet, [destination, payload]))
+    :ok = :gen_tcp.send(socket, packet)
+
+    assert_receive {:handler_event, ^handler,
+                    {:client_message, {:send_packet, ^destination, ^payload}}},
+                   2_000
+
+    :ok = :gen_tcp.send(socket, packet)
+    assert_eventually(fn -> Manual.pending_timer_count() == 2 end)
+
+    # The keepalive is due long before the pace is: a handler that parked in a
+    # selective receive would answer neither.
+    :ok = Manual.advance(65_000)
+    assert {:ok, <<keep_alive_type, 0::unsigned-big-32>>} = :gen_tcp.recv(socket, 5, 2_000)
+    assert keep_alive_type == Frame.type(:keep_alive)
+
+    monitor = Process.monitor(handler)
+    send(handler, {:derpex_drain_close, make_ref()})
+    assert_receive {:DOWN, ^monitor, :process, ^handler, _reason}, 100
+    :gen_tcp.close(socket)
+  end
+
   test "accept limiting closes excess sockets before HTTP session allocation" do
     limiter = start_supervised!({AcceptLimiter, name: nil, config: {0, 1}})
     {server_public, server_private} = Crypto.generate_keypair()
@@ -558,7 +631,9 @@ defmodule Derpex.Listener.HandlerTest do
     {_thousand_island_socket, state} = :sys.get_state(handler)
     assert Ring.stats(state.ordinary).capacity == 64
     assert Ring.stats(state.disco).capacity == 64
-    assert Ring.stats(state.lifecycle).capacity == 32
+    # Lifecycle frames are state changes, so their queue grows instead of
+    # replacing: it has a soft cap, not a capacity.
+    assert LifecycleQueue.stats(state.lifecycle).soft_cap == 65_536
     assert Ring.stats(state.pong).capacity == 1
     :gen_tcp.close(socket)
   end
@@ -647,6 +722,93 @@ defmodule Derpex.Listener.HandlerTest do
     :gen_tcp.close(socket)
     assert_receive {:DOWN, ^monitor, :process, ^handler, _reason}, 2_000
     assert_eventually(fn -> Manual.pending_timer_count() == 0 end)
+  end
+
+  test "a packet sent during a handshake is queued, and server_info still goes first" do
+    {server_public, server_private} = Crypto.generate_keypair()
+    {sender_public, sender_private} = Crypto.generate_keypair()
+    {recipient_public, recipient_private} = Crypto.generate_keypair()
+    parent = self()
+
+    # Registration makes the recipient routable; blocking here holds the handler
+    # at exactly that point, before its server info is written and before its
+    # send loop starts, while the sender floods the new route.
+    event_handler = fn
+      {:authenticated, ^recipient_public, _info} = event ->
+        send(parent, {:registering, self()})
+
+        receive do
+          :flooded -> :ok
+        after
+          2_000 -> :ok
+        end
+
+        send(parent, event)
+        :ok
+
+      event ->
+        send(parent, event)
+        :ok
+    end
+
+    {:ok, server} =
+      ThousandIsland.start_link(
+        port: 0,
+        transport_options: [ip: {127, 0, 0, 1}],
+        num_acceptors: 1,
+        handler_module: Handler,
+        handler_options: [
+          server_private_key: Secret.wrap(server_private),
+          server_public_key: server_public,
+          event_handler: event_handler
+        ]
+      )
+
+    stop_server_on_exit(server)
+    {:ok, {_ip, port}} = ThousandIsland.listener_info(server)
+
+    sender = connect_and_send_info(port, server_public, sender_private, %ClientInfo{version: 2})
+    assert_receive {:authenticated, ^sender_public, _sender_info}, 2_000
+    assert {:ok, <<_type, length::unsigned-big-32>>} = :gen_tcp.recv(sender, 5, 2_000)
+    assert {:ok, _server_info} = :gen_tcp.recv(sender, length, 2_000)
+
+    recipient =
+      connect_and_send_info(port, server_public, recipient_private, %ClientInfo{version: 2})
+
+    assert_receive {:registering, handler}, 2_000
+
+    packet = IO.iodata_to_binary(Frame.encode(:send_packet, [recipient_public, "flood"]))
+    before = Metrics.snapshot()
+    for _ <- 1..64, do: :ok = :gen_tcp.send(sender, packet)
+    assert_receive {:client_message, {:send_packet, ^recipient_public, "flood"}}, 2_000
+
+    # The flood is in the recipient's queues, which no writer is draining yet.
+    Process.sleep(50)
+    send(handler, :flooded)
+
+    assert {:ok, <<first_type, first_length::unsigned-big-32>>} =
+             :gen_tcp.recv(recipient, 5, 2_000)
+
+    assert first_type == Frame.type(:server_info)
+    assert {:ok, body} = :gen_tcp.recv(recipient, first_length, 2_000)
+
+    assert Handshake.decode_server_info(body, recipient_private, server_public) ==
+             {:ok, %Derpex.ServerInfo{version: 2}}
+
+    # The packets that arrived mid-handshake were queued, not refused: the
+    # recipient was already registered when they were routed.
+    assert {:ok, <<packet_type, _length::unsigned-big-32>>} = :gen_tcp.recv(recipient, 5, 2_000)
+    assert packet_type == Frame.type(:recv_packet)
+
+    current = Metrics.snapshot()
+
+    for kind <- [:disco, :other] do
+      assert current[{:packets_dropped, :unknown_dest, kind}] ==
+               before[{:packets_dropped, :unknown_dest, kind}]
+    end
+
+    :gen_tcp.close(sender)
+    :gen_tcp.close(recipient)
   end
 
   defp stop_server_on_exit(server) do

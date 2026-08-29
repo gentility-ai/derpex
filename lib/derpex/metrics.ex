@@ -24,12 +24,14 @@ defmodule Derpex.Metrics do
     :peer_gone_disconnected_frames,
     :peer_gone_not_here_frames,
     :packets_forwarded_out,
+    :packets_forwarded_dropped,
     :packets_forwarded_in,
     :remove_forwarder_other,
     :home_moves_in,
     :home_moves_out,
     :write_errors,
-    :ring_producer_naps
+    :ring_producer_naps,
+    :lifecycle_queue_overflows
   ]
 
   @drop_reasons [

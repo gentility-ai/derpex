@@ -58,6 +58,8 @@ defmodule Derpex.Bench.Relay do
   @moduledoc false
 
   alias Derpex.Bench.Transport
+  alias Derpex.Outbox
+  alias Derpex.Outbox.LifecycleQueue
   alias Derpex.Outbox.Ring
   alias Derpex.Router
   alias Derpex.Writer
@@ -145,6 +147,7 @@ defmodule Derpex.Bench.Relay do
 
     flows = Enum.map(options.sizes, &run_flow(&1, options))
     soak = run_slow_client_soak(options)
+    idle = measure_idle_connection(options)
 
     :erlang.garbage_collect()
     memory_after = :erlang.memory(:total)
@@ -162,6 +165,7 @@ defmodule Derpex.Bench.Relay do
       },
       "relay_flows" => flows,
       "slow_client_isolation" => soak,
+      "idle_connection" => idle,
       "beam_total_memory_before_bytes" => memory_before,
       "beam_total_memory_after_bytes" => memory_after,
       "beam_total_memory_delta_bytes" => memory_after - memory_before,
@@ -302,6 +306,40 @@ defmodule Derpex.Bench.Relay do
     end
   end
 
+  # What one connected, silent client costs: four ring tables, their atomics,
+  # and the writer process.
+  defp measure_idle_connection(options) do
+    :erlang.garbage_collect()
+    before_bytes = :erlang.memory(:total)
+    connections = 64
+
+    started =
+      Enum.map(1..connections, fn _index ->
+        start_destination(Transport.new(0), options.queue_depth)
+      end)
+
+    :erlang.garbage_collect()
+    after_bytes = :erlang.memory(:total)
+
+    # Three rings and one lifecycle queue, the way a real connection is built.
+    ring_words =
+      started
+      |> Enum.flat_map(fn {_writer, rings, _destination} -> Map.values(rings) end)
+      |> Enum.map(&outbox_memory_words/1)
+      |> Enum.sum()
+
+    Enum.each(started, fn {writer, rings, destination} ->
+      stop_destination(writer, rings, destination)
+    end)
+
+    %{
+      "connections" => connections,
+      "bytes_per_idle_connection" => div(after_bytes - before_bytes, connections),
+      "ring_table_bytes_per_idle_connection" =>
+        div(ring_words * :erlang.system_info(:wordsize), connections)
+    }
+  end
+
   defp start_destination(socket, queue_depth) do
     {:ok, writer} =
       Writer.start_link(owner: self(), transport: Transport, socket: socket)
@@ -311,8 +349,8 @@ defmodule Derpex.Bench.Relay do
     rings = %{
       ordinary: Ring.new(queue_depth, notifier: writer, wake_message: Writer.wake_message()),
       disco: Ring.new(queue_depth, notifier: writer, wake_message: Writer.wake_message()),
-      pong: Ring.new(1, notifier: writer, wake_message: Writer.wake_message()),
-      lifecycle: Ring.new(queue_depth, notifier: writer, wake_message: Writer.wake_message())
+      pong: Ring.new(1, notifier: writer, wake_message: Writer.wake_message(), full: :reject),
+      lifecycle: LifecycleQueue.new(notifier: writer, wake_message: Writer.wake_message())
     }
 
     :ok = Writer.attach(writer, rings)
@@ -327,10 +365,14 @@ defmodule Derpex.Bench.Relay do
     if Process.alive?(writer), do: Process.exit(writer, :kill)
   end
 
-  defp close_ring(ring) do
-    case Ring.close(ring) do
+  defp outbox_memory_words(%Ring{} = ring), do: Ring.memory_words(ring)
+
+  defp outbox_memory_words(%LifecycleQueue{} = queue), do: LifecycleQueue.memory_words(queue)
+
+  defp close_ring(outbox) do
+    case Outbox.close(outbox) do
       :ok -> :ok
-      :busy -> close_ring(ring)
+      :busy -> close_ring(outbox)
     end
   end
 

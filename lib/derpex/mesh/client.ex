@@ -47,6 +47,7 @@ defmodule Derpex.Mesh.Client do
   alias Derpex.Handshake
   alias Derpex.HTTP1.Scan
   alias Derpex.Mesh.ClientAddressTable
+  alias Derpex.Metrics
   alias Derpex.Outbox.Ring
   alias Derpex.Router
   alias Derpex.Secret
@@ -113,6 +114,7 @@ defmodule Derpex.Mesh.Client do
           non_negative_option!(options, :reconnect_interval, @default_reconnect_interval),
         connect_timeout: positive_option!(options, :connect_timeout, @default_connect_timeout),
         queue_capacity: positive_option!(options, :queue_capacity, @default_queue_capacity),
+        metrics: Keyword.get_lazy(options, :metrics, &Metrics.default_handle/0),
         send_timeout: positive_option!(options, :send_timeout, @default_send_timeout),
         recv_deadline: positive_option!(options, :recv_deadline, @default_recv_deadline),
         recv_timer: nil,
@@ -490,7 +492,15 @@ defmodule Derpex.Mesh.Client do
   end
 
   defp new_ring(state) do
-    Ring.new(state.queue_capacity, notifier: self(), wake_message: @wake_message)
+    # Packets bound for another region are dropped under the same rules as any
+    # other queue. Each drop is labelled from the packet, the way Go labels a
+    # drop it makes on behalf of a forwarder.
+    Ring.new(state.queue_capacity,
+      notifier: self(),
+      wake_message: @wake_message,
+      metrics: state.metrics,
+      metric_kind: :by_packet
+    )
   end
 
   defp delete_ring(nil), do: :ok

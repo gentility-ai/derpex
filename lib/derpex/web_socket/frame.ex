@@ -32,16 +32,21 @@ defmodule Derpex.WebSocket.Frame do
     parse(%{state | buffer: state.buffer <> data}, [])
   end
 
-  @doc "Encodes one unmasked server binary message."
-  @spec encode_binary(iodata()) :: binary()
-  def encode_binary(data), do: encode(0x2, IO.iodata_to_binary(data))
+  @doc """
+  Encodes one unmasked server binary message.
+
+  Returns iodata: a DERP frame is already a list of a header and a packet, and
+  flattening it here would copy every relayed packet.
+  """
+  @spec encode_binary(iodata()) :: iodata()
+  def encode_binary(data), do: encode(0x2, data)
 
   @doc "Encodes one unmasked server pong control message."
-  @spec encode_pong(binary()) :: binary()
+  @spec encode_pong(binary()) :: iodata()
   def encode_pong(payload) when byte_size(payload) <= 125, do: encode(0xA, payload)
 
   @doc "Encodes one unmasked server close control message."
-  @spec encode_close(0..65_535, binary()) :: binary()
+  @spec encode_close(0..65_535, binary()) :: iodata()
   def encode_close(status, reason \\ "") when byte_size(reason) <= 123,
     do: encode(0x8, <<status::unsigned-big-16, reason::binary>>)
 
@@ -178,7 +183,7 @@ defmodule Derpex.WebSocket.Frame do
   defp bxor_binary(mask, payload), do: :crypto.exor(mask, payload)
 
   defp encode(opcode, payload) do
-    length = byte_size(payload)
+    length = IO.iodata_length(payload)
 
     header =
       cond do
@@ -187,6 +192,6 @@ defmodule Derpex.WebSocket.Frame do
         true -> <<1::1, 0::3, opcode::4, 0::1, 127::7, length::unsigned-big-64>>
       end
 
-    header <> payload
+    [header, payload]
   end
 end

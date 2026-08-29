@@ -10,6 +10,15 @@ defmodule Derpex.Listener.Transports.SSL do
   `sni_fun` alone cannot do. Listeners without a reloader keep the plain
   upstream handshake and pay nothing.
 
+  Write timeouts need no extra machinery here: `:ssl.send/2` is a call into the
+  connection's TLS sender, and when the `send_timeout` set on the socket
+  underneath expires, the sender replies `{error, timeout}` to the caller
+  (`tls_sender.erl`, the `{error, timeout}` clause of `send_or_buffer/5`). OTP
+  marks that clause as retained for compatibility with the inet driver, so
+  `test/derpex/writer_timeout_test.exs` exercises it per transport rather than
+  trusting it; a timer wrapped around `:ssl.send/2` would add a second deadline
+  without removing the dependency on the first.
+
   Thousand Island hands `handshake/1` only the accepted socket, so the snapshot
   key is registered in `:persistent_term` under the listen socket's bound
   `{ip, port}`. A connection accepted on a wildcard listener reports its own

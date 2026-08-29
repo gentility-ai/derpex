@@ -12,19 +12,24 @@ defmodule Derpex.Writer do
   alias Derpex.Cardinality
   alias Derpex.Frame.Body
   alias Derpex.Metrics
+  alias Derpex.Outbox
+  alias Derpex.Outbox.LifecycleQueue
   alias Derpex.Outbox.Ring
+  alias Derpex.Router
+  alias Derpex.SocketOptions
   alias Derpex.WebSocket.Frame, as: WebSocketFrame
 
   @wake_message :derpex_outbox_ready
   @retry_message :derpex_outbox_retry
   @retry_interval_ms 5
   @websocket_chunk_size 16 * 1_024
+  @packet_classes [:lifecycle, :ordinary, :disco, :pong]
 
   @type rings :: %{
           ordinary: Ring.t(),
           disco: Ring.t(),
           pong: Ring.t(),
-          lifecycle: Ring.t()
+          lifecycle: Ring.t() | LifecycleQueue.t()
         }
 
   @doc false
@@ -41,9 +46,15 @@ defmodule Derpex.Writer do
   @spec attach(pid(), rings()) :: :ok | {:error, term()}
   def attach(writer, rings), do: GenServer.call(writer, {:attach, rings})
 
-  @doc "Writes bounded handshake/HTTP control data in call order."
+  @doc """
+  Writes bounded handshake/HTTP control data in call order.
+
+  The caller passes its own socket write timeout plus a margin: giving up
+  sooner than the socket does would abandon a write that is still legitimately
+  in flight, and a mesh peer is allowed thirty seconds.
+  """
   @spec write_control(pid(), iodata(), timeout()) :: :ok | {:error, term()}
-  def write_control(writer, data, timeout \\ 5_000),
+  def write_control(writer, data, timeout \\ SocketOptions.default_write_timeout_ms() + 1_000),
     do: GenServer.call(writer, {:control, data}, timeout)
 
   @doc "Switches subsequent writes to RFC 6455 binary messages."
@@ -79,6 +90,8 @@ defmodule Derpex.Writer do
        wire_mode: :native,
        rings: nil,
        retry_timer: nil,
+       packet_cursor: 0,
+       noted_sources: MapSet.new(),
        sender_cardinality: Cardinality.new()
      }}
   end
@@ -139,14 +152,18 @@ defmodule Derpex.Writer do
   end
 
   defp drain(state) do
-    case take_next(state.rings) do
-      {:ok, message, queue_age_microseconds} ->
+    case take_next(state) do
+      {{:ok, message, queue_age_microseconds}, state} ->
+        # Go counts a pong and a peer-gone frame as it hands them to the
+        # writer, and a relayed packet only once the write returned, so the
+        # counters are incremented on the same side of the socket call here.
+        record_dispatch(state.metrics, message)
+
         with {:ok, frame} <- Body.encode_server(message),
              :ok <- send_data(state, frame) do
           record_queue_duration(state.metrics, message, queue_age_microseconds)
           record_send(state.metrics, message)
-          maybe_note_send(state, message)
-          drain(state)
+          drain(note_reverse_path(state, message))
         else
           {:error, reason} ->
             :ok = Metrics.add(state.metrics, :write_errors, 1)
@@ -154,13 +171,13 @@ defmodule Derpex.Writer do
             {:error, reason, state}
         end
 
-      :empty ->
+      {:empty, state} ->
         {:ok, state}
 
-      :busy ->
+      {:busy, state} ->
         {:ok, schedule_retry(state)}
 
-      :closed ->
+      {:closed, state} ->
         {:ok, state}
     end
   end
@@ -192,49 +209,84 @@ defmodule Derpex.Writer do
     %{state | retry_timer: nil}
   end
 
-  defp take_next(%{lifecycle: lifecycle} = rings) do
-    case Ring.take_with_age(lifecycle) do
-      :empty -> take_packet(rings)
-      result -> result
-    end
+  # Go's sendLoop selects at random among the ready channels, and its lifecycle
+  # channels are in that same select: no class is preferred and none can be
+  # starved. A cursor rotating over the four classes is the deterministic form
+  # of that fairness. Picking the oldest ready head instead would drain a full
+  # ordinary ring before a pong that arrived after it.
+  defp take_next(state) do
+    take_in_order(state, rotation(state.packet_cursor), :empty)
   end
 
-  defp take_packet(%{ordinary: ordinary, disco: disco, pong: pong}) do
-    case Ring.take_with_age(ordinary) do
+  defp rotation(cursor) do
+    Enum.drop(@packet_classes, cursor) ++ Enum.take(@packet_classes, cursor)
+  end
+
+  defp take_in_order(state, [], outcome), do: {outcome, state}
+
+  defp take_in_order(state, [class | rest], outcome) do
+    case Outbox.take_with_age(Map.fetch!(state.rings, class)) do
+      {:ok, _message, _age} = result ->
+        {result, %{state | packet_cursor: next_cursor(class)}}
+
       :empty ->
-        case Ring.take_with_age(disco) do
-          :empty -> Ring.take_with_age(pong)
-          result -> result
-        end
+        take_in_order(state, rest, outcome)
 
-      result ->
-        result
+      other ->
+        take_in_order(state, rest, weaker_of(outcome, other))
     end
   end
 
-  defp maybe_note_send(_state, {:recv_packet, <<0::256>>, _packet}), do: :ok
-
-  defp maybe_note_send(state, {:recv_packet, source, _packet}) do
-    :ok = Cardinality.insert(state.sender_cardinality, source)
-    Derpex.Router.note_send(source, state.owner, state.rings.lifecycle)
+  defp next_cursor(class) do
+    rem(Enum.find_index(@packet_classes, &(&1 == class)) + 1, length(@packet_classes))
   end
 
-  defp maybe_note_send(_state, _message), do: :ok
+  # A ring that was locked matters more than one that was closed: the locked one
+  # still owes the writer a drain.
+  defp weaker_of(:busy, _other), do: :busy
+  defp weaker_of(_outcome, other), do: other
+
+  # Go's sawSrc, with one difference: a source is forgotten again when its
+  # peer-gone frame is written, so a peer that leaves and returns is owed a
+  # second peer-gone. Go never re-arms, which it can afford because its watcher
+  # set dies with the connection.
+  defp note_reverse_path(state, {:recv_packet, <<0::256>>, _packet}), do: state
+
+  defp note_reverse_path(state, {:recv_packet, source, _packet}) do
+    if MapSet.member?(state.noted_sources, source) do
+      state
+    else
+      :ok = Cardinality.insert(state.sender_cardinality, source)
+      :ok = Router.note_send(source, state.owner, state.rings.lifecycle)
+      %{state | noted_sources: MapSet.put(state.noted_sources, source)}
+    end
+  end
+
+  # Only a disconnect re-arms. Reason 0x01 says the packet's destination is not
+  # here, which is about a key this connection sent to, not about a source it
+  # was written packets from.
+  defp note_reverse_path(state, {:peer_gone, key, 0x00}) do
+    %{state | noted_sources: MapSet.delete(state.noted_sources, key)}
+  end
+
+  defp note_reverse_path(state, _message), do: state
 
   defp record_send(metrics, {:recv_packet, _source, packet}) do
     :ok = Metrics.add(metrics, :packets_sent, 1)
     Metrics.add(metrics, :bytes_sent, byte_size(packet))
   end
 
-  defp record_send(metrics, {:pong, _payload}), do: Metrics.add(metrics, :sent_pong, 1)
+  defp record_send(_metrics, _message), do: :ok
 
-  defp record_send(metrics, {:peer_gone, _key, 0x00}),
+  defp record_dispatch(metrics, {:pong, _payload}), do: Metrics.add(metrics, :sent_pong, 1)
+
+  defp record_dispatch(metrics, {:peer_gone, _key, 0x00}),
     do: Metrics.add(metrics, :peer_gone_disconnected_frames, 1)
 
-  defp record_send(metrics, {:peer_gone, _key, _reason}),
+  defp record_dispatch(metrics, {:peer_gone, _key, _reason}),
     do: Metrics.add(metrics, :peer_gone_not_here_frames, 1)
 
-  defp record_send(_metrics, _message), do: :ok
+  defp record_dispatch(_metrics, _message), do: :ok
 
   defp record_write_drop(metrics, {:recv_packet, _source, packet}) do
     kind = if Derpex.Disco.looks_like_wrapper?(packet), do: :disco, else: :other
@@ -251,19 +303,34 @@ defmodule Derpex.Writer do
   defp send_data(%{wire_mode: :native} = state, data),
     do: state.transport.send(state.socket, data)
 
-  defp send_data(%{wire_mode: :websocket} = state, data),
-    do: send_websocket_chunks(state, IO.iodata_to_binary(data))
-
-  defp send_websocket_chunks(state, data) when byte_size(data) <= @websocket_chunk_size do
-    state.transport.send(state.socket, WebSocketFrame.encode_binary(data))
+  # The pinned Go client reads WebSocket messages with a 32 KB limit, so a
+  # 64 KB DERP frame has to arrive as several messages. The split happens over
+  # the iodata: only the binary straddling a chunk boundary is divided, and
+  # into sub-binaries, so no relayed packet is ever copied.
+  defp send_data(%{wire_mode: :websocket} = state, data) do
+    data
+    |> :erlang.iolist_to_iovec()
+    |> send_websocket_chunks(state)
   end
 
-  defp send_websocket_chunks(state, data) do
-    <<chunk::binary-size(@websocket_chunk_size), rest::binary>> = data
+  defp send_websocket_chunks(iovec, state) do
+    {chunk, rest} = take_chunk(iovec, @websocket_chunk_size, [])
 
     case state.transport.send(state.socket, WebSocketFrame.encode_binary(chunk)) do
-      :ok -> send_websocket_chunks(state, rest)
+      :ok -> if rest == [], do: :ok, else: send_websocket_chunks(rest, state)
       {:error, _reason} = error -> error
     end
+  end
+
+  defp take_chunk([], _remaining, taken), do: {Enum.reverse(taken), []}
+  defp take_chunk(rest, 0, taken), do: {Enum.reverse(taken), rest}
+
+  defp take_chunk([binary | rest], remaining, taken) when byte_size(binary) <= remaining do
+    take_chunk(rest, remaining - byte_size(binary), [binary | taken])
+  end
+
+  defp take_chunk([binary | rest], remaining, taken) do
+    <<head::binary-size(^remaining), tail::binary>> = binary
+    {Enum.reverse([head | taken]), [tail | rest]}
   end
 end

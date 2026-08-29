@@ -54,14 +54,15 @@ defmodule Derpex.WebSocket.FramePropertyTest do
     check all payload <- server_payload(),
               control <- sized_binary(0, 123),
               status <- integer(0..65_535) do
-      assert read_server_frame(Frame.encode_binary(payload)) == {0x2, payload}
+      assert read_server_frame(IO.iodata_to_binary(Frame.encode_binary(payload))) ==
+               {0x2, payload}
 
-      assert read_server_frame(Frame.encode_binary([payload, control])) ==
+      assert read_server_frame(IO.iodata_to_binary(Frame.encode_binary([payload, control]))) ==
                {0x2, payload <> control}
 
-      assert read_server_frame(Frame.encode_pong(control)) == {0xA, control}
+      assert read_server_frame(IO.iodata_to_binary(Frame.encode_pong(control))) == {0xA, control}
 
-      assert read_server_frame(Frame.encode_close(status, control)) ==
+      assert read_server_frame(IO.iodata_to_binary(Frame.encode_close(status, control))) ==
                {0x8, <<status::unsigned-big-16, control::binary>>}
     end
   end

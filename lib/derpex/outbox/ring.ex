@@ -17,7 +17,9 @@ defmodule Derpex.Outbox.Ring do
   """
 
   alias Derpex.Clock
+  alias Derpex.Disco
   alias Derpex.Metrics
+  alias Derpex.Outbox.Lock
 
   @head 1
   @size 2
@@ -25,15 +27,12 @@ defmodule Derpex.Outbox.Ring do
   @head_drops 4
   @tail_drops 5
   @closed 6
-  @lock_retries 1_024
-  @producer_yields 4
-  @producer_nap_ms 1
-  @acquire_budget_microseconds 4_000
 
   defstruct [
     :table,
     :state,
     :capacity,
+    :full_policy,
     :notifier,
     :wake_message,
     :test_hook,
@@ -45,11 +44,12 @@ defmodule Derpex.Outbox.Ring do
             table: :ets.tid(),
             state: :atomics.atomics_ref(),
             capacity: pos_integer(),
+            full_policy: :replace | :reject,
             notifier: pid(),
             wake_message: atom(),
             test_hook: nil | (atom() -> term()),
             metrics: Metrics.handle() | nil,
-            metric_kind: :disco | :other | nil
+            metric_kind: :disco | :other | :by_packet | nil
           }
 
   @type enqueue_result :: {:ok, :wake | :coalesced | :replaced} | {:dropped, atom()}
@@ -57,12 +57,15 @@ defmodule Derpex.Outbox.Ring do
   @doc "Creates a ring owned by the calling process."
   @spec new(pos_integer(), keyword()) :: t()
   def new(capacity, options \\ []) when is_integer(capacity) and capacity > 0 do
+    # Every read and write happens under the ring lock, so decorated
+    # concurrency options would only buy per-scheduler structures that cost
+    # tens of kilobytes per connection and are never contended.
     table =
       :ets.new(__MODULE__, [
         :set,
         :public,
-        read_concurrency: true,
-        write_concurrency: true
+        read_concurrency: false,
+        write_concurrency: false
       ])
 
     true = :ets.insert(table, for(index <- 0..(capacity - 1), do: {index, 0, 0, nil}))
@@ -71,6 +74,7 @@ defmodule Derpex.Outbox.Ring do
       table: table,
       state: :atomics.new(6, signed: false),
       capacity: capacity,
+      full_policy: Keyword.get(options, :full, :replace),
       notifier: Keyword.get(options, :notifier, self()),
       wake_message: Keyword.get(options, :wake_message, :derpex_outbox_ready),
       test_hook: Keyword.get(options, :test_hook),
@@ -101,14 +105,14 @@ defmodule Derpex.Outbox.Ring do
     # queue timestamp is taken before the lock rather than inside it.
     enqueued_at = Clock.monotonic_time(:microsecond)
 
-    case acquire_producer(ring, wait?) do
+    case Lock.acquire_producer(ring.table, wait?, ring.metrics) do
       {:ok, lock_token} ->
         {result, pending_drop} =
           try do
             recover(ring)
             enqueue_locked(ring, item, enqueued_at, lock_token)
           after
-            release(ring, lock_token)
+            Lock.release(ring.table, lock_token)
           end
 
         record_pending_drop(ring, pending_drop)
@@ -122,7 +126,20 @@ defmodule Derpex.Outbox.Ring do
   end
 
   defp record_pending_drop(_ring, nil), do: :ok
+
   defp record_pending_drop(ring, {item, reason}), do: record_drop(ring, item, reason)
+
+  # Go records a head-dropped packet's residence time in the same moving average
+  # as a delivered one, so a queue that is dropping still reports how long it is
+  # making packets wait.
+  defp record_pending_drop(ring, {item, reason, enqueued_at}) do
+    :ok = record_drop(ring, item, reason)
+
+    Metrics.observe_queue_duration(
+      ring.metrics,
+      max(Clock.monotonic_time(:microsecond) - enqueued_at, 0)
+    )
+  end
 
   @doc "Takes the next item for the single writer."
   @spec take(t()) :: {:ok, term()} | :empty | :closed | :busy
@@ -136,14 +153,14 @@ defmodule Derpex.Outbox.Ring do
   @doc "Takes the next item with its non-negative queue residence time."
   @spec take_with_age(t()) :: {:ok, term(), non_neg_integer()} | :empty | :closed | :busy
   def take_with_age(%__MODULE__{} = ring) do
-    case acquire_consumer(ring) do
+    case Lock.acquire_consumer(ring.table) do
       {:ok, lock_token} ->
         taken =
           try do
             recover(ring)
             take_locked(ring, lock_token)
           after
-            release(ring, lock_token)
+            Lock.release(ring.table, lock_token)
           end
 
         with {:ok, item, enqueued_at} <- taken do
@@ -155,10 +172,14 @@ defmodule Derpex.Outbox.Ring do
     end
   end
 
+  @doc "Returns the ring table's memory footprint in machine words."
+  @spec memory_words(t()) :: non_neg_integer()
+  def memory_words(%__MODULE__{} = ring), do: :ets.info(ring.table, :memory)
+
   @doc "Closes the ring and releases every retained item. Idempotent."
   @spec close(t()) :: :ok | :busy
   def close(%__MODULE__{} = ring) do
-    case acquire(ring) do
+    case Lock.acquire(ring.table) do
       {:ok, lock_token} ->
         try do
           recover(ring)
@@ -170,7 +191,7 @@ defmodule Derpex.Outbox.Ring do
           :ets.delete(ring.table, :journal)
           :ok
         after
-          release(ring, lock_token)
+          Lock.release(ring.table, lock_token)
         end
 
       :busy ->
@@ -181,13 +202,14 @@ defmodule Derpex.Outbox.Ring do
   @doc "Returns consistent queue and drop counters, or `:busy` under mutation."
   @spec stats(t()) :: map() | :busy
   def stats(%__MODULE__{} = ring) do
-    case acquire(ring) do
+    case Lock.acquire(ring.table) do
       {:ok, lock_token} ->
         try do
           recover(ring)
 
           %{
             capacity: ring.capacity,
+            full_policy: ring.full_policy,
             size: atomic_get(ring, @size),
             wake_pending: atomic_get(ring, @wake_pending) == 1,
             head_drops: atomic_get(ring, @head_drops),
@@ -196,7 +218,7 @@ defmodule Derpex.Outbox.Ring do
             packet_slots: packet_slot_count(ring)
           }
         after
-          release(ring, lock_token)
+          Lock.release(ring.table, lock_token)
         end
 
       :busy ->
@@ -237,7 +259,23 @@ defmodule Derpex.Outbox.Ring do
     end
   end
 
+  defp enqueue_open_locked(%{full_policy: :reject} = ring, item, enqueued_at, lock_token) do
+    if atomic_get(ring, @size) == ring.capacity do
+      # Go's handleFramePing drops the ping that arrived last when a pong is
+      # already waiting: the client is pinging faster than it is being answered,
+      # and the answer it is owed is the older one.
+      :atomics.add_get(ring.state, @tail_drops, 1)
+      {{:dropped, :queue_full}, nil}
+    else
+      publish_locked(ring, item, enqueued_at, lock_token)
+    end
+  end
+
   defp enqueue_open_locked(ring, item, enqueued_at, lock_token) do
+    publish_locked(ring, item, enqueued_at, lock_token)
+  end
+
+  defp publish_locked(ring, item, enqueued_at, lock_token) do
     wake = signal_writer(ring)
     {full?, index, head, size, head_drops} = slot_plan(ring)
     operation_token = unique_token()
@@ -251,7 +289,7 @@ defmodule Derpex.Outbox.Ring do
     run_hook(ring, :after_commit)
     :ets.delete(ring.table, :journal)
 
-    {enqueue_result(full?, wake), if(replaced, do: {replaced, :queue_head})}
+    {enqueue_result(full?, wake), replaced}
   end
 
   # The slot to publish into, with the head, size and head-drop count that
@@ -355,117 +393,6 @@ defmodule Derpex.Outbox.Ring do
     :atomics.put(ring.state, @head_drops, head_drops)
   end
 
-  # Producers hold no shared "waiting" state: every attempt is a plain lock
-  # attempt, so a producer killed between attempts leaves nothing behind for
-  # the next caller. Yields cover the common case, where the holder is running
-  # its few microseconds of ETS work. The naps cover the uncommon one, where the
-  # holder used up its reduction budget inside the critical section and has to
-  # be rescheduled; dropping there would lose a packet the ring has room for,
-  # which the Go relay never does. A yield takes microseconds on an idle node
-  # and tens of milliseconds behind a long run queue, so the wall clock, not the
-  # attempt count, is what bounds the wait.
-  defp acquire_producer(ring, wait?) do
-    acquire_producer(ring, @producer_yields, wait?, budget_deadline())
-  end
-
-  defp acquire_producer(ring, yields_left, wait?, deadline) when yields_left > 0 do
-    case try_acquire(ring) do
-      :busy ->
-        :erlang.yield()
-
-        if expired?(deadline),
-          do: :busy,
-          else: acquire_producer(ring, yields_left - 1, wait?, deadline)
-
-      result ->
-        result
-    end
-  end
-
-  # A caller that will not nap still makes the reclaiming attempt, so a lock
-  # left by a dead producer cannot outlive it.
-  defp acquire_producer(ring, 0, false, _deadline), do: try_acquire_or_reclaim(ring)
-
-  defp acquire_producer(ring, 0, true, deadline) do
-    case try_acquire_or_reclaim(ring) do
-      :busy ->
-        if nap_fits?(deadline) do
-          Metrics.add(ring.metrics, :ring_producer_naps, 1)
-          Process.sleep(@producer_nap_ms)
-          acquire_producer(ring, 0, true, deadline)
-        else
-          :busy
-        end
-
-      result ->
-        result
-    end
-  end
-
-  defp acquire_consumer(ring), do: try_acquire_or_reclaim(ring)
-
-  defp acquire(ring), do: acquire(ring, @lock_retries, budget_deadline())
-
-  defp acquire(ring, retries_left, deadline) do
-    case try_acquire_or_reclaim(ring) do
-      :busy when retries_left > 0 ->
-        :erlang.yield()
-
-        if expired?(deadline), do: :busy, else: acquire(ring, retries_left - 1, deadline)
-
-      result ->
-        result
-    end
-  end
-
-  defp budget_deadline do
-    :erlang.monotonic_time(:microsecond) + @acquire_budget_microseconds
-  end
-
-  defp expired?(deadline), do: :erlang.monotonic_time(:microsecond) >= deadline
-
-  defp nap_fits?(deadline) do
-    :erlang.monotonic_time(:microsecond) + @producer_nap_ms * 1_000 <= deadline
-  end
-
-  # The stale-owner check costs a lookup and a liveness call, which is waste on
-  # the common path where the owner is alive and about to release.
-  defp try_acquire(ring) do
-    token = unique_token()
-    if :ets.insert_new(ring.table, {:lock, token, self()}), do: {:ok, token}, else: :busy
-  end
-
-  defp try_acquire_or_reclaim(ring) do
-    token = unique_token()
-
-    if :ets.insert_new(ring.table, {:lock, token, self()}) do
-      {:ok, token}
-    else
-      reclaim_stale_lock(ring, token)
-    end
-  end
-
-  defp reclaim_stale_lock(ring, token) do
-    case :ets.lookup(ring.table, :lock) do
-      [{:lock, old_token, owner}] ->
-        if Process.alive?(owner) do
-          :busy
-        else
-          :ets.delete_object(ring.table, {:lock, old_token, owner})
-          try_insert_lock(ring, token)
-        end
-
-      [] ->
-        try_insert_lock(ring, token)
-    end
-  end
-
-  defp try_insert_lock(ring, token) do
-    if :ets.insert_new(ring.table, {:lock, token, self()}), do: {:ok, token}, else: :busy
-  end
-
-  defp release(ring, token), do: :ets.delete_object(ring.table, {:lock, token, self()})
-
   defp clear_slots(ring) do
     operation_token = unique_token()
 
@@ -493,7 +420,7 @@ defmodule Derpex.Outbox.Ring do
   # Only the lookup belongs under the lock; the drop is recorded after release.
   defp replaced_item(ring, index) do
     case :ets.lookup(ring.table, index) do
-      [{^index, _slot_token, _enqueued_at, item}] -> item
+      [{^index, _slot_token, replaced_at, item}] -> {item, :queue_head, replaced_at}
       [] -> nil
     end
   end
@@ -518,8 +445,23 @@ defmodule Derpex.Outbox.Ring do
   defp record_drop(%{metric_kind: nil}, _item, _reason), do: :ok
 
   defp record_drop(ring, item, reason) do
-    Metrics.add_drop(ring.metrics, reason, ring.metric_kind, packet_size(item))
+    Metrics.add_drop(ring.metrics, reason, drop_kind(ring, item), packet_size(item))
   end
+
+  # A ring that carries one class of traffic labels its drops with that class.
+  # A forwarding ring carries both, so it labels each drop the way Go does,
+  # from the packet itself.
+  defp drop_kind(%{metric_kind: :by_packet}, item), do: packet_kind(item)
+  defp drop_kind(ring, _item), do: ring.metric_kind
+
+  defp packet_kind({:recv_packet, _source, packet}), do: packet_kind(packet)
+  defp packet_kind({:forward_packet, _source, _destination, packet}), do: packet_kind(packet)
+
+  defp packet_kind(packet) when is_binary(packet) do
+    if Disco.looks_like_wrapper?(packet), do: :disco, else: :other
+  end
+
+  defp packet_kind(_non_packet), do: :other
 
   defp packet_size({:recv_packet, _source, packet}) when is_binary(packet), do: byte_size(packet)
 

@@ -2,6 +2,7 @@ defmodule Derpex.RouterTest do
   use ExUnit.Case, async: false
 
   alias Derpex.Metrics
+  alias Derpex.Outbox.LifecycleQueue
   alias Derpex.Outbox.Ring
   alias Derpex.Router
   alias Derpex.Router.ReversePaths
@@ -577,6 +578,63 @@ defmodule Derpex.RouterTest do
     Process.exit(second_connection, :kill)
     Process.exit(watcher, :kill)
   end
+
+  test "a stalled watcher still learns about every peer that arrived" do
+    watcher = spawn(fn -> Process.sleep(:infinity) end)
+    lifecycle = LifecycleQueue.new(notifier: watcher, owner: watcher)
+    peers = for _index <- 1..100, do: :crypto.strong_rand_bytes(32)
+
+    on_exit(fn ->
+      Enum.each(peers, &Router.unregister(&1, watcher))
+      Process.exit(watcher, :kill)
+    end)
+
+    assert Router.watch(watcher, lifecycle) == :ok
+
+    # The watcher's writer never drains while the region fills up. A fixed ring
+    # would have kept the last thirty-two arrivals and quietly lost the rest.
+    Enum.each(peers, fn peer ->
+      assert Router.register(peer, watcher, Ring.new(1), Ring.new(1), lifecycle) == :ok
+    end)
+
+    present =
+      Stream.repeatedly(fn -> LifecycleQueue.take(lifecycle) end)
+      |> Enum.take_while(&match?({:ok, {:peer_present, _key, _ip, _port, _flags, _app}}, &1))
+      |> Enum.map(fn {:ok, {:peer_present, key, _ip, _port, _flags, _app}} -> key end)
+
+    assert length(present) == 100
+    assert Enum.sort(present) == Enum.sort(peers)
+  end
+
+  test "a packet for a torn-down destination counts as a disconnect drop" do
+    parent = self()
+    key = :crypto.strong_rand_bytes(32)
+    source = :crypto.strong_rand_bytes(32)
+
+    connection = spawn(fn -> Process.sleep(:infinity) end)
+
+    # A ring dies with the process that owns its table. The route survives until
+    # the router reaps it, so a packet can still find a destination that is gone.
+    owner = spawn(fn -> send(parent, {:ring, Ring.new(1)}) end)
+    monitor = Process.monitor(owner)
+    assert_receive {:ring, ring}
+    assert_receive {:DOWN, ^monitor, :process, ^owner, _reason}
+    assert Router.register(key, connection, ring) == :ok
+
+    on_exit(fn ->
+      Router.unregister(key, connection)
+      Process.exit(connection, :kill)
+    end)
+
+    before = Metrics.snapshot()
+    assert Router.route(source, key, "orphan") == {:dropped, :closed_destination}
+    after_snapshot = Metrics.snapshot()
+
+    assert delta(before, after_snapshot, {:packets_dropped, :gone_disconnected, :other}) == 1
+    assert delta(before, after_snapshot, {:bytes_dropped, :gone_disconnected, :other}) == 6
+  end
+
+  defp delta(before, current, key), do: Map.fetch!(current, key) - Map.fetch!(before, key)
 
   test "a vanished ring owner becomes a drop instead of crashing topology state" do
     parent = self()

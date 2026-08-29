@@ -56,7 +56,9 @@ defmodule Derpex.ConnectionTest do
 
     assert [
              {:authenticated, ^client_public, ^client_info, false},
+             {:register, ^client_public, ^client_info, false},
              {:send, server_info_frame},
+             :start_send_loop,
              {:cancel_timeout, :handshake},
              {:set_timeout, :keep_alive, keep_alive_interval}
            ] = actions
@@ -94,7 +96,9 @@ defmodule Derpex.ConnectionTest do
 
     assert [
              {:authenticated, ^client_public, ^client_info, false},
+             {:register, ^client_public, ^client_info, false},
              {:send, _server_info},
+             :start_send_loop,
              {:cancel_timeout, :handshake},
              {:set_timeout, :keep_alive, _interval},
              {:rate_limit, 38},
@@ -144,7 +148,9 @@ defmodule Derpex.ConnectionTest do
 
     assert [
              {:authenticated, ^client_public, ^client_info, true},
+             {:register, ^client_public, ^client_info, true},
              {:send, _server_info},
+             :start_send_loop,
              {:cancel_timeout, :handshake},
              {:set_timeout, :keep_alive, _interval},
              {:rate_limit, 0},
