@@ -202,8 +202,12 @@ identity, organization, peer, and source-IP values are never metric labels.
 
 The baseline-compatible `/debug/`, `/debug/vars`, `/debug/varz`,
 `/debug/check`, and live Linux `/debug/traffic` routes permit direct loopback
-and Tailscale-address clients. They reject requests carrying
-`X-Forwarded-For`. The upstream
+and Tailscale IPv6 ULA (`fd7a:115c:a1e0::/48`) clients. Unlike upstream, the
+Tailscale IPv4 CGNAT range (`100.64.0.0/10`) is **not** granted by default: a
+relay on a public port can see a carrier-NAT source address belonging to no
+tailnet. Set `DERPEX_DEBUG_ALLOW_TAILSCALE_CGNAT=1` to restore the upstream
+rule on a relay whose only CGNAT peers are tailnet nodes. These routes reject
+requests carrying `X-Forwarded-For`. The upstream
 `TS_ALLOW_DEBUG_IP`, `TS_DEBUG_TRUSTED_CIDRS`, and GET-only
 `TS_DEBUG_KEY_PATH`/`?debugkey=` mechanisms are supported; the Gentility
 operations bearer token is also accepted. Public health and probes do not

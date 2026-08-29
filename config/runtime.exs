@@ -51,6 +51,7 @@ if config_env() == :prod do
     debug_key_path = System.get_env("TS_DEBUG_KEY_PATH")
     debug_allow_ip = System.get_env("TS_ALLOW_DEBUG_IP")
     debug_trusted_cidrs_text = System.get_env("TS_DEBUG_TRUSTED_CIDRS")
+    debug_allow_cgnat? = System.get_env("DERPEX_DEBUG_ALLOW_TAILSCALE_CGNAT") == "1"
     disable_rtt_stats_text = System.get_env("TS_DERP_DISABLE_RTT_STATS", "false")
 
     send_queue_depth_text =
@@ -367,6 +368,13 @@ if config_env() == :prod do
     debug =
       [key_path: debug_key_path, allow_ip: debug_allow_ip, trusted_cidrs: debug_trusted_cidrs]
       |> Enum.reject(fn {_key, value} -> value in [nil, []] end)
+      |> then(fn options ->
+        if debug_allow_cgnat? do
+          Keyword.put(options, :allow_tailscale_cgnat, true)
+        else
+          options
+        end
+      end)
 
     client_verifiers =
       if verify_clients? do
