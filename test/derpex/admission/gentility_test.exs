@@ -2,6 +2,7 @@ defmodule Derpex.Admission.GentilityTest do
   use ExUnit.Case, async: false
 
   alias Derpex.Admission.Gentility
+  alias Derpex.Admission.Gentility.Cache
   alias Derpex.Admission.Gentility.Contract
   alias Derpex.Admission.Gentility.Lease
   alias Derpex.Admission.Gentility.Revocation
@@ -272,6 +273,53 @@ defmodule Derpex.Admission.GentilityTest do
 
     assert :ok = stop_supervised(Gentility)
     assert File.exists?(path)
+  end
+
+  @tag :tmp_dir
+  test "recovers a cache holding two records for one node key", %{tmp_dir: tmp_dir} do
+    parent = self()
+    path = Path.join(tmp_dir, "admission.cache")
+    node_key = node_key(39)
+
+    :ok =
+      Cache.store(
+        path,
+        [
+          signed_lease(node_key, expires_at_ms: 1_500),
+          signed_lease(node_key, expires_at_ms: 11_000)
+        ],
+        []
+      )
+
+    controller =
+      start_controller(
+        authority: fn _request -> {:error, :unavailable} end,
+        max_lease_ms: 10_000,
+        cache_path: path,
+        close_peer: fn key -> send(parent, {:closed, key}) end
+      )
+
+    assert Gentility.stats(controller).cache_entries == 1
+
+    Manual.advance(600)
+    assert Gentility.stats(controller).cache_entries == 1
+    refute_receive {:closed, ^node_key}
+
+    assert {:ok, %{gentility: %{source: :cached, lease_expires_at_ms: 11_000}}} =
+             Gentility.authorize(request(node_key), Gentility.policy(controller))
+
+    Manual.advance(10_000)
+    assert_receive {:closed, ^node_key}
+    assert Gentility.stats(controller).cache_entries == 0
+    refute_receive {:closed, ^node_key}
+  end
+
+  test "a controller refuses to start on invalid options" do
+    assert {:error, {:invalid_verification_keys, _child}} =
+             start_supervised(
+               {Gentility,
+                authority: fn _request -> {:error, :unavailable} end, verification_keys: %{}}
+             )
   end
 
   @tag :tmp_dir

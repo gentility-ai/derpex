@@ -1,6 +1,8 @@
 defmodule Derpex.Admission.Gentility.Cache do
   @moduledoc false
 
+  alias Derpex.Admission.Gentility.Contract
+
   @magic "DXAC"
   @version 1
   @max_record_size 4_096
@@ -41,7 +43,7 @@ defmodule Derpex.Admission.Gentility.Cache do
     with {:ok, leases, <<revocation_count::32, rest::binary>>} <- take_records(rest, lease_count),
          true <- revocation_count <= max_revocations,
          {:ok, revocations, ""} <- take_records(rest, revocation_count) do
-      {:ok, {leases, revocations}}
+      {:ok, {dedupe_leases(leases), revocations}}
     else
       false -> {:error, :too_many_revocations}
       {:error, _reason} = error -> error
@@ -73,6 +75,32 @@ defmodule Derpex.Admission.Gentility.Cache do
   end
 
   defp take_records(_data, _count), do: {:error, :invalid_cache_record}
+
+  # A file written before this rule, or by a future writer, may carry two records
+  # for one node key. Loading both would leave the cache with one entry and two
+  # expiry-index keys, so the later expiry wins here and the other is discarded.
+  defp dedupe_leases(wires) do
+    wires
+    |> Enum.reduce(%{}, &keep_later_lease/2)
+    |> Enum.sort_by(fn {node_key, _held} -> node_key end)
+    |> Enum.map(fn {_node_key, {_expires_at_ms, wire}} -> wire end)
+  end
+
+  defp keep_later_lease(wire, leases) do
+    case Contract.decode_lease(wire) do
+      {:ok, lease} ->
+        case leases[lease.node_key] do
+          {expires_at_ms, _wire} when expires_at_ms >= lease.expires_at_ms ->
+            leases
+
+          _older_or_missing ->
+            Map.put(leases, lease.node_key, {lease.expires_at_ms, wire})
+        end
+
+      {:error, _undecodable} ->
+        leases
+    end
+  end
 
   defp records(records) do
     Enum.map(records, fn record -> [<<byte_size(record)::32>>, record] end)

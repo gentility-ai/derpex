@@ -216,15 +216,19 @@ defmodule Derpex.Admission.Gentility do
     # Trapping exits is what makes the final cache write on shutdown possible.
     Process.flag(:trap_exit, true)
 
-    with {:ok, state} <- initial_state(options) do
-      state =
-        state
-        |> load_cache()
-        |> purge_expired()
-        |> reschedule_expiry()
-        |> schedule_budget_prune()
+    case initial_state(options) do
+      {:ok, state} ->
+        state =
+          state
+          |> load_cache()
+          |> purge_expired()
+          |> reschedule_expiry()
+          |> schedule_budget_prune()
 
-      {:ok, state}
+        {:ok, state}
+
+      {:error, reason} ->
+        {:stop, reason}
     end
   end
 
@@ -981,7 +985,9 @@ defmodule Derpex.Admission.Gentility do
   end
 
   defp put_loaded_lease(state, wire, lease) do
-    put_lease_entry(state, lease.node_key, %{wire: wire, lease: lease})
+    state
+    |> drop_lease_entry(lease.node_key)
+    |> put_lease_entry(lease.node_key, %{wire: wire, lease: lease})
   end
 
   defp reverify_records(state) do
@@ -1019,19 +1025,43 @@ defmodule Derpex.Admission.Gentility do
     end
   end
 
+  # The popped key leaves both indexes before anything else happens, so the walk
+  # terminates even if an index key ever outlived the entry that created it.
   defp purge_expired_leases(state, now, purged?) do
     if :gb_trees.is_empty(state.by_expiry) do
       {state, purged?}
     else
-      {{expires_at_ms, node_key}, _present} = :gb_trees.smallest(state.by_expiry)
+      {{expires_at_ms, node_key} = key, _present} = :gb_trees.smallest(state.by_expiry)
 
       if expires_at_ms <= now do
-        state = drop_lease_entry(state, node_key)
-        close_peer(state, node_key)
-        purge_expired_leases(state, now, true)
+        state = %{
+          state
+          | by_expiry: :gb_trees.delete_any(key, state.by_expiry),
+            unclaimed: :gb_trees.delete_any(key, state.unclaimed)
+        }
+
+        purge_expired_leases(expire_lease(state, node_key, key), now, true)
       else
         {state, purged?}
       end
+    end
+  end
+
+  # An index key that no longer names the cached entry is stale, not an expiry:
+  # the lease standing behind that node key expires later and must survive.
+  defp expire_lease(state, node_key, key) do
+    case state.leases[node_key] do
+      nil ->
+        state
+
+      entry ->
+        if expiry_key(node_key, entry) == key do
+          state = drop_lease_entry(state, node_key)
+          close_peer(state, node_key)
+          state
+        else
+          state
+        end
     end
   end
 
