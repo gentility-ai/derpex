@@ -70,6 +70,7 @@ defmodule Derpex.Application do
          Boot.children(certificates) ++
          gentility_controller_children(gentility) ++
          relay_children ++
+         Boot.post_listener_children(certificates) ++
          stun_children ++ gentility_event_children(gentility) ++ signal_children()}
     end
   end

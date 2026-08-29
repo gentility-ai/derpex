@@ -31,6 +31,8 @@ defmodule Derpex.Certificates.IPManager do
 
   use GenServer
 
+  import Bitwise, only: [<<<: 2]
+
   require Logger
 
   alias Derpex.AtomicFile
@@ -48,6 +50,9 @@ defmodule Derpex.Certificates.IPManager do
   @initial_retry_delay_ms 60_000
   @maximum_retry_delay_ms 30 * 60_000
   @renew_interval_ms 60 * 60_000
+  @bootstrap_report_interval_ms 60_000
+  @bootstrap_key {__MODULE__, :bootstrap_subjects}
+  @never -(1 <<< 60)
 
   @type certificate :: %{
           :certificate_der => binary(),
@@ -105,10 +110,68 @@ defmodule Derpex.Certificates.IPManager do
   the listener reads the current one per connection out of `:persistent_term`.
   The listener supervisor calls this once, after the manager has started and
   before the socket is opened.
+
+  Returns `{:ok, certs_keys}` when a certificate is already in hand — the
+  common case on restart, read from the disk cache — and `:bootstrap` when
+  there is not one yet. In the second case the listener binds a self-signed
+  placeholder and this manager orders the real certificate in the background,
+  publishing it into the snapshot when it arrives. Nothing here blocks on a
+  certificate authority: the listener that answers HTTP-01 challenges may not
+  have accepted its first connection yet.
   """
-  @spec publish_to(GenServer.server(), term(), binary(), binary()) :: :ok
+  @spec publish_to(GenServer.server(), term(), binary(), binary()) ::
+          {:ok, certs_keys()} | :bootstrap
   def publish_to(manager, snapshot_key, subject, meta_certificate) do
     GenServer.call(manager, {:publish_to, snapshot_key, subject, meta_certificate}, :infinity)
+  end
+
+  @doc """
+  Orders a certificate for `subject` if there is not already one in hand.
+
+  Called after the listeners are accepting, because an HTTP-01 challenge is
+  only answerable once the plaintext listener is bound.
+  """
+  @spec ensure(GenServer.server(), binary()) :: :ok
+  def ensure(manager, subject) do
+    send(manager_pid(manager), {:ensure, canonical_subject(subject)})
+    :ok
+  end
+
+  defp manager_pid(manager) when is_pid(manager), do: manager
+  defp manager_pid(manager), do: GenServer.whereis(manager) || manager
+
+  @doc "Subjects whose listener is serving a self-signed placeholder."
+  @spec bootstrap_subjects() :: MapSet.t(binary())
+  def bootstrap_subjects, do: :persistent_term.get(@bootstrap_key, MapSet.new())
+
+  @doc "Whether any listener is serving a placeholder instead of its certificate."
+  @spec bootstrap_certificate_active?() :: boolean()
+  def bootstrap_certificate_active?, do: MapSet.size(bootstrap_subjects()) > 0
+
+  @doc false
+  @spec mark_bootstrap(binary()) :: :ok
+  def mark_bootstrap(subject) do
+    :persistent_term.put(
+      @bootstrap_key,
+      MapSet.put(bootstrap_subjects(), canonical_subject(subject))
+    )
+  end
+
+  defp clear_bootstrap(subject) do
+    subjects = bootstrap_subjects()
+
+    if MapSet.member?(subjects, subject) do
+      :persistent_term.put(@bootstrap_key, MapSet.delete(subjects, subject))
+    end
+
+    :ok
+  end
+
+  defp canonical_subject(subject) do
+    case :inet.parse_address(String.to_charlist(subject)) do
+      {:ok, address} -> address |> normalize_ip() |> canonical()
+      {:error, _reason} -> String.downcase(subject, :ascii)
+    end
   end
 
   @doc "Returns a challenge response, not-found, or fallback decision."
@@ -172,6 +235,10 @@ defmodule Derpex.Certificates.IPManager do
 
   @impl true
   def init(options) do
+    # Exits are trapped so `terminate/2` runs on shutdown: a manager that is
+    # stopping is no longer serving a placeholder, and the readiness probe has
+    # to stop saying that it is.
+    Process.flag(:trap_exit, true)
     directory = Keyword.fetch!(options, :directory)
     issuer = Keyword.fetch!(options, :issuer)
     :ok = AtomicFile.ensure_directory(directory)
@@ -185,11 +252,18 @@ defmodule Derpex.Certificates.IPManager do
       renew_interval_ms: Keyword.get(options, :renew_interval_ms, @renew_interval_ms),
       entries: %{},
       flights: %{},
+      bootstrap_reports: %{},
       challenges: %{}
     }
 
     {:ok, schedule_renewal(state)}
   end
+
+  # A manager that is gone is not serving a placeholder, so its subject leaves
+  # the set the readiness probe and the gauge read.
+  @impl true
+  def terminate(_reason, %{snapshot: {_key, subject, _meta}}), do: clear_bootstrap(subject)
+  def terminate(_reason, _state), do: :ok
 
   @impl true
   def handle_call({:certificate, local_ip, server_name}, from, state) do
@@ -201,15 +275,24 @@ defmodule Derpex.Certificates.IPManager do
   end
 
   def handle_call({:publish_to, key, subject, meta_certificate}, _from, state) do
-    subject = String.downcase(subject, :ascii)
+    subject = canonical_subject(subject)
     state = %{state | snapshot: {key, subject, meta_certificate}}
+    state = load_cached_entry(state, subject)
 
-    case Map.fetch(state.entries, subject) do
-      {:ok, entry} -> publish_snapshot(state, subject, entry)
-      :error -> :ok
+    case Map.get(state.entries, subject) do
+      %{tls: %{} = tls} = entry ->
+        publish_snapshot(state, subject, entry)
+        :ok = clear_bootstrap(subject)
+        {:reply, {:ok, with_meta_certificate(tls, meta_certificate)}, state}
+
+      _no_certificate_yet ->
+        # No order is started here. `init/1` of the listener supervisor runs
+        # before any listener has bound, so an order begun now would publish a
+        # challenge nothing can answer. `ensure/2` is called once the listeners
+        # are accepting.
+        :ok = mark_bootstrap(subject)
+        {:reply, :bootstrap, state}
     end
-
-    {:reply, :ok, state}
   end
 
   def handle_call({:put_challenge, path, response}, _from, state) do
@@ -250,6 +333,16 @@ defmodule Derpex.Certificates.IPManager do
   # minutes cannot stall a handshake for a different address, and the issuer
   # can call back into this manager to publish an HTTP-01 challenge while the
   # request that started it is still outstanding.
+  def handle_info({:ensure, subject}, state) do
+    entry = Map.get(state.entries, subject, new_entry())
+
+    if holds_valid_certificate?(entry) or not is_nil(entry.flight) or backing_off?(entry) do
+      {:noreply, state}
+    else
+      {:noreply, start_flight(state, subject, entry)}
+    end
+  end
+
   def handle_info({:flight, ip, result}, state) do
     {:noreply, finish_flight(state, ip, result)}
   end
@@ -270,9 +363,12 @@ defmodule Derpex.Certificates.IPManager do
     state
   end
 
+  # The tick renews what is close to expiry and retries what never arrived: a
+  # listener still serving a placeholder because the authority was unreachable
+  # has to be brought out of it without a restart.
   defp renewable?(entry) do
-    not is_nil(entry.certificate) and is_nil(entry.flight) and needs_renewal?(entry) and
-      not backing_off?(entry)
+    is_nil(entry.flight) and not backing_off?(entry) and
+      (is_nil(entry.certificate) or needs_renewal?(entry))
   end
 
   defp answer(state, local_ip, server_name, from, projection) do
@@ -327,8 +423,13 @@ defmodule Derpex.Certificates.IPManager do
 
         {:error, reason} ->
           deferred = defer(%{entry | flight: nil})
-          log_deferral(ip, reason, deferred)
           {deferred, {:error, reason}}
+      end
+
+    state =
+      case result do
+        {:ok, _fresh} -> state
+        {:error, reason} -> log_deferral(state, ip, reason, entry)
       end
 
     # The entry is committed before anyone is told about it: a caller that is
@@ -353,11 +454,38 @@ defmodule Derpex.Certificates.IPManager do
     %{state | flights: Map.delete(state.flights, reference)}
   end
 
-  defp log_deferral(ip, reason, deferred) do
-    Logger.warning(
-      "DERP IP certificate issuance for #{ip} failed: #{inspect(reason)}; " <>
-        "next attempt in #{div(deferred.next_attempt_ms - now_ms(), 1_000)}s"
-    )
+  # A listener still serving a placeholder is an outage in waiting, so it is
+  # reported at error rather than warning — throttled, because the retry that
+  # produces it is on a timer and must not turn the log into the incident.
+  defp log_deferral(state, ip, reason, deferred) do
+    seconds = div(deferred.next_attempt_ms - now_ms(), 1_000)
+
+    message =
+      "DERP certificate issuance for #{ip} failed: #{inspect(reason)}; " <>
+        "next attempt in #{seconds}s"
+
+    if MapSet.member?(bootstrap_subjects(), ip) do
+      report_bootstrap(state, ip, message)
+    else
+      Logger.warning(message)
+      state
+    end
+  end
+
+  defp report_bootstrap(state, ip, message) do
+    now = Clock.monotonic_time(:millisecond)
+    last = Map.get(state.bootstrap_reports, ip, @never)
+
+    if now - last >= @bootstrap_report_interval_ms do
+      Logger.error(
+        message <>
+          "; the listener is serving a self-signed placeholder for #{ip} and is not ready"
+      )
+
+      %{state | bootstrap_reports: Map.put(state.bootstrap_reports, ip, now)}
+    else
+      state
+    end
   end
 
   defp resolve(state, local, server_name) do
@@ -520,15 +648,28 @@ defmodule Derpex.Certificates.IPManager do
 
   defp publish_snapshot(%{snapshot: {key, subject, meta_certificate}}, ip, entry) do
     if ip == subject and not is_nil(entry.tls) do
-      :persistent_term.put(key, [
-        %{
-          cert: Certificates.append_meta_certificate(entry.tls.cert, meta_certificate),
-          key: entry.tls.key
-        }
-      ])
+      :persistent_term.put(key, [with_meta_certificate(entry.tls, meta_certificate)])
+      :ok = clear_bootstrap(subject)
     end
 
     :ok
+  end
+
+  defp with_meta_certificate(tls, meta_certificate) do
+    %{cert: Certificates.append_meta_certificate(tls.cert, meta_certificate), key: tls.key}
+  end
+
+  defp load_cached_entry(state, subject) do
+    case Map.fetch(state.entries, subject) do
+      {:ok, _entry} ->
+        state
+
+      :error ->
+        case load_cached(state.directory, subject) do
+          {:ok, entry} -> put_entry(state, subject, entry)
+          {:error, _reason} -> state
+        end
+    end
   end
 
   defp load_cached(directory, ip) do

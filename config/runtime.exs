@@ -576,7 +576,10 @@ if config_env() == :prod do
       accept_limit: accept_limit,
       gentility: gentility,
       identity_path: identity_path,
-      listeners: [listener | challenge_listener],
+      # The plaintext listener is started first: an ACME order cannot complete
+      # until the challenge it publishes is reachable, and the TLS listener is
+      # what starts that order.
+      listeners: challenge_listener ++ [listener],
       mesh_key: mesh_key,
       mesh_peers: mesh_peers,
       rate_config_path: rate_config_path,

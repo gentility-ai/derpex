@@ -111,6 +111,25 @@ defmodule Derpex.Certificates.Boot do
     Keyword.update(listener, :handler_options, options, &Keyword.merge(&1, options))
   end
 
+  @doc """
+  Children that must start only once every listener is accepting.
+
+  The first order publishes an HTTP-01 challenge that a certificate authority
+  fetches over the plaintext listener, so it cannot begin while the listener
+  supervisor is still building its children.
+  """
+  @spec post_listener_children(plan()) :: [Supervisor.child_spec()]
+  def post_listener_children(%{ip_certificate_issuer: nil}), do: []
+
+  def post_listener_children(%{hostname: hostname}) do
+    [
+      Supervisor.child_spec({Task, fn -> IPManager.ensure(@manager, hostname) end},
+        id: {@manager, :bootstrap},
+        restart: :transient
+      )
+    ]
+  end
+
   @doc "Returns the HTTP-01 challenge source to give a plaintext listener."
   @spec challenge_options(plan()) :: keyword()
   def challenge_options(%{ip_certificate_issuer: :acme}) do

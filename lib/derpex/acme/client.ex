@@ -430,9 +430,12 @@ defmodule Derpex.ACME.Client do
     attempt < @nonce_attempts and match?(%{type: @bad_nonce}, HTTP.problem(response))
   end
 
+  # A certificate authority that answers with something other than a problem
+  # document still has to be diagnosable, so a bounded slice of the body is
+  # carried with the status rather than discarded.
   defp error(response) do
     case HTTP.problem(response) do
-      nil -> {:acme_status, response.status}
+      nil -> {:acme_status, response.status, String.slice(response.body, 0, 256)}
       problem -> {:acme_error, response.status, problem.type, problem.detail}
     end
   end

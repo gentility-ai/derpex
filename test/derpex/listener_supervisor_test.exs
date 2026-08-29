@@ -1,5 +1,8 @@
 defmodule Derpex.ListenerSupervisorTest do
-  use ExUnit.Case, async: true
+  # Publishing a listener snapshot marks a bootstrap subject that the
+  # readiness probe and the certificate gauge read globally, so these run
+  # alone rather than beside a test that asserts readiness.
+  use ExUnit.Case, async: false
 
   alias Derpex.Certificates.IPManager
   alias Derpex.Certificates.Manual
@@ -48,13 +51,23 @@ defmodule Derpex.ListenerSupervisorTest do
     refute Keyword.has_key?(options, :ip_certificate_manager)
     transport_options = Keyword.fetch!(options, :transport_options)
 
-    assert [%{cert: [leaf, meta_certificate], key: {_type, _der}}] =
+    # Nothing is ordered while the listeners are still being built, so the
+    # socket binds a self-signed placeholder for the same address.
+    assert [%{cert: [placeholder, meta_certificate], key: {_type, _der}}] =
              Keyword.fetch!(transport_options, :certs_keys)
 
-    assert :ok = Manual.verify_certificate(leaf, "127.0.0.1")
+    assert :ok = Manual.verify_certificate(placeholder, "127.0.0.1")
+    assert IPManager.bootstrap_certificate_active?()
 
     assert common_name(meta_certificate) ==
              "derpkey" <> Base.encode16(server_public, case: :lower)
+
+    # Once the listeners are accepting, the manager issues and publishes into
+    # the listener snapshot, and the placeholder state clears.
+    :ok = IPManager.ensure(manager, "127.0.0.1")
+    assert {:ok, leaf} = await_issued(manager)
+    refute leaf == placeholder
+    refute IPManager.bootstrap_certificate_active?()
 
     # One metacertificate per listener, shared by the bound options and every
     # SNI answer: it only carries the node key, and an RSA key pair per hello
@@ -161,6 +174,23 @@ defmodule Derpex.ListenerSupervisorTest do
 
     assert {ThousandIsland, :start_link, [options]} = child_spec.start
     refute Keyword.has_key?(Keyword.fetch!(options, :transport_options), :certs_keys)
+  end
+
+  defp await_issued(manager, deadline \\ nil) do
+    deadline = deadline || System.monotonic_time(:millisecond) + 5_000
+
+    case IPManager.certificate(manager, "127.0.0.1") do
+      {:ok, %{certificate_der: der}} ->
+        {:ok, der}
+
+      {:error, reason} ->
+        if System.monotonic_time(:millisecond) >= deadline do
+          flunk("no certificate was issued: #{inspect(reason)}")
+        else
+          Process.sleep(10)
+          await_issued(manager, deadline)
+        end
+    end
   end
 
   defp common_name(certificate_der) do

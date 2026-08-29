@@ -1,5 +1,8 @@
 defmodule Derpex.Certificates.IPManagerTest do
-  use ExUnit.Case, async: true
+  # Publishing a listener snapshot marks a bootstrap subject that the
+  # readiness probe and the certificate gauge read globally, so these run
+  # alone rather than beside a test that asserts readiness.
+  use ExUnit.Case, async: false
 
   alias Derpex.Certificates.IPManager
   alias Derpex.Certificates.Manual
@@ -289,11 +292,14 @@ defmodule Derpex.Certificates.IPManagerTest do
         {IPManager, directory: directory, issuer: &IPManager.self_signed_issuer/2}
       )
 
-    # Nothing is published until the manager holds a certificate.
-    assert :ok = IPManager.publish_to(manager, key, "203.0.113.7", "meta")
+    # Nothing is published until the manager holds a certificate, and the
+    # listener is told to bind a placeholder in the meantime.
+    assert IPManager.publish_to(manager, key, "203.0.113.7", "meta") == :bootstrap
     assert :persistent_term.get(key, :missing) == :missing
+    assert MapSet.member?(IPManager.bootstrap_subjects(), "203.0.113.7")
 
     assert {:ok, certificate} = IPManager.certificate(manager, "203.0.113.7")
+    refute MapSet.member?(IPManager.bootstrap_subjects(), "203.0.113.7")
     assert [%{cert: [leaf, "meta"], key: {_type, _der}}] = :persistent_term.get(key)
     assert leaf == certificate.certificate_der
 

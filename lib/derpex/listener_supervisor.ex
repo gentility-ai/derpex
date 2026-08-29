@@ -205,23 +205,28 @@ defmodule Derpex.ListenerSupervisor do
   # renewed certificate reaches hellos with and without SNI alike.
   defp managed_certificate_options(manager, hostname, server_public_key, snapshot_key) do
     meta_certificate = MetaCertificate.generate(server_public_key)
-    :ok = IPManager.publish_to(manager, snapshot_key, hostname, meta_certificate)
 
     [
-      certs_keys: [bootstrap_certificate(manager, hostname, meta_certificate)],
+      certs_keys: [bound_certificate(manager, hostname, snapshot_key, meta_certificate)],
       sni_fun: IPManager.sni_fun(manager, hostname, meta_certificate)
     ]
   end
 
-  defp bootstrap_certificate(manager, hostname, meta_certificate) do
-    case IPManager.certs_keys(manager, hostname, "", meta_certificate) do
+  # Nothing here waits on a certificate authority. `publish_to/4` answers from
+  # the manager's disk cache, which is the usual case on restart, and otherwise
+  # says it is bootstrapping: the socket binds a self-signed placeholder and the
+  # manager orders the real certificate in the background, once the listener
+  # that answers HTTP-01 challenges is already accepting. Ordering here instead
+  # would deadlock the first order against the listener it needs.
+  defp bound_certificate(manager, hostname, snapshot_key, meta_certificate) do
+    case IPManager.publish_to(manager, snapshot_key, hostname, meta_certificate) do
       {:ok, certs_keys} ->
         certs_keys
 
-      {:error, reason} ->
+      :bootstrap ->
         Logger.warning(
-          "DERP listener could not obtain a certificate for #{hostname} at boot " <>
-            "(#{inspect(reason)}); binding a self-signed certificate until one arrives"
+          "DERP listener has no certificate for #{hostname} yet; binding a self-signed " <>
+            "placeholder while one is ordered"
         )
 
         self_signed_certificate(hostname, meta_certificate)
