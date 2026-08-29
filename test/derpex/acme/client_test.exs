@@ -134,6 +134,47 @@ defmodule Derpex.ACME.ClientTest do
     assert detail == "too many certificates"
   end
 
+  test "refuses a chain whose leaf does not carry the key it generated", context do
+    client = start_client(context)
+    :ok = FakeACME.substitute_certificate(context.authority)
+
+    assert {:error, :issued_certificate_key_mismatch} =
+             Client.issue(client, {:ip, "127.0.0.1"}, "shortlived")
+  end
+
+  test "waits past thirty polls when the authority asks it to", context do
+    client = start_client(context)
+    # Thirty-five polls is more than the fixed thirty attempts this used to
+    # give up after; Retry-After of zero is clamped up to the floor, so the
+    # test costs a few seconds rather than a minute.
+    :ok = FakeACME.defer_order(context.authority, 35, "0")
+
+    assert {:ok, _certificate} = Client.issue(client, {:ip, "127.0.0.1"}, "shortlived")
+    assert FakeACME.order_polls(context.authority) > 30
+  end
+
+  test "gives up on an order that never settles, at the deadline", context do
+    client = start_client(context)
+    :ok = FakeACME.defer_order(context.authority, :forever, "0")
+
+    assert {:error, {:order_deadline, _url}} =
+             Client.issue(client, {:ip, "127.0.0.1"}, "shortlived", deadline_ms: 500)
+  end
+
+  test "treats a differently cased badNonce URN as one", context do
+    client = start_client(context)
+
+    :ok =
+      FakeACME.fail_next(
+        context.authority,
+        "/new-order",
+        {400, "urn:ietf:params:acme:error:BADNONCE", "stale nonce"}
+      )
+
+    assert {:ok, _certificate} = Client.issue(client, {:ip, "127.0.0.1"}, "shortlived")
+    assert FakeACME.orders(context.authority) == 1
+  end
+
   test "retries once with a fresh nonce when the authority rejects one", context do
     client = start_client(context)
 

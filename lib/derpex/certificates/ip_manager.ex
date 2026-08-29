@@ -295,8 +295,8 @@ defmodule Derpex.Certificates.IPManager do
     end
   end
 
-  def handle_call({:put_challenge, path, response}, _from, state) do
-    {:reply, :ok, put_in(state, [:challenges, path], response)}
+  def handle_call({:put_challenge, path, response}, {owner, _tag}, state) do
+    {:reply, :ok, put_in(state, [:challenges, path], {response, owner})}
   end
 
   def handle_call({:delete_challenge, path}, _from, state) do
@@ -307,7 +307,7 @@ defmodule Derpex.Certificates.IPManager do
     response =
       if String.starts_with?(path, @challenge_prefix) do
         case Map.fetch(state.challenges, path) do
-          {:ok, body} -> {:ok, body}
+          {:ok, {body, _owner}} -> {:ok, body}
           :error -> :not_found
         end
       else
@@ -346,6 +346,8 @@ defmodule Derpex.Certificates.IPManager do
   def handle_info({:flight, ip, result}, state) do
     {:noreply, finish_flight(state, ip, result)}
   end
+
+  def handle_info({:EXIT, _pid, _reason}, state), do: {:noreply, state}
 
   def handle_info({:DOWN, reference, :process, _pid, reason}, state) do
     case Map.pop(state.flights, reference) do
@@ -390,17 +392,23 @@ defmodule Derpex.Certificates.IPManager do
     update_in(state.entries[ip].flight.waiters, &[{from, projection} | &1])
   end
 
+  # The flight is linked as well as monitored: a manager that goes down takes
+  # its outstanding orders with it rather than leaving one running against a
+  # certificate authority with nowhere to deliver. Exits are trapped, so the
+  # link never propagates a failure into this process.
   defp start_flight(state, ip, entry) do
     manager = self()
     directory = state.directory
     issuer = state.issuer
 
-    {_pid, reference} =
-      spawn_monitor(fn ->
+    pid =
+      spawn_link(fn ->
         send(manager, {:flight, ip, flight_result(directory, issuer, ip)})
       end)
 
-    state = put_entry(state, ip, %{entry | flight: %{reference: reference, waiters: []}})
+    reference = Process.monitor(pid)
+    flight = %{reference: reference, pid: pid, waiters: []}
+    state = put_entry(state, ip, %{entry | flight: flight})
     %{state | flights: Map.put(state.flights, reference, ip)}
   end
 
@@ -413,8 +421,8 @@ defmodule Derpex.Certificates.IPManager do
 
   defp finish_flight(state, ip, result) do
     entry = Map.get(state.entries, ip, new_entry())
-    flight = entry.flight || %{reference: nil, waiters: []}
-    state = release_monitor(state, flight.reference)
+    flight = entry.flight || %{reference: nil, pid: nil, waiters: []}
+    state = state |> release_monitor(flight.reference) |> reclaim_challenges(flight.pid)
 
     {entry, reply} =
       case result do
@@ -446,6 +454,17 @@ defmodule Derpex.Certificates.IPManager do
 
   defp reply({:error, reason}, _projection), do: {:error, reason}
   defp reply(result, projection), do: project(result, projection)
+
+  # An order removes its own challenge when it finishes, but an order that died
+  # cannot, and a token left answering is a credential left lying around.
+  defp reclaim_challenges(state, nil), do: state
+
+  defp reclaim_challenges(state, pid) do
+    challenges =
+      Map.reject(state.challenges, fn {_path, {_response, owner}} -> owner == pid end)
+
+    %{state | challenges: challenges}
+  end
 
   defp release_monitor(state, nil), do: state
 

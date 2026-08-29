@@ -66,6 +66,17 @@ defmodule Derpex.Test.FakeACME do
   @doc "Makes the next request to `path` answer with an ACME problem document."
   def fail_next(server, path, problem), do: GenServer.call(server, {:fail_next, path, problem})
 
+  @doc "Holds the order pending for `count` polls, advertising `retry_after` seconds."
+  def defer_order(server, count, retry_after) do
+    GenServer.call(server, {:defer_order, count, retry_after})
+  end
+
+  @doc "How many times the order resource has been read."
+  def order_polls(server), do: GenServer.call(server, :order_polls)
+
+  @doc "Signs the next certificate for a key the client did not generate."
+  def substitute_certificate(server), do: GenServer.call(server, :substitute_certificate)
+
   @impl true
   def init(options) do
     {:ok, listen} =
@@ -99,6 +110,10 @@ defmodule Derpex.Test.FakeACME do
        order_status: "pending",
        certificate_pem: nil,
        binding: nil,
+       deferrals: 0,
+       retry_after: nil,
+       order_polls: 0,
+       substitute: false,
        failures: %{}
      }}
   end
@@ -112,6 +127,15 @@ defmodule Derpex.Test.FakeACME do
   def handle_call(:root, _from, state), do: {:reply, state.root_der, state}
 
   def handle_call(:last_binding, _from, state), do: {:reply, state.binding, state}
+  def handle_call(:order_polls, _from, state), do: {:reply, state.order_polls, state}
+
+  def handle_call({:defer_order, count, retry_after}, _from, state) do
+    {:reply, :ok, %{state | deferrals: count, retry_after: retry_after}}
+  end
+
+  def handle_call(:substitute_certificate, _from, state) do
+    {:reply, :ok, %{state | substitute: true}}
+  end
 
   def handle_call(:last_order, _from, state) do
     {:reply, %{profile: state.profile, identifier: state.identifier}, state}
@@ -229,7 +253,22 @@ defmodule Derpex.Test.FakeACME do
      }), state}
   end
 
-  defp dispatch("/order/1", _body, state), do: {:reply, order_response(state, 200), state}
+  # The order stays pending for as many polls as the test asked for, with the
+  # Retry-After a real authority would send.
+  defp dispatch("/order/1", _body, state) do
+    state = %{state | order_polls: state.order_polls + 1}
+
+    case state.deferrals do
+      0 ->
+        {:reply, order_response(state, 200), state}
+
+      :forever ->
+        {:reply, deferred_response(state), state}
+
+      count ->
+        {:reply, deferred_response(state), %{state | deferrals: count - 1}}
+    end
+  end
 
   defp dispatch("/cert/1", _body, state) do
     {:reply,
@@ -261,6 +300,23 @@ defmodule Derpex.Test.FakeACME do
       _absent ->
         nil
     end
+  end
+
+  defp deferred_response(state) do
+    {status, headers, body} = json(200, pending_order(state), [])
+    {status, [{"retry-after", state.retry_after || "1"} | headers], body}
+  end
+
+  defp pending_order(state) do
+    identifier = state.identifier || %{type: "unknown", value: "unknown"}
+
+    %{
+      "status" => "pending",
+      "identifiers" => [%{"type" => identifier.type, "value" => identifier.value}],
+      "authorizations" => [state.base <> "/authz/1"],
+      "finalize" => state.base <> "/finalize/1",
+      "certificate" => state.base <> "/cert/1"
+    }
   end
 
   defp order_response(state, status) do
@@ -373,6 +429,7 @@ defmodule Derpex.Test.FakeACME do
   end
 
   defp sign_leaf(state, public_point, general_name) do
+    public_point = if state.substitute, do: substitute_point(), else: public_point
     now = System.system_time(:second)
 
     tbs =
@@ -393,6 +450,12 @@ defmodule Derpex.Test.FakeACME do
       {:Certificate, leaf, :not_encrypted},
       {:Certificate, state.root_der, :not_encrypted}
     ])
+  end
+
+  # A well-formed certificate for somebody else's key, which a client has to
+  # refuse however good the chain looks.
+  defp substitute_point do
+    elem(:public_key.generate_key({:namedCurve, :secp256r1}), 4)
   end
 
   defp generate_root do

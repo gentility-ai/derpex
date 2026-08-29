@@ -37,12 +37,14 @@ defmodule Derpex.ACME.Client do
   alias Derpex.ACME.HTTP
   alias Derpex.ACME.JWS
   alias Derpex.ACME.Order
+  alias Derpex.Certificates
   alias Derpex.Clock
 
-  @bad_nonce "urn:ietf:params:acme:error:badNonce"
+  @bad_nonce_suffix "badnonce"
   @nonce_attempts 3
-  @poll_attempts 30
+  @nonce_backoff_ms 200
   @poll_interval_ms 250
+  @maximum_poll_interval_ms 10_000
   @order_deadline_ms 180_000
 
   @type subject :: {:ip, binary()} | {:dns, binary()}
@@ -75,17 +77,21 @@ defmodule Derpex.ACME.Client do
   end
 
   @doc "Orders one certificate, fulfilling every authorization it requires."
-  @spec issue(GenServer.server(), subject(), binary() | nil) ::
+  @spec issue(GenServer.server(), subject(), binary() | nil, keyword()) ::
           {:ok, certificate()} | {:error, term()}
-  def issue(client, identifier, profile \\ nil) do
+  def issue(client, identifier, profile \\ nil, options \\ []) do
+    deadline =
+      Clock.system_time(:millisecond) + Keyword.get(options, :deadline_ms, @order_deadline_ms)
+
     with {:ok, session} <- GenServer.call(client, :session, :infinity),
          :ok <- supported_profile(session, profile),
          {:ok, order} <- create_order(client, session, identifier, profile),
-         :ok <- authorize(client, session, order),
-         {:ok, order} <- await_ready(client, session, order),
+         :ok <- authorize(client, session, order, deadline),
+         {:ok, order} <- await_ready(client, session, order, deadline),
          {:ok, {csr, private_key}} <- CSR.generate(identifier),
-         {:ok, order} <- finalize(client, session, order, csr),
-         {:ok, chain} <- download(client, session, order) do
+         {:ok, order} <- finalize(client, session, order, csr, deadline),
+         {:ok, chain} <- download(client, session, order),
+         :ok <- verify_key(chain, private_key) do
       {:ok, %{certificate_der: hd(chain), chain: chain, private_key: private_key}}
     end
   end
@@ -112,6 +118,8 @@ defmodule Derpex.ACME.Client do
       {:error, reason, state} -> {:reply, {:error, reason}, state}
     end
   end
+
+  def handle_call(:clear_nonces, _from, state), do: {:reply, :ok, %{state | nonces: []}}
 
   def handle_call(:take_nonce, _from, %{nonces: [nonce | rest]} = state) do
     {:reply, {:ok, nonce}, %{state | nonces: rest}}
@@ -180,32 +188,50 @@ defmodule Derpex.ACME.Client do
   # Registration runs before the client can serve `:take_nonce`, so it spends
   # nonces from this process's own pool rather than calling back into itself.
   defp request(state, url, payload, kid, attempt \\ 1) do
-    {nonce, state} = local_nonce(state)
+    case local_nonce(state) do
+      {:ok, nonce, state} -> send_request(state, url, payload, kid, attempt, nonce)
+      {:error, reason, state} -> {:error, reason, state}
+    end
+  end
 
-    body =
-      JWS.encode(payload, state.session.account_key, kid: kid, nonce: nonce, url: url)
+  defp send_request(state, url, payload, kid, attempt, nonce) do
+    body = JWS.encode(payload, state.session.account_key, kid: kid, nonce: nonce, url: url)
 
     case HTTP.post(url, body, state.http_options) do
       {:ok, response} ->
         state = store_local_nonce(state, response)
-
-        cond do
-          response.status < 400 -> {:ok, response, state}
-          retry_nonce?(response, attempt) -> request(state, url, payload, kid, attempt + 1)
-          true -> {:error, error(response), state}
-        end
+        requested(state, url, payload, kid, attempt, response)
 
       {:error, reason} ->
         {:error, reason, state}
     end
   end
 
-  defp local_nonce(%{nonces: [nonce | rest]} = state), do: {nonce, %{state | nonces: rest}}
+  defp requested(state, url, payload, kid, attempt, response) do
+    cond do
+      response.status < 400 ->
+        {:ok, response, state}
+
+      bad_nonce?(response) and attempt < @nonce_attempts ->
+        request(%{state | nonces: []}, url, payload, kid, attempt + 1)
+
+      true ->
+        {:error, error(response), state}
+    end
+  end
+
+  defp local_nonce(%{nonces: [nonce | rest]} = state), do: {:ok, nonce, %{state | nonces: rest}}
 
   defp local_nonce(state) do
     case HTTP.get(state.session.directory.new_nonce, state.http_options) do
-      {:ok, response} -> {HTTP.header(response, "replay-nonce"), state}
-      {:error, _reason} -> {nil, state}
+      {:ok, response} ->
+        case HTTP.header(response, "replay-nonce") do
+          nonce when is_binary(nonce) and nonce != "" -> {:ok, nonce, state}
+          _absent -> {:error, :no_replay_nonce, state}
+        end
+
+      {:error, reason} ->
+        {:error, reason, state}
     end
   end
 
@@ -247,25 +273,25 @@ defmodule Derpex.ACME.Client do
     end
   end
 
-  defp authorize(client, session, order) do
+  defp authorize(client, session, order, deadline) do
     Enum.reduce_while(order.authorizations, :ok, fn url, :ok ->
-      case fulfill(client, session, url) do
+      case fulfill(client, session, url, deadline) do
         :ok -> {:cont, :ok}
         {:error, reason} -> {:halt, {:error, reason}}
       end
     end)
   end
 
-  defp fulfill(client, session, url) do
+  defp fulfill(client, session, url, deadline) do
     with {:ok, response} <- post(client, session, url, :post_as_get),
          {:ok, _status, challenge} <- Challenge.select(response) do
-      accept(client, session, url, challenge)
+      accept(client, session, url, challenge, deadline)
     end
   end
 
-  defp accept(_client, _session, _url, nil), do: :ok
+  defp accept(_client, _session, _url, nil, _deadline), do: :ok
 
-  defp accept(client, session, authorization_url, challenge) do
+  defp accept(client, session, authorization_url, challenge, deadline) do
     path = Challenge.path(challenge.token)
     response = Challenge.key_authorization(challenge.token, session.account_key)
     {module, server} = session.challenge
@@ -273,15 +299,15 @@ defmodule Derpex.ACME.Client do
 
     try do
       with {:ok, _accepted} <- post(client, session, challenge.url, %{}) do
-        await_authorization(client, session, authorization_url)
+        await_authorization(client, session, authorization_url, deadline)
       end
     after
       _removed = module.delete_challenge(server, path)
     end
   end
 
-  defp await_authorization(client, session, url) do
-    poll(client, session, url, fn response ->
+  defp await_authorization(client, session, url, deadline) do
+    poll(client, session, url, deadline, fn response ->
       case Challenge.status(response) do
         {:ok, "valid"} -> {:done, :ok}
         {:ok, "invalid"} -> {:done, {:error, {:authorization_invalid, url}}}
@@ -291,10 +317,10 @@ defmodule Derpex.ACME.Client do
     end)
   end
 
-  defp await_ready(_client, _session, %{url: nil} = order), do: {:ok, order}
+  defp await_ready(_client, _session, %{url: nil} = order, _deadline), do: {:ok, order}
 
-  defp await_ready(client, session, order) do
-    poll(client, session, order.url, fn response ->
+  defp await_ready(client, session, order, deadline) do
+    poll(client, session, order.url, deadline, fn response ->
       case Order.parse(response) do
         {:ok, parsed} -> ready(parsed, order)
         {:error, reason} -> {:done, {:error, reason}}
@@ -312,7 +338,7 @@ defmodule Derpex.ACME.Client do
     end
   end
 
-  defp finalize(client, session, order, csr) do
+  defp finalize(client, session, order, csr, deadline) do
     with {:ok, response} <-
            post(client, session, order.finalize, Order.finalize_payload(csr)),
          {:ok, finalized} <- Order.parse(response) do
@@ -321,13 +347,13 @@ defmodule Derpex.ACME.Client do
       case Order.settled(finalized) do
         :issued -> {:ok, finalized}
         {:error, reason} -> {:error, reason}
-        _not_yet -> await_issued(client, session, finalized)
+        _not_yet -> await_issued(client, session, finalized, deadline)
       end
     end
   end
 
-  defp await_issued(client, session, order) do
-    poll(client, session, order.url, fn response ->
+  defp await_issued(client, session, order, deadline) do
+    poll(client, session, order.url, deadline, fn response ->
       case Order.parse(response) do
         {:ok, parsed} -> issued(parsed, order)
         {:error, reason} -> {:done, {:error, reason}}
@@ -356,6 +382,16 @@ defmodule Derpex.ACME.Client do
 
   defp download(_client, _session, _order), do: {:error, :order_without_certificate}
 
+  # autocert's `validCert`: a chain whose leaf does not carry the public key of
+  # the key we generated is not ours to serve, however well formed it is.
+  defp verify_key([leaf | _intermediates], private_key) do
+    if Certificates.private_key_matches?(leaf, private_key) do
+      :ok
+    else
+      {:error, :issued_certificate_key_mismatch}
+    end
+  end
+
   defp certificates(pem) do
     pem
     |> :public_key.pem_decode()
@@ -367,34 +403,54 @@ defmodule Derpex.ACME.Client do
     _error -> []
   end
 
-  # The pause between polls is a delay inside one order's own process, not a
-  # protocol timer, so it sleeps; the deadline that bounds the order is read
-  # from `Derpex.Clock` and is therefore steerable.
-  defp poll(client, session, url, decide, attempt \\ 1, deadline \\ nil) do
-    deadline = deadline || Clock.system_time(:millisecond) + @order_deadline_ms
-
+  # An order is bounded by a deadline, not by a fixed number of attempts: a
+  # certificate authority that asks for a minute between polls is entitled to,
+  # and thirty quarter-second attempts would give up in under eight seconds.
+  # `Retry-After` decides the pause, clamped so neither a zero nor an hour is
+  # taken literally, and the deadline that bounds the whole order is read from
+  # `Derpex.Clock` and is therefore steerable. The pause itself is a delay
+  # inside one order's own process, not a protocol timer.
+  defp poll(client, session, url, deadline, decide) do
     with {:ok, response} <- post(client, session, url, :post_as_get) do
       case decide.(response) do
         {:done, result} -> result
-        :again -> poll_again(client, session, url, decide, attempt, deadline)
+        :again -> poll_again(client, session, url, deadline, decide, response)
       end
     end
   end
 
-  defp poll_again(client, session, url, decide, attempt, deadline) do
-    cond do
-      attempt >= @poll_attempts ->
-        {:error, {:order_not_settled, url}}
-
-      Clock.system_time(:millisecond) >= deadline ->
+  defp poll_again(client, session, url, deadline, decide, response) do
+    case remaining(deadline) do
+      0 ->
         {:error, {:order_deadline, url}}
 
-      true ->
-        Process.sleep(@poll_interval_ms)
-        poll(client, session, url, decide, attempt + 1, deadline)
+      remaining ->
+        Process.sleep(min(retry_after(response), remaining))
+        poll(client, session, url, deadline, decide)
     end
   end
 
+  defp remaining(deadline), do: max(deadline - Clock.system_time(:millisecond), 0)
+
+  defp retry_after(response) do
+    case HTTP.header(response, "retry-after") do
+      value when is_binary(value) ->
+        case Integer.parse(String.trim(value)) do
+          {seconds, ""} when seconds >= 0 ->
+            seconds |> Kernel.*(1_000) |> max(@poll_interval_ms) |> min(@maximum_poll_interval_ms)
+
+          _not_delta_seconds ->
+            @poll_interval_ms
+        end
+
+      nil ->
+        @poll_interval_ms
+    end
+  end
+
+  # A nonce that cannot be fetched is an error, never a request sent without
+  # one: RFC 8555 rejects an unauthenticated replay, and a JWS with no nonce
+  # would be indistinguishable from one at the far end.
   defp post(client, session, url, payload, attempt \\ 1) do
     with {:ok, nonce} <- GenServer.call(client, :take_nonce, :infinity) do
       body =
@@ -411,11 +467,21 @@ defmodule Derpex.ACME.Client do
     end
   end
 
+  # RFC 8555 section 6.5: a rejected nonce is retried with a fresh one. Every
+  # nonce held is suspect once the server rejects one, so the pool is emptied
+  # rather than spent one rejection at a time, and the retries back off.
   defp posted(client, session, url, payload, attempt, response) do
     cond do
-      response.status < 400 -> {:ok, response}
-      retry_nonce?(response, attempt) -> post(client, session, url, payload, attempt + 1)
-      true -> {:error, error(response)}
+      response.status < 400 ->
+        {:ok, response}
+
+      bad_nonce?(response) and attempt < @nonce_attempts ->
+        GenServer.call(client, :clear_nonces, :infinity)
+        Process.sleep(@nonce_backoff_ms * attempt)
+        post(client, session, url, payload, attempt + 1)
+
+      true ->
+        {:error, error(response)}
     end
   end
 
@@ -426,8 +492,13 @@ defmodule Derpex.ACME.Client do
     end
   end
 
-  defp retry_nonce?(response, attempt) do
-    attempt < @nonce_attempts and match?(%{type: @bad_nonce}, HTTP.problem(response))
+  # Authorities differ on the case of the URN, so it is matched case
+  # insensitively on its suffix rather than compared byte for byte.
+  defp bad_nonce?(response) do
+    case HTTP.problem(response) do
+      %{type: type} -> type |> String.downcase(:ascii) |> String.ends_with?(@bad_nonce_suffix)
+      nil -> false
+    end
   end
 
   # A certificate authority that answers with something other than a problem
