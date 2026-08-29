@@ -14,6 +14,7 @@ defmodule Derpex.UpstreamInventory do
        "cmd/derper/ipcert_test.go"
      ]},
     {"DERP prober", ["prober/derp_test.go"]},
+    {"STUN", ["net/stun/stun_test.go"]},
     {"XDP", ["derp/xdp/xdp_linux_test.go"]}
   ]
 
@@ -65,7 +66,7 @@ defmodule Derpex.UpstreamInventory do
     {"derp/derpserver/derpserver_test.go", "TestModifyTLSConfigToAddMetaCert"} =>
       "adapted in test/derpex/certificates_test.exs; concurrent augmentation returns fresh chains without provider mutation",
     {"derp/derpserver/derpserver_test.go", "TestLimiter"} =>
-      "ported shared burst, refill, zero-rate, disable, and pre-allocation rejection cases in test/derpex/rate_limiter_test.exs and test/derpex/receive_limiter_test.exs",
+      "upstream logs 200 reservations against a shared bucket and asserts nothing; DERPEX pins the behavior it explores — burst, refill, and reservation delay in test/derpex/rate_limiter_test.exs and test/derpex/receive_limiter_test.exs, and the zero-rate disable and burst clamp in test/derpex/rate_config_test.exs",
     {"derp/derpserver/derpserver_test.go", "TestGetPerClientSendQueueDepth"} =>
       "ported in test/derpex/send_queue_config_test.exs; empty/default and explicit depths preserved",
     {"derp/derpserver/derpserver_test.go", "TestParseSSOutput"} =>
@@ -123,9 +124,13 @@ defmodule Derpex.UpstreamInventory do
     {"cmd/derper/derper_test.go", "TestNoContent"} =>
       "ported all challenge validity cases in test/derpex/http1_test.exs",
     {"cmd/derper/ipcert_test.go", "TestIPCertManager"} =>
-      "ported IPv4/IPv6 issuance with the shortlived profile, SNI checks, HTTP-01 routing and disk-cache reuse in test/derpex/certificates/ip_manager_test.exs, driven end to end against the ported fake certificate authority in test/derpex/acme/client_test.exs",
+      "ported IPv4/IPv6 issuance with the shortlived profile, SNI checks, HTTP-01 routing and disk-cache reuse in test/derpex/certificates/ip_manager_test.exs, driven end to end against the ported fake certificate authority in test/derpex/acme/client_test.exs and through the real boot path — placeholder, order, HTTP-01 fetched back off the plaintext listener, issued leaf served to a no-SNI handshake — in test/derpex/certificates/acme_boot_test.exs",
     {"cmd/derper/ipcert_test.go", "TestCertModeIPCertsGating"} =>
       "ported certificate-mode/IP-host gating in test/derpex/certificates/mode_test.exs and the boot-time refusal of unimplemented modes in test/derpex/certificates/boot_test.exs",
+    {"net/stun/stun_test.go", "TestParseBindingRequest"} =>
+      "ported in test/derpex/stun/protocol_test.exs; the official binding-request shape, upstream's tolerance of the unused declared attribute length, and rejection of a wrong software attribute, a corrupted fingerprint, or trailing attributes",
+    {"net/stun/stun_test.go", "TestResponse"} =>
+      "ported in test/derpex/stun/protocol_test.exs as byte-identical IPv4 and IPv6 XOR-MAPPED-ADDRESS vectors, including the IPv4-mapped IPv6 source Go answers as IPv4; the round trip upstream asserts is closed by the official parser in test/interop/go_client_test.exs",
     {"prober/derp_test.go", "Test_packetsForSize"} =>
       "ported exact packet counts, total sizes, per-call randomness, and large-payload caching in test/derpex/prober_test.exs"
   }
@@ -151,7 +156,11 @@ defmodule Derpex.UpstreamInventory do
     {"cmd/derper/cert_test.go", "TestPinnedCertRawIP"} =>
       "unchanged official region client dials DERPEX by raw IP using the generated sha256-raw DERP-map pin in test/interop/go_client_test.exs",
     {"prober/derp_test.go", "TestRunDerpProbeNodePair"} =>
-      "upstream 100 MB transfer and 30-packet in-flight bound run through DERPEX with unchanged official clients in test/interop/go_client_test.exs"
+      "upstream's runDerpProbeNodePair is unexported, so interop/go/prober_smoke.go re-implements the probe loop — the same 100 MB transfer and 30-packet in-flight bound — around two unchanged official derphttp clients, which are what DERPEX is measured through in test/interop/go_client_test.exs",
+    {"net/stun/stun_test.go", "TestParseResponse"} =>
+      "DERPEX is a STUN server and ships no response parser; the reciprocal claim, that its binding response is what the unchanged official stun.ParseResponse reads, is asserted by interop/go/stun_smoke.go in test/interop/go_client_test.exs",
+    {"net/stun/stun_test.go", "TestAttrOrderForXdpDERP"} =>
+      "upstream pins the attribute order its own request builder emits; DERPEX builds no request, and the order it is held to is whatever the unchanged official stun.Request sends in interop/go/stun_smoke.go, gated by test/interop/go_client_test.exs"
   }
 
   # A row the trace comparison settles: the same scenario is replayed against
@@ -161,14 +170,11 @@ defmodule Derpex.UpstreamInventory do
     {"derp/derp_test.go", "TestSendRecv"} =>
       "the pinned Go server and DERPEX produce the same relayed-packet and peer-gone trace in test/interop/differential_test.exs",
     {"derp/derpserver/derpserver_test.go", "TestServerDupClients"} =>
-      "duplicate routing is compared step for step against the pinned Go server in test/interop/differential_test.exs; the connection lifecycle cases are in test/derpex/router_test.exs"
+      "the lastWriterIsActive half is compared step for step against the pinned Go server in test/interop/differential_test.exs and the connection lifecycle cases are in test/derpex/router_test.exs; the disableFighters half is not reproduced, because that policy is set only by upstream's own test and Server.dupPolicy leaves it off everywhere else, so DERPEX implements the shipped policy only"
   }
 
   # Rows that stay release-blocking until the work they name exists.
-  @pending %{
-    {"cmd/derper/ipcert_test.go", "TestIPCertManagerNextProvider"} =>
-      "upstream's IP certificate manager delegates a DNS hello to a separate autocert provider; DERPEX has no second provider to delegate to, because one manager orders both IP and hostname certificates, so the `:next_provider` seam has no production caller and this row stays open even though a DNS hello creating no IP order is covered in test/derpex/certificates/ip_manager_test.exs"
-  }
+  @pending %{}
 
   # A row about a Go implementation detail. The behavior it protects is still
   # gated here, so each of these cites the artifact that gates it.
@@ -178,9 +184,15 @@ defmodule Derpex.UpstreamInventory do
     {"derp/derpserver/derpserver_test.go", "TestLookupDestHashTrieNoAlloc"} =>
       "Go allocation assertion; bench/relay.exs enforces per-flow allocation and p99 latency thresholds through the benchmark smoke in .github/workflows/ci.yml",
     {"derp/xdp/xdp_linux_test.go", "TestXDP"} =>
-      "separate Linux XDP path is not in the cmd/derper request path; the pinned oracle job in .github/workflows/ci.yml still runs upstream's own XDP package",
+      "separate Linux XDP data path, outside the cmd/derper request path DERPEX reimplements; the pinned oracle job in .github/workflows/ci.yml compiles upstream's own derp/xdp package, but this test calls tstest.RequireRoot and skips itself on the unprivileged runner, so what the job proves for it is that the package still builds",
     {"derp/xdp/xdp_linux_test.go", "TestCountersMapKey"} =>
-      "layout invariant for the unused Go/XDP implementation; the pinned oracle job in .github/workflows/ci.yml still runs upstream's own XDP package"
+      "layout invariant for the unused Go/XDP counters map; it needs no privileges, so it is the derp/xdp test that actually executes when the pinned oracle job in .github/workflows/ci.yml runs that package",
+    {"prober/derp_test.go", "TestDerpProber"} =>
+      "tests the separate prober tool (cmd/derpprobe) planning probes from a DERP map, not the DERP server; DERPEX ships no prober planner, and the server surface a prober needs is black-box gated by TestRunDerpProbeNodePair in test/interop/go_client_test.exs",
+    {"cmd/derper/ipcert_test.go", "TestIPCertManagerNextProvider"} =>
+      "upstream's IP certificate manager hands a DNS hello to a separate autocert provider; DERPEX orders both IP and hostname certificates from one manager, so `:next_provider` is a structural seam with no production caller — the argument PLAN.md §2.3 records — and the delegation the seam exists for is exercised in test/derpex/certificates/ip_manager_test.exs:70-92",
+    {"net/stun/stun_test.go", "TestIs"} =>
+      "Go's classifier for a socket magicsock multiplexes between STUN and WireGuard; DERPEX's responder owns its UDP port in lib/derpex/stun.ex and validates every datagram as a binding request instead, so there is no packet kind to guess"
   }
 
   @dispositions [
@@ -201,8 +213,8 @@ defmodule Derpex.UpstreamInventory do
         verify_commit!(upstream)
         tests = collect_tests!(upstream)
 
-        unless length(tests) == 69 do
-          abort("expected 69 relevant tests, found #{length(tests)}")
+        unless length(tests) == 74 do
+          abort("expected 74 relevant tests, found #{length(tests)}")
         end
 
         verify_citations!(tests)

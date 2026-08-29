@@ -146,6 +146,7 @@ jobs:
           ./derp/derphttp
           ./cmd/derper
           ./prober
+          ./net/stun
           ./derp/xdp
 
       - name: Run Go clients, differential oracle, and tsnet-stack smokes

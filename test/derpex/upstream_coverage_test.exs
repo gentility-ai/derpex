@@ -54,11 +54,21 @@ defmodule Derpex.UpstreamCoverageTest do
     end
   end
 
-  test "only the prober plan and the next-provider seam are pending" do
+  test "no upstream test is left pending" do
     pending =
       rows() |> Enum.filter(&(&1.disposition == "pending")) |> Enum.map(& &1.name) |> Enum.sort()
 
-    assert pending == ["TestDerpProber", "TestIPCertManagerNextProvider"]
+    assert pending == []
+  end
+
+  test "the inventory covers every upstream test the generator scopes in" do
+    rows = rows()
+    assert length(rows) == 74
+
+    for name <- ~w(TestParseResponse TestIs TestParseBindingRequest TestResponse
+                   TestAttrOrderForXdpDERP) do
+      assert Enum.any?(rows, &(&1.name == name)), "the STUN area is missing #{name}"
+    end
   end
 
   test "the send-freeze row points at the system test that ports it" do

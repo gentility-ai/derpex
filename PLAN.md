@@ -104,11 +104,14 @@ Two consequences are worth stating rather than discovering:
   `Derpex.Listener.Transports.SSL` reads it per connection. A renewed
   certificate therefore reaches hellos with and without SNI alike.
 
-One inventory row stays open. `TestIPCertManagerNextProvider` covers upstream's
-delegation of a DNS hello from the IP certificate manager to a separate
-autocert manager. DERPEX has no second provider to delegate to — one manager
-orders both IP and hostname certificates — so the `:next_provider` seam has no
-production caller and the row is recorded as `pending` rather than claimed.
+One inventory row is a structural seam rather than a behavior.
+`TestIPCertManagerNextProvider` covers upstream's delegation of a DNS hello
+from the IP certificate manager to a separate autocert manager. DERPEX has no
+second provider to delegate to — one manager orders both IP and hostname
+certificates — so `:next_provider` is a seam with no production caller. The row
+is `implementation-specific` on that argument, citing the delegation test in
+`test/derpex/certificates/ip_manager_test.exs`; it is not a claim that DERPEX
+ships the two-provider arrangement upstream tests.
 
 The plaintext listener `DERPEX_HTTP_PORT` opens is restricted to what Go's
 `tsweb.Port80Handler` serves: the challenge path and the unauthenticated
@@ -477,7 +480,7 @@ the full official Rust client.
 
 ### 5.1 Upstream inventory
 
-The baseline contains 69 named relevant Go tests:
+The baseline contains 74 named relevant Go tests:
 
 | Area | Named tests |
 | --- | ---: |
@@ -486,6 +489,7 @@ The baseline contains 69 named relevant Go tests:
 | DERP HTTP | 11 |
 | `cmd/derper` | 14 |
 | DERP prober | 3 |
+| STUN | 5 |
 | XDP | 2 |
 
 `interop/COVERAGE.md` inventories every test by package, name, upstream line,
@@ -751,7 +755,7 @@ Deliverables:
 - Add source-build, no-Rust consumer, and tag-triggered precompiled-NIF workflow
   skeletons using the target matrix in Section 3.7.
 - Commit `interop/upstream.lock` and checkout/bootstrap tooling.
-- Generate the 69-test inventory and initial compatibility dispositions.
+- Generate the 74-test inventory and initial compatibility dispositions.
 - Add a Go oracle/helper module without modifying the upstream checkout, and
   inventory the hooks exported by `derp/derpserver/fortest.go`.
 - Implement `Derpex.Clock` with a real and a controllable test implementation.
@@ -1131,7 +1135,7 @@ Exit gate:
 - The release candidate installs and starts on every supported target without
   `go`, `cargo`, or `rustc`, using only the published checksum-verified NIF
   archive.
-- Every one of the 69 baseline tests is accounted for with no pending row.
+- Every one of the 74 baseline tests is accounted for with no pending row.
 - No known observable difference exists without a documented, user-approved
   compatibility exception.
 - Long-running tests show bounded mailboxes, queues, timers, and binary memory.
@@ -1223,7 +1227,7 @@ DERPEX is complete for the pinned baseline when:
 
 - all release-blocking Mix, Go interop, differential, Rust interop, and system
   gates pass;
-- all 69 relevant baseline Go tests have a reviewed disposition and none are
+- all 74 relevant baseline Go tests have a reviewed disposition and none are
   pending;
 - unchanged official Go clients can use native HTTP, TLS fast-start, and mesh
   paths;

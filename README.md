@@ -54,9 +54,9 @@ Go-server-versus-DERPEX differential trace, and the official `tailscale-rs`
 client. None of those toolchains or checkouts is copied into an OTP release or
 runtime image.
 
-The Go job also runs the six pinned upstream packages represented by
+The Go job also runs the seven pinned upstream packages represented by
 `interop/COVERAGE.md`. That step proves the normative oracle remains healthy;
-the reviewed 69-test mapping, official clients, and differential trace are the
+the reviewed 74-test mapping, official clients, and differential trace are the
 corresponding DERPEX behavior gates.
 
 The local official-client gates use sibling pinned checkouts:
