@@ -88,4 +88,30 @@ defmodule Derpex.Certificates.IPManagerTest do
 
     refute_receive {:unexpected_issue, _ip, _profile}
   end
+
+  test "caches issued certificates through the atomic private-file path" do
+    directory =
+      Path.join(System.tmp_dir!(), "derpex-ipcert-modes-#{System.unique_integer([:positive])}")
+
+    on_exit(fn -> File.rm_rf!(directory) end)
+
+    issuer = fn ip, _profile ->
+      with {:ok, {certificate_der, private_key}} <- Manual.generate_ip(ip) do
+        {:ok, %{certificate_der: certificate_der, private_key: private_key}}
+      end
+    end
+
+    manager = start_supervised!({IPManager, directory: directory, issuer: issuer})
+    assert {:ok, _certificate} = IPManager.certificate(manager, "203.0.113.7")
+
+    assert file_mode(directory) == 0o700
+    assert file_mode(Path.join(directory, "203.0.113.7.key")) == 0o600
+    assert file_mode(Path.join(directory, "203.0.113.7.crt")) == 0o644
+    assert Enum.filter(File.ls!(directory), &String.contains?(&1, ".tmp.")) == []
+  end
+
+  defp file_mode(path) do
+    {:ok, stat} = File.stat(path)
+    Bitwise.band(stat.mode, 0o777)
+  end
 end

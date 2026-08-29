@@ -139,6 +139,26 @@ defmodule Derpex.HTTPAdmissionTest do
              )
   end
 
+  test "rate-limits the admission-unavailable warning", context do
+    :gen_tcp.close(context.listener)
+    unavailable_options = options(context)
+
+    log =
+      capture_log(fn ->
+        Enum.each(1..100, fn _attempt ->
+          assert :ok = HTTPAdmission.admit(@node_key, {127, 0, 0, 1}, unavailable_options)
+        end)
+      end)
+
+    warnings =
+      log
+      |> String.split("admission controller is unavailable")
+      |> length()
+      |> Kernel.-(1)
+
+    assert warnings == 1
+  end
+
   test "validates absolute controller URLs" do
     assert {:ok, %URI{scheme: "https", host: "admit.example.com"}} =
              HTTPAdmission.parse_url("https://admit.example.com/check")

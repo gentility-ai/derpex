@@ -36,4 +36,27 @@ defmodule Derpex.Certificates.ManualTest do
     assert {:ok, listener} = :ssl.listen(0, tls_options)
     assert :ok = :ssl.close(listener)
   end
+
+  test "writes the generated key pair through the atomic private-file path" do
+    directory =
+      Path.join([
+        System.tmp_dir!(),
+        "derpex-manual-modes-#{System.unique_integer([:positive])}",
+        "nested"
+      ])
+
+    on_exit(fn -> File.rm_rf!(Path.dirname(directory)) end)
+
+    assert {:ok, manual} = Manual.load_or_create(directory, "127.0.0.1")
+
+    assert file_mode(manual.key_path) == 0o600
+    assert file_mode(manual.certificate_path) == 0o644
+    assert file_mode(directory) == 0o700
+    assert Enum.filter(File.ls!(directory), &String.contains?(&1, ".tmp.")) == []
+  end
+
+  defp file_mode(path) do
+    {:ok, stat} = File.stat(path)
+    Bitwise.band(stat.mode, 0o777)
+  end
 end

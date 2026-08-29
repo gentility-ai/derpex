@@ -3,20 +3,29 @@ defmodule Derpex.HTTPAdmission do
 
   @behaviour Derpex.ClientVerifier
 
+  import Bitwise, only: [<<<: 2]
+
   require Logger
 
   alias Derpex.Admission.Request
+  alias Derpex.Clock
   alias Derpex.HTTPClient
   alias Derpex.JSON
 
   @default_timeout_ms 5_000
   @default_max_response_bytes 4_096
+  @default_warning_interval_ms 30_000
+
+  # Never-warned sentinel: far enough in the past that the first unavailable
+  # response always logs, whatever interval is configured.
+  @never -(1 <<< 60)
 
   @type options :: [
           url: URI.t() | binary(),
           fail_open: boolean(),
           timeout_ms: pos_integer(),
           max_response_bytes: pos_integer(),
+          warning_interval_ms: non_neg_integer(),
           tls_options: keyword()
         ]
 
@@ -46,7 +55,7 @@ defmodule Derpex.HTTPAdmission do
       case HTTPClient.request(uri, request(uri, body), http_options) do
         {:ok, {200, _headers, response_body}} -> decode_decision(response_body)
         {:ok, {status, _headers, _response_body}} -> {:error, {:admission_status, status}}
-        {:error, reason} -> handle_request_error(reason, options)
+        {:error, reason} -> handle_request_error(reason, uri, options)
       end
     end
   end
@@ -125,17 +134,58 @@ defmodule Derpex.HTTPAdmission do
     end)
   end
 
-  defp handle_request_error(reason, options) do
+  defp handle_request_error(reason, uri, options) do
     cond do
       not unavailable?(reason) ->
         {:error, {:invalid_admission_response, response_error(reason)}}
 
       Keyword.get(options, :fail_open, true) ->
-        Logger.warning("DERP admission controller is unavailable; allowing client")
+        warn_unavailable(uri, options)
         :ok
 
       true ->
         {:error, {:admission_unavailable, reason}}
+    end
+  end
+
+  # A controller outage makes every admission fail, so the warning is throttled
+  # per controller endpoint. The throttle is a two-slot `:atomics` (last warning
+  # timestamp, suppressed count) held in `:persistent_term`, so the hot path
+  # stays lock-free and needs no process.
+  defp warn_unavailable(uri, options) do
+    interval = Keyword.get(options, :warning_interval_ms, @default_warning_interval_ms)
+    throttle = throttle(uri)
+    previous = :atomics.get(throttle, 1)
+    now = Clock.monotonic_time(:millisecond)
+
+    if now - previous >= interval and
+         :atomics.compare_exchange(throttle, 1, previous, now) == :ok do
+      Logger.warning(warning_message(:atomics.exchange(throttle, 2, 0)))
+    else
+      :atomics.add(throttle, 2, 1)
+    end
+
+    :ok
+  end
+
+  defp warning_message(0), do: "DERP admission controller is unavailable; allowing client"
+
+  defp warning_message(suppressed) do
+    warning_message(0) <> " (#{suppressed} identical warnings suppressed)"
+  end
+
+  defp throttle(uri) do
+    key = {__MODULE__, :unavailable_warning, URI.to_string(uri)}
+
+    case :persistent_term.get(key, nil) do
+      nil ->
+        throttle = :atomics.new(2, signed: true)
+        :atomics.put(throttle, 1, @never)
+        :persistent_term.put(key, throttle)
+        :persistent_term.get(key)
+
+      throttle ->
+        throttle
     end
   end
 

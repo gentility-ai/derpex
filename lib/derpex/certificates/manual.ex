@@ -1,6 +1,7 @@
 defmodule Derpex.Certificates.Manual do
   @moduledoc "Loads manual certificates and creates persistent self-signed IP certificates."
 
+  alias Derpex.AtomicFile
   alias Derpex.Clock
 
   @common_name_oid {2, 5, 4, 3}
@@ -9,6 +10,8 @@ defmodule Derpex.Certificates.Manual do
   @rsa_encryption_oid {1, 2, 840, 113_549, 1, 1, 1}
   @sha256_with_rsa_oid {1, 2, 840, 113_549, 1, 1, 11}
   @validity_seconds 365 * 24 * 60 * 60
+  @certificate_mode 0o644
+  @key_mode 0o600
 
   @type t :: %__MODULE__{
           hostname: binary(),
@@ -114,11 +117,8 @@ defmodule Derpex.Certificates.Manual do
          certificate_pem =
            :public_key.pem_encode([{:Certificate, certificate_der, :not_encrypted}]),
          key_pem = encode_private_key(private_key),
-         :ok <- File.mkdir_p(Path.dirname(certificate_path)),
-         :ok <- File.write(certificate_path, certificate_pem),
-         :ok <- File.chmod(certificate_path, 0o644),
-         :ok <- File.write(key_path, key_pem) do
-      File.chmod(key_path, 0o600)
+         :ok <- AtomicFile.write(certificate_path, certificate_pem, mode: @certificate_mode) do
+      AtomicFile.write(key_path, key_pem, mode: @key_mode)
     end
   rescue
     error -> {:error, {:certificate_generation, error}}
