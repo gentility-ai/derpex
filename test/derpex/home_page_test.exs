@@ -22,7 +22,12 @@ defmodule Derpex.HomePageTest do
   end
 
   test "serves the rendered page at the HTTP root" do
-    request = %Request{method: "GET", target: "/", version: "HTTP/1.1"}
+    request = %Request{
+      method: "GET",
+      target: "/",
+      version: "HTTP/1.1",
+      headers: [{"host", "derp.example"}]
+    }
 
     assert {:response, response} =
              HTTP1.route(request, :crypto.strong_rand_bytes(32),

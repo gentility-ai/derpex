@@ -12,6 +12,11 @@ defmodule Derpex.HTTP1 do
   alias Derpex.HTTP1.Request
   alias Derpex.HTTP1.Response
   alias Derpex.Operations
+  alias Derpex.WebSocket.Frame
+
+  @missing_host_status "400 Bad Request: missing required Host header"
+  @subprotocol_violation "client must speak the derp subprotocol"
+  @policy_violation_status 1008
 
   @doc "Routes a parsed request without consuming bytes read past its headers."
   @spec route(Request.t(), binary(), keyword()) ::
@@ -19,9 +24,30 @@ defmodule Derpex.HTTP1 do
           | {:stream, :debug_traffic, iodata(), keyword()}
           | {:response, iodata()}
   def route(%Request{} = request, server_public_key, options \\ []) do
-    request
-    |> Request.path()
-    |> route_path(request, server_public_key, options)
+    if host_required?(request) do
+      missing_host()
+    else
+      request
+      |> Request.path()
+      |> route_path(request, server_public_key, options)
+    end
+  end
+
+  # Go's net/http rejects an HTTP/1.1 request head that carries no Host header
+  # before any handler runs; an empty Host value is still a present header.
+  defp host_required?(%Request{version: "HTTP/1.1"} = request),
+    do: Request.header(request, "host") == nil
+
+  defp host_required?(%Request{}), do: false
+
+  defp missing_host do
+    {:response,
+     [
+       "HTTP/1.1 ",
+       @missing_host_status,
+       "\r\nContent-Type: text/plain; charset=utf-8\r\nConnection: close\r\n\r\n",
+       @missing_host_status
+     ]}
   end
 
   defp route_path(path, request, _server_public_key, _options)
@@ -292,11 +318,14 @@ defmodule Derpex.HTTP1 do
     {:upgrade, :derp, response, upgrade_metadata(request)}
   end
 
+  # Upstream picks the WebSocket path on a case-sensitive substring test, then
+  # lets coder/websocket negotiate one exact (case-insensitive) token out of the
+  # offer. Anything else stays on the legacy native-DERP path.
   defp websocket_or_legacy_upgrade(request, server_public_key) do
     case Request.header(request, "sec-websocket-protocol") do
       protocols when is_binary(protocols) ->
         if String.contains?(protocols, "derp") do
-          websocket_upgrade(request)
+          websocket_upgrade(request, negotiated_subprotocol(protocols))
         else
           native_upgrade(request, server_public_key)
         end
@@ -306,7 +335,14 @@ defmodule Derpex.HTTP1 do
     end
   end
 
-  defp websocket_upgrade(request) do
+  defp negotiated_subprotocol(protocols) do
+    protocols
+    |> String.split(",")
+    |> Enum.map(&String.trim/1)
+    |> Enum.find(&(String.downcase(&1, :ascii) == "derp"))
+  end
+
+  defp websocket_upgrade(request, subprotocol) do
     with true <- request.method == "GET",
          true <- connection_upgrade?(Request.header(request, "connection")),
          "13" <- Request.header(request, "sec-websocket-version"),
@@ -314,23 +350,37 @@ defmodule Derpex.HTTP1 do
          {:ok, decoded_key} <- Base.decode64(key),
          true <- byte_size(decoded_key) == 16 do
       accept = Base.encode64(:crypto.hash(:sha, key <> "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"))
+      handshake = websocket_handshake(accept, subprotocol)
 
-      response = [
-        "HTTP/1.1 101 Switching Protocols\r\n",
-        "Upgrade: websocket\r\n",
-        "Connection: Upgrade\r\n",
-        "Sec-WebSocket-Accept: ",
-        accept,
-        "\r\n",
-        "Sec-WebSocket-Protocol: derp\r\n\r\n"
-      ]
-
-      {:upgrade, :websocket, response, upgrade_metadata(request)}
+      # Upstream compares the negotiated subprotocol to "derp" byte for byte
+      # after the handshake, so a near miss gets a 101 and then a close.
+      if subprotocol == "derp" do
+        {:upgrade, :websocket, handshake, upgrade_metadata(request)}
+      else
+        {:response,
+         [handshake, Frame.encode_close(@policy_violation_status, @subprotocol_violation)]}
+      end
     else
       _invalid ->
         {:response, Response.encode(400, [], "Bad Request\n")}
     end
   end
+
+  defp websocket_handshake(accept, subprotocol) do
+    [
+      "HTTP/1.1 101 Switching Protocols\r\n",
+      "Upgrade: websocket\r\n",
+      "Connection: Upgrade\r\n",
+      "Sec-WebSocket-Accept: ",
+      accept,
+      "\r\n",
+      subprotocol_header(subprotocol),
+      "\r\n"
+    ]
+  end
+
+  defp subprotocol_header(nil), do: []
+  defp subprotocol_header(subprotocol), do: ["Sec-WebSocket-Protocol: ", subprotocol, "\r\n"]
 
   defp connection_upgrade?(nil), do: false
 

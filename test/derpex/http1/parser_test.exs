@@ -71,7 +71,10 @@ defmodule Derpex.HTTP1.ParserTest do
     assert {:ok, request, "", _parser} = Parser.push(parser, "\r\n\r\n")
     assert Request.header(request, "x-filler") == filler
 
-    assert div(microseconds, 1_000) < 200,
+    # Rescanning the whole buffer on every push is quadratic and took ~36_600 ms
+    # here; scanning only the new bytes costs ~125 ms. The ceiling sits an order
+    # of magnitude either side so a busy async suite cannot make it flap.
+    assert div(microseconds, 1_000) < 1_000,
            "one-byte-at-a-time push of #{header_bytes} header bytes took #{div(microseconds, 1_000)} ms"
   end
 

@@ -22,7 +22,8 @@ defmodule Derpex.BootstrapDNSTest do
     request = %Request{
       method: "GET",
       target: "/bootstrap-dns?q=hidden.example",
-      version: "HTTP/1.1"
+      version: "HTTP/1.1",
+      headers: [{"host", "derp.example"}]
     }
 
     assert {:response, response} =
