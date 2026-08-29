@@ -412,7 +412,10 @@ defmodule Derpex.Admission.GentilityTest do
 
   @tag timeout: 600_000
   test "claims and releases in constant time against a full lease cache" do
-    entries = 100_000
+    # The shape of the cost, not the size of the cache, is what this pins down,
+    # and ten thousand leases already fail an implementation that scans them.
+    # DERPEX_SLOW_TESTS=1 runs the full hundred thousand.
+    entries = if System.get_env("DERPEX_SLOW_TESTS") == "1", do: 100_000, else: 10_000
     samples = 500
     now = System.system_time(:millisecond)
 
@@ -448,9 +451,10 @@ defmodule Derpex.Admission.GentilityTest do
       |> Enum.map(fn {connection, index} ->
         node_key = <<index::256>>
         context = Map.fetch!(contexts, node_key)
+        request = request(node_key)
 
         {microseconds, result} =
-          :timer.tc(fn -> Gentility.claim(request(node_key), context, connection, policy) end)
+          :timer.tc(fn -> Gentility.claim(request, context, connection, policy) end)
 
         assert {:ok, _context} = result
         {microseconds, connection}
