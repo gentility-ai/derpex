@@ -148,6 +148,45 @@ defmodule Derpex.Admission.Gentility.EventsTest do
     assert Gentility.stats(controller).revocations > 0
   end
 
+  test "a reconciliation page larger than the controller accepts is capped at boot" do
+    parent = self()
+    wires = Enum.map(1..3, &signed_revocation(<<&1::256>>, 10))
+
+    {:ok, adapter} =
+      Agent.start_link(fn ->
+        %{reconcile: [{:ok, wires, nil}], stream: [{:timeout, "cursor"}]}
+      end)
+
+    controller =
+      start_supervised!(
+        {Gentility,
+         authority: fn _request -> {:error, :unavailable} end,
+         verification_keys: %{@key_id => @public_key},
+         clock: Manual,
+         max_revocations: 2,
+         close_peer: fn key -> send(parent, {:closed, key}) end}
+      )
+
+    log =
+      ExUnit.CaptureLog.capture_log(fn ->
+        events =
+          start_supervised!(
+            {Events,
+             controller: controller,
+             adapter: {Adapter, adapter},
+             clock: Manual,
+             max_reconciliation_records: 10,
+             backoff_ms: 50}
+          )
+
+        # The page the adapter offers is larger than the controller's bound, so
+        # it is refused here instead of being sent and rejected whole.
+        eventually(fn -> Events.stats(events).last_error == :invalid_reconciliation end)
+      end)
+
+    assert log =~ "exceeds the controller's revocation bound"
+  end
+
   test "invalid reconciliation fails closed and retries without applying any record" do
     parent = self()
     valid = signed_revocation(node_key(3), 10)

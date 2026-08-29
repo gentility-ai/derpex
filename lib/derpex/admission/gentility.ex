@@ -50,6 +50,7 @@ defmodule Derpex.Admission.Gentility do
   @default_renewal_retry_ms 60_000
   @renewal_fraction {4, 5}
   @expiry_jitter_percent 10
+  @renewal_chunk 1_000
   @default_log_interval_ms 60_000
   @denial_reasons [
     :no_cached_lease,
@@ -100,6 +101,7 @@ defmodule Derpex.Admission.Gentility do
   @overloaded_counter 1
   @unavailable_counter 2
   @usage_shed_counter 3
+  @pacing_capped_counter 4
 
   @type authority ::
           module() | {module(), term()} | (Request.t() -> {:ok, binary()} | {:error, term()})
@@ -185,7 +187,7 @@ defmodule Derpex.Admission.Gentility do
       # connection stays responsive; the untaken debt keeps pacing the next
       # reservation.
       if node_delay <= maximum_delay do
-        {:ok, min(max(node_delay, organization_delay), maximum_delay)}
+        {:ok, paced_delay(policy, max(node_delay, organization_delay), maximum_delay)}
       else
         {:error, :byte_budget_exhausted}
       end
@@ -225,6 +227,15 @@ defmodule Derpex.Admission.Gentility do
   catch
     :exit, _reason -> {:error, :admission_unavailable}
   end
+
+  # A capped wait means the debt outran the pacing window: the connection stays
+  # open and keeps being paced, and the counter is how that shows up in metrics.
+  defp paced_delay(policy, delay, maximum_delay) when delay > maximum_delay do
+    :atomics.add(policy.counters, @pacing_capped_counter, 1)
+    maximum_delay
+  end
+
+  defp paced_delay(_policy, delay, _maximum_delay), do: delay
 
   @doc "Applies an authenticated revocation and closes all affected local duplicates."
   @spec revoke(GenServer.server(), binary()) :: {:ok, :applied | :stale} | {:error, term()}
@@ -297,6 +308,7 @@ defmodule Derpex.Admission.Gentility do
       nearest_lease_expiry_seconds: nearest_lease_expiry_seconds(state),
       usage_shed_total: :atomics.get(state.policy.counters, @usage_shed_counter),
       close_peer_failures: :atomics.get(state.close_failures, 1),
+      byte_pacing_capped_total: :atomics.get(state.policy.counters, @pacing_capped_counter),
       cache_load_error: state.load_error != nil,
       cache_persist_error: state.persist_error != nil,
       load_error: state.load_error,
@@ -463,7 +475,7 @@ defmodule Derpex.Admission.Gentility do
     authority = Keyword.fetch!(options, :authority)
     server = Keyword.get(options, :server) || self()
     gate = :atomics.new(1, signed: false)
-    counters = :atomics.new(3, signed: false)
+    counters = :atomics.new(4, signed: false)
 
     max_concurrent_requests =
       positive_option!(options, :max_concurrent_requests, @default_max_concurrent_requests)
@@ -1528,7 +1540,14 @@ defmodule Derpex.Admission.Gentility do
   # cached lease costs nothing to re-authorize on the node's next connection,
   # and renewing the whole cache would put the fleet's reconnection load on
   # Gentility continuously.
-  defp renew_due(state) do
+  defp renew_due(state), do: renew_due(state, @renewal_chunk)
+
+  # A cache loaded from disk can have every lease past its renewal time at once.
+  # The sweep takes a bounded number per message and leaves the rest due, which
+  # `reschedule_renewal/1` turns into an immediate continuation.
+  defp renew_due(state, 0), do: state
+
+  defp renew_due(state, remaining) do
     now = now_ms(state)
 
     if :gb_trees.is_empty(state.by_renewal) do
@@ -1538,7 +1557,7 @@ defmodule Derpex.Admission.Gentility do
 
       if renew_at_ms <= now do
         state = %{state | by_renewal: :gb_trees.delete_any(key, state.by_renewal)}
-        renew_due(start_renewal(state, node_key, key))
+        renew_due(start_renewal(state, node_key, key), remaining - 1)
       else
         state
       end

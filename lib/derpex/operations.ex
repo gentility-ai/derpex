@@ -320,6 +320,7 @@ defmodule Derpex.Operations do
       max_revocations: "derpex_gentility_max_revocations",
       cache_full: "derpex_gentility_cache_full",
       close_peer_failures: "derpex_gentility_close_peer_failed_total",
+      byte_pacing_capped_total: "derpex_gentility_byte_pacing_capped_total",
       renewals_in_flight: "derpex_gentility_renewals_in_flight",
       nearest_lease_expiry_seconds: "derpex_gentility_nearest_lease_expiry_seconds",
       cache_load_error: "derpex_gentility_cache_load_error",

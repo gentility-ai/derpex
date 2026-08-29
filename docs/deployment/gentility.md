@@ -224,6 +224,13 @@ set — no node, organization, or source identity ever reaches a label:
 - `derpex_gentility_cache_load_error` / `derpex_gentility_cache_persist_error` —
   1 while the durable cache could not be read at boot or last failed to write.
 - `derpex_gentility_renewals_in_flight`, `derpex_gentility_cache_full`.
+- `derpex_gentility_byte_pacing_capped_total` — reservations whose pacing wait
+  hit `DERPEX_GENTILITY_MAX_BYTE_DELAY_MS`. A rising count with no closes is an
+  organization sitting over its byte allocation while its members stay
+  connected.
+- `derpex_gentility_close_peer_failed_total` — closes the router could not
+  complete. A close that fails is isolated and counted rather than costing the
+  batch; a persistent count means peers may outlive their revocation.
 
 Warnings are rate limited per kind (one per minute per controller) so a
 persistent condition cannot flood the log: authority unavailable and serving

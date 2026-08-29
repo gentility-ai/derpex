@@ -58,6 +58,12 @@ defmodule Derpex.Admission.Gentility.ControlPlane do
   reconciliation that never ends is abandoned and retried rather than run
   forever.
 
+  The two cursors are distinct. A reconciliation cursor is `nil` at the start of
+  a pass and `nil` again to end one. A stream cursor is always a binary: it
+  begins as `""` — meaning "from wherever you would start a fresh consumer" —
+  and is thereafter whatever `c:next_revocation/3` last returned, including
+  across a timeout. `nil` is never a stream position.
+
   Gentility prunes revocations older than the maximum lease lifetime
   (`DERPEX_GENTILITY_MAX_LEASE_MS`): every lease such a record could still deny
   has expired by then, so a reconciliation only has to replay that window.

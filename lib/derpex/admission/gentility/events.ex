@@ -3,6 +3,8 @@ defmodule Derpex.Admission.Gentility.Events do
 
   use GenServer
 
+  require Logger
+
   alias Derpex.Admission.Gentility
   alias Derpex.Clock
 
@@ -58,10 +60,13 @@ defmodule Derpex.Admission.Gentility.Events do
       initial_backoff_ms: positive_option!(options, :backoff_ms, @default_backoff_ms),
       max_backoff_ms: positive_option!(options, :max_backoff_ms, @default_max_backoff_ms),
       max_reconciliation_records:
-        positive_option!(
-          options,
-          :max_reconciliation_records,
-          @default_max_reconciliation_records
+        reconciliation_record_bound(
+          positive_option!(
+            options,
+            :max_reconciliation_records,
+            @default_max_reconciliation_records
+          ),
+          Keyword.get(options, :controller, Gentility)
         ),
       max_reconciliation_bytes:
         positive_option!(
@@ -171,6 +176,32 @@ defmodule Derpex.Admission.Gentility.Events do
 
     cancel_retry(state)
     :ok
+  end
+
+  # A page larger than the controller's revocation bound would be rejected whole
+  # on arrival, so the page size is capped by what the controller will accept.
+  defp reconciliation_record_bound(configured, controller) do
+    case controller_revocation_bound(controller) do
+      nil ->
+        configured
+
+      bound when bound < configured ->
+        Logger.warning(
+          "gentility reconciliation page size #{configured} exceeds the controller's " <>
+            "revocation bound #{bound}; using #{bound}"
+        )
+
+        bound
+
+      _within_bound ->
+        configured
+    end
+  end
+
+  defp controller_revocation_bound(controller) do
+    Gentility.stats(controller).max_revocations
+  catch
+    :exit, _unavailable -> nil
   end
 
   defp start_worker(%{worker: nil, retry_timer: nil} = state) do

@@ -61,15 +61,45 @@ defmodule Derpex.Listener.HandlerUsageShedTest do
     end
   end
 
+  defmodule UsageUnavailablePolicy do
+    @moduledoc false
+
+    @behaviour Derpex.Admission
+
+    @impl true
+    def authorize(_request, _parent), do: {:ok, %{organization_id: "org_01"}}
+
+    @impl true
+    def claim(_request, context, _connection, _parent), do: {:ok, context}
+
+    @impl true
+    def release(_connection, _parent), do: :ok
+
+    @impl true
+    def reserve_bytes(_context, _bytes, _parent), do: {:ok, 0}
+
+    @impl true
+    def record_usage(_context, _bytes, _outcome, parent) do
+      send(parent, {:shed, :record_usage, self()})
+      receive do: (:release -> {:error, :usage_unavailable})
+    end
+  end
+
   test "a full usage spool closes the connection without a crash report" do
     assert_clean_shed(SpoolFullPolicy, :reserve_bytes)
+  end
+
+  test "any other usage failure is logged and still closes cleanly" do
+    log = assert_clean_shed(UsageUnavailablePolicy, :record_usage, expect_quiet: false)
+    assert log =~ "usage-accounting failure"
+    assert log =~ "usage_unavailable"
   end
 
   test "a usage record that cannot be spooled closes the connection cleanly" do
     assert_clean_shed(RecordUsageFullPolicy, :record_usage)
   end
 
-  defp assert_clean_shed(policy, expected_shed) do
+  defp assert_clean_shed(policy, expected_shed, options \\ []) do
     {server_public, server_private} = Crypto.generate_keypair()
     {_client_public, client_private} = Crypto.generate_keypair()
 
@@ -106,8 +136,9 @@ defmodule Derpex.Listener.HandlerUsageShedTest do
       end)
 
     refute log =~ "terminating"
-    refute log =~ "usage_spool_full"
     refute log =~ "(exit)"
+    if Keyword.get(options, :expect_quiet, true), do: refute(log =~ "usage_spool_full")
+    log
   end
 
   defp connect_and_send_info(port, server_public, client_private) do

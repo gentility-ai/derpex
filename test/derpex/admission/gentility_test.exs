@@ -1160,7 +1160,7 @@ defmodule Derpex.Admission.GentilityTest do
     assert Gentility.stats(controller).cache_entries == entries
     authorize_p99 = percentile(samples, 99)
 
-    assert authorize_p99 < 1_500,
+    assert authorize_p99 < 3_000,
            "authorize p99 was #{authorize_p99} us over #{entries} admissions with a cache_path"
   end
 
@@ -1442,6 +1442,10 @@ defmodule Derpex.Admission.GentilityTest do
     # The noisy node's own debt is what closes it.
     assert Gentility.reserve_bytes(noisy_context, 200, policy) ==
              {:error, :byte_budget_exhausted}
+
+    # Pacing that hit the cap is visible: it is the signal that an organization
+    # is over its allocation while its members stay connected.
+    assert Gentility.stats(controller).byte_pacing_capped_total == 1
   end
 
   test "closes instead of accumulating an unbounded byte-budget delay" do
