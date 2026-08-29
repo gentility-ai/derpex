@@ -29,7 +29,12 @@ slots and prevents further publication.
 The single writer drains until `:empty`; observing empty clears the wake flag
 while holding the lock. Enqueue signals before publication while holding that
 same lock, so the consumer cannot observe the wake before the operation is
-committed or recovered.
+committed or recovered. A writer that finds a ring locked ends the drain and
+schedules one short retry: it never re-sends itself a wakeup, because the
+producer holding the lock may have coalesced its signal into the wakeup being
+handled, and a self-wakeup would then spin until that producer commits. The
+writer also drains once when its rings are attached, since a wakeup raised
+before attachment has no rings to drain and is not repeated.
 
 ## Consequences
 
