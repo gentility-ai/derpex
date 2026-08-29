@@ -80,6 +80,17 @@ lease lifetime, taken out of the lease's own life, never added to it. DERPEX
 therefore never serves an expired lease, and a region's leases do not all fall
 due in the same millisecond and stampede Gentility on reconnection.
 
+### Regional leases
+
+A lease names the region it was issued for, and DERPEX refuses one that names a
+different region than `DERPEX_GENTILITY_REGION_ID` — on live admission, on
+cache recovery, on renewal, and on key rotation alike. Budgets are regional
+allocations, so honouring a lease from another region would spend that region's
+allowance here. Denials are counted as
+`derpex_gentility_authorize_total{outcome="denied",reason="wrong_region"}`; a
+non-zero rate means a DERP map, a lease issuer, or an instance's region setting
+disagree about where this relay is.
+
 ### Byte budgets
 
 Node and organization budgets are both token buckets, but they are enforced

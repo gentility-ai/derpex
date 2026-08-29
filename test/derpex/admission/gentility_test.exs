@@ -438,6 +438,87 @@ defmodule Derpex.Admission.GentilityTest do
     assert Gentility.stats(controller).cache_entries == 0
   end
 
+  test "denies a lease issued for another region" do
+    node_key = node_key(52)
+    {:ok, authority} = Agent.start_link(fn -> {:ok, signed_lease(node_key, region_id: 17)} end)
+
+    controller =
+      start_controller(
+        authority: fn _request -> Agent.get(authority, & &1) end,
+        region_id: 17
+      )
+
+    policy = Gentility.policy(controller)
+    assert {:ok, %{gentility: %{region_id: 17}}} = Gentility.authorize(request(node_key), policy)
+
+    Agent.update(authority, fn _response ->
+      {:ok, signed_lease(node_key(53), region_id: 18)}
+    end)
+
+    assert Gentility.authorize(request(node_key(53)), policy) == {:error, :wrong_region}
+    assert Gentility.stats(controller).cache_entries == 1
+
+    counts = Gentility.stats(controller).authorize_counts
+    assert counts[{:denied, :wrong_region}] == 1
+  end
+
+  @tag :tmp_dir
+  test "a cached lease for another region is not recovered", %{tmp_dir: tmp_dir} do
+    path = Path.join(tmp_dir, "admission.cache")
+    node_key = node_key(54)
+
+    :ok = Cache.store(path, [signed_lease(node_key, region_id: 18)], [])
+
+    controller =
+      start_controller(
+        authority: fn _request -> {:error, :unavailable} end,
+        cache_path: path,
+        region_id: 17
+      )
+
+    assert Gentility.stats(controller).cache_entries == 0
+
+    assert Gentility.authorize(request(node_key), Gentility.policy(controller)) ==
+             {:error, :no_cached_lease}
+  end
+
+  test "a mass close runs outside the controller call" do
+    parent = self()
+    keys = [node_key(55), node_key(56)]
+
+    controller =
+      start_controller(
+        authority: fn request -> {:ok, signed_lease(request.node_key)} end,
+        close_peer: fn key ->
+          send(parent, {:closing, key, self()})
+          receive do: (:release -> 0)
+        end
+      )
+
+    policy = Gentility.policy(controller)
+
+    Enum.each(keys, fn key ->
+      assert {:ok, _context} = Gentility.authorize(request(key), policy)
+    end)
+
+    records = Enum.map(keys, &signed_revocation(&1, 10))
+
+    # The call returns while the closes are still running, and the controller
+    # keeps answering behind them.
+    assert Gentility.reconcile(controller, records) == {:ok, %{applied: 2, stale: 0}}
+    assert Gentility.stats(controller).cache_entries == 0
+
+    assert_receive {:closing, first_key, first_closer}, 2_000
+    assert_receive {:closing, second_key, second_closer}, 2_000
+    assert MapSet.new([first_key, second_key]) == MapSet.new(keys)
+    refute first_closer == controller
+    refute second_closer == controller
+
+    send(first_closer, :release)
+    send(second_closer, :release)
+    assert Gentility.stats(controller).close_peer_counts == %{revocation: 2}
+  end
+
   test "active revocation is idempotent, rejects stale leases, and allows a newer revision" do
     parent = self()
     node_key = node_key(3)
@@ -1448,7 +1529,7 @@ defmodule Derpex.Admission.GentilityTest do
       organization_id: "org_01",
       owner_kind: "deployment",
       deployment_id: "dep_01",
-      region_id: 17,
+      region_id: Keyword.get(options, :region_id, 17),
       policy_revision: Keyword.get(options, :policy_revision, 9),
       quota_revision: Keyword.get(options, :quota_revision, 3),
       issued_at_ms: Keyword.get(options, :issued_at_ms, 1_000),

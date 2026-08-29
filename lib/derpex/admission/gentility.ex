@@ -28,6 +28,7 @@ defmodule Derpex.Admission.Gentility do
   alias Derpex.Admission.Gentility.ByteBudget
   alias Derpex.Admission.Gentility.Cache
   alias Derpex.Admission.Gentility.CacheWriter
+  alias Derpex.Admission.Gentility.Closer
   alias Derpex.Admission.Gentility.Contract
   alias Derpex.Admission.Gentility.Lease
   alias Derpex.Admission.Gentility.Revocation
@@ -440,6 +441,7 @@ defmodule Derpex.Admission.Gentility do
     cond do
       state.usage && state.usage.server == pid -> {:stop, reason, state}
       state.cache_writer == pid -> {:stop, reason, state}
+      state.closer == pid -> {:stop, reason, state}
       true -> unexpected_exit(state, pid, reason)
     end
   end
@@ -452,6 +454,7 @@ defmodule Derpex.Admission.Gentility do
     _flushed = flush_cache(state, :sync)
     UsageWorker.stop(state.usage)
     CacheWriter.stop(state.cache_writer)
+    Closer.stop(state.closer)
     :ok
   end
 
@@ -485,12 +488,16 @@ defmodule Derpex.Admission.Gentility do
     expiry_jitter = Keyword.get(options, :expiry_jitter, &default_expiry_jitter/1)
 
     verification_keys = Keyword.fetch!(options, :verification_keys)
+    region_id = region_option!(options)
     clock = Keyword.get(options, :clock, Clock)
 
     cache_path = Keyword.get(options, :cache_path)
 
+    close_peer = Keyword.get(options, :close_peer, &Router.close_peer/1)
+
     with :ok <- validate_verification_keys(verification_keys),
          {:ok, cache_writer} <- initial_cache_writer(cache_path),
+         {:ok, closer} <- Closer.start_link(close_peer: close_peer),
          {:ok, usage} <- initial_usage(Keyword.get(options, :usage), clock) do
       budgets = Budgets.new()
 
@@ -516,8 +523,10 @@ defmodule Derpex.Admission.Gentility do
          max_revocations: max_revocations,
          max_lease_ms: max_lease_ms,
          max_future_skew_ms: max_future_skew_ms,
+         region_id: region_id,
          clock: clock,
-         close_peer: Keyword.get(options, :close_peer, &Router.close_peer/1),
+         close_peer: close_peer,
+         closer: closer,
          close_connection:
            Keyword.get(options, :close_connection, fn connection, reason ->
              send(connection, {:derpex_admission_close, reason})
@@ -955,8 +964,7 @@ defmodule Derpex.Admission.Gentility do
     {state, applied, stale, close_keys} =
       Enum.reduce(revocations, {state, 0, 0, MapSet.new()}, &reconcile_revocation/2)
 
-    Enum.each(close_keys, &close_peer(state, &1, :revocation))
-    state = count_close_peer(state, :revocation, MapSet.size(close_keys))
+    state = close_peers(state, MapSet.to_list(close_keys), :revocation)
 
     state =
       if applied > 0,
@@ -1054,11 +1062,22 @@ defmodule Derpex.Admission.Gentility do
   defp verify_revocations(_wires, _keys, _maximum), do: {:error, :reconciliation_too_large}
 
   defp verify_lease(state, wire) do
-    Contract.verify_lease(wire, state.verification_keys, now_ms(state),
-      max_lease_ms: state.max_lease_ms,
-      max_future_skew_ms: state.max_future_skew_ms
-    )
+    with {:ok, lease} <-
+           Contract.verify_lease(wire, state.verification_keys, now_ms(state),
+             max_lease_ms: state.max_lease_ms,
+             max_future_skew_ms: state.max_future_skew_ms
+           ),
+         :ok <- verify_region(state, lease) do
+      {:ok, lease}
+    end
   end
+
+  # A lease names the region it was issued for. Serving it anywhere else would
+  # let one region's allocation be spent in another, so it is refused wherever
+  # a lease is verified: live admission, cache load, renewal, and rotation.
+  defp verify_region(%{region_id: nil}, _lease), do: :ok
+  defp verify_region(%{region_id: region_id}, %Lease{region_id: region_id}), do: :ok
+  defp verify_region(_state, _lease), do: {:error, :wrong_region}
 
   defp context(lease, source) do
     %{
@@ -1365,8 +1384,24 @@ defmodule Derpex.Admission.Gentility do
 
   defp reverify_chunk(state) do
     {chunk, rest} = Enum.split(state.reverify.leases, @reverify_chunk)
-    state = Enum.reduce(chunk, state, &reverify_lease/2)
+    {state, closed} = Enum.reduce(chunk, {state, []}, &reverify_lease/2)
+
+    state =
+      state
+      |> close_peers(closed, :key_rotation)
+      |> log_rotation(closed)
+
     continue_reverify(put_in(state.reverify.leases, rest))
+  end
+
+  defp log_rotation(state, []), do: state
+
+  defp log_rotation(state, _closed) do
+    log_event(
+      state,
+      :key_rotation,
+      "gentility verification-key rotation is dropping leases signed by a retired key"
+    )
   end
 
   defp continue_reverify(state) do
@@ -1374,26 +1409,15 @@ defmodule Derpex.Admission.Gentility do
     state
   end
 
-  defp reverify_lease(node_key, state) do
+  defp reverify_lease(node_key, {state, closed}) do
     case state.leases[node_key] do
       nil ->
-        state
+        {state, closed}
 
       entry ->
         case verify_lease(state, entry.wire) do
-          {:ok, _lease} ->
-            state
-
-          {:error, _retired_or_expired} ->
-            state = drop_lease_entry(state, node_key)
-            close_peer(state, node_key, :key_rotation)
-
-            state
-            |> count_close_peer(:key_rotation)
-            |> log_event(
-              :key_rotation,
-              "gentility verification-key rotation is dropping leases signed by a retired key"
-            )
+          {:ok, _lease} -> {state, closed}
+          {:error, _retired} -> {drop_lease_entry(state, node_key), [node_key | closed]}
         end
     end
   end
@@ -1414,17 +1438,17 @@ defmodule Derpex.Admission.Gentility do
   # Expiry order is maintained incrementally, so purging walks only the leases
   # that have actually expired rather than the whole cache.
   defp purge_expired(state) do
-    case purge_expired_leases(state, now_ms(state), false) do
-      {state, false} -> state
-      {state, true} -> mark_cache_dirty(state)
+    case purge_expired_leases(state, now_ms(state), []) do
+      {state, []} -> state
+      {state, keys} -> state |> close_peers(keys, :expiry) |> mark_cache_dirty()
     end
   end
 
   # The popped key leaves both indexes before anything else happens, so the walk
   # terminates even if an index key ever outlived the entry that created it.
-  defp purge_expired_leases(state, now, purged?) do
+  defp purge_expired_leases(state, now, closed) do
     if :gb_trees.is_empty(state.by_expiry) do
-      {state, purged?}
+      {state, closed}
     else
       {{expires_at_ms, node_key} = key, _present} = :gb_trees.smallest(state.by_expiry)
 
@@ -1435,27 +1459,26 @@ defmodule Derpex.Admission.Gentility do
             unclaimed: :gb_trees.delete_any(key, state.unclaimed)
         }
 
-        purge_expired_leases(expire_lease(state, node_key, key), now, true)
+        {state, closed} = expire_lease(state, node_key, key, closed)
+        purge_expired_leases(state, now, closed)
       else
-        {state, purged?}
+        {state, closed}
       end
     end
   end
 
   # An index key that no longer names the cached entry is stale, not an expiry:
   # the lease standing behind that node key expires later and must survive.
-  defp expire_lease(state, node_key, key) do
+  defp expire_lease(state, node_key, key, closed) do
     case state.leases[node_key] do
       nil ->
-        state
+        {state, closed}
 
       entry ->
         if expiry_key(node_key, entry) == key do
-          state = drop_lease_entry(state, node_key)
-          close_peer(state, node_key, :expiry)
-          count_close_peer(state, :expiry)
+          {drop_lease_entry(state, node_key), [node_key | closed]}
         else
-          state
+          {state, closed}
         end
     end
   end
@@ -1786,6 +1809,21 @@ defmodule Derpex.Admission.Gentility do
     :ok
   end
 
+  # One close is a single router call and stays inline. A batch is handed to the
+  # closer so that a reconciliation or an expiry sweep cannot stall admission
+  # behind thousands of router calls.
+  defp close_peers(state, [], _cause), do: state
+
+  defp close_peers(state, [key], cause) do
+    close_peer(state, key, cause)
+    count_close_peer(state, cause)
+  end
+
+  defp close_peers(state, keys, cause) do
+    :ok = Closer.close(state.closer, keys)
+    count_close_peer(state, cause, length(keys))
+  end
+
   defp count_close_peer(state, cause, count \\ 1) do
     counts = Map.update(state.close_peer_counts, cause, count, &(&1 + count))
     %{state | close_peer_counts: counts}
@@ -1883,6 +1921,14 @@ defmodule Derpex.Admission.Gentility do
   end
 
   defp validate_verification_keys(_keys), do: {:error, :invalid_verification_keys}
+
+  defp region_option!(options) do
+    case Keyword.get(options, :region_id) do
+      nil -> nil
+      value when is_integer(value) and value in 0..0xFFFF_FFFF -> value
+      _invalid -> raise ArgumentError, "region_id must be an unsigned 32-bit integer"
+    end
+  end
 
   defp positive_option!(options, key, default) do
     case Keyword.get(options, key, default) do
