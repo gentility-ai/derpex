@@ -15,7 +15,8 @@ defmodule Derpex.System.SignalsTest do
   @moduletag :system
   @moduletag timeout: 180_000
 
-  @boot_script "test/system/support/relay_boot.exs"
+  # Lives under test/support so `mix test` never mistakes it for a test file.
+  @boot_script "test/support/system/relay_boot.exs"
   @ready_pattern ~r/DERPEX-SYSTEM-READY pid=(\d+) port=(\d+)/
   @initial_config ~s({"PerClientRateLimitBytesPerSec":1250000,"PerClientRateBurstBytes":2500000})
   @reloaded_config ~s({"PerClientRateLimitBytesPerSec":2500000,"PerClientRateBurstBytes":5000000})

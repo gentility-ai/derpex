@@ -11,9 +11,15 @@ defmodule Derpex.System.SendFreezeTest do
 
   * `drain` waits up to one second for at least one new packet, then discards
     whatever else arrived, exactly like the Go helper of the same name.
-  * `is_empty` asserts alice never received a packet. Upstream counts only
-    `derp.ReceivedPacket` in that check; so does this test, because once the
-    server drops bob a `peer_gone` frame legitimately reaches alice.
+  * `assert_no_packets` is upstream's `isEmpty`: alice is a pure sender and
+    must never receive a packet.
+  * Upstream's `recv` treats any frame that is not a `ReceivedPacket` as fatal,
+    so every client here also asserts it saw no `peer_gone` and no other frame.
+    Nothing should produce one: a disconnect only reaches peers watching the
+    departed key, and a client starts watching a key when a packet from it is
+    written to that client, so a pure sender like alice watches nobody. The
+    unknown-destination `peer_gone` that alice's post-close sends could earn is
+    gated on disco packets, and neither payload here is one.
 
   Two assertions go beyond upstream, because a real socket makes them
   observable where `memnet` did not: the frozen client is closed by the write
@@ -38,7 +44,12 @@ defmodule Derpex.System.SendFreezeTest do
   @flood_ms 2_000
   # Upstream's drain helper gives a recipient one second to produce a packet.
   @drain_window_ms 1_000
-  @bob_payload :binary.copy("x", 4 * 1_024)
+  # Upstream's payload is a 17-byte string across a 1024-byte `memnet` pipe. A
+  # real socket needs volume before a write blocks, and a loaded machine can
+  # drag the sender down to a few dozen ticks, so each packet to the frozen
+  # client is large enough that even a starved sender fills any socket buffer
+  # the kernel hands out. `alice -> cathy` keeps the upstream payload.
+  @bob_payload :binary.copy("x", 32 * 1_024)
   @cathy_payload "hello alice->cathy\n"
 
   test "a frozen recipient cannot freeze an independent flow" do
@@ -77,22 +88,40 @@ defmodule Derpex.System.SendFreezeTest do
     assert_progress_while_flooding(cathy_reader, flood_deadline)
 
     {sent_to_bob, sent_to_cathy} = await_flood(flood)
-    assert sent_to_bob > 0
-    assert sent_to_cathy > 0
+
+    # `@tick_ms` is a floor on the sender's period, not a rate guarantee:
+    # `Process.sleep/1` rounds up and a loaded machine has been seen at 25 ms
+    # per tick. So this is not a throughput assertion, only the sanity floor
+    # that keeps the delivery ratio below from being judged against a handful
+    # of packets — two percent of the nominal tick count.
+    minimum_ticks = div(@flood_ms, 50 * @tick_ms)
+    assert sent_to_bob >= minimum_ticks
+    assert sent_to_cathy >= minimum_ticks
 
     delivered = settle(cathy_reader)
 
     assert delivered >= div(sent_to_cathy * 9, 10),
            "alice->cathy delivered #{delivered} of #{sent_to_cathy} packets"
 
+    # Everything bob saw, he saw before the freeze; snapshot him here so the
+    # thaw below cannot smuggle a late frame past the check.
+    assert_only_packets(bob_reader, "bob")
+    assert_only_packets(cathy_reader, "cathy")
+
     # The frozen client is the one the server gives up on, and it gives up
     # because a write timed out rather than because the peer went away.
     :ok = DerpClient.thaw(bob_reader)
     assert eventually(fn -> DerpClient.closed?(bob_reader) end, 5_000), "bob was not closed"
-    assert write_errors() > write_errors_before
+
+    # `send_timeout_close` closes the socket before the failing `send/2`
+    # returns, so the client can see the FIN a moment before the writer counts
+    # the error. Poll rather than read once.
+    assert eventually(fn -> write_errors() > write_errors_before end, 5_000),
+           "the frozen client was closed without a recorded write error"
 
     # isEmpty(alice): alice is a pure sender and must never receive a packet.
     assert_no_packets(alice_reader, "alice")
+    assert_only_packets(alice_reader, "alice")
     assert DerpClient.zero_source_packets(cathy_reader) == 0
 
     # Close bob before alice, as upstream does, to keep a peer-gone frame from
@@ -106,22 +135,22 @@ defmodule Derpex.System.SendFreezeTest do
     {server_public_key, server_private_key} = Crypto.generate_keypair()
 
     server =
-      start_supervised!(
-        {ThousandIsland,
-         port: 0,
-         num_acceptors: 3,
-         transport_options: [
-           ip: {127, 0, 0, 1},
-           send_timeout: @write_timeout_ms,
-           send_timeout_close: true,
-           sndbuf: 1_024
-         ],
-         handler_module: Handler,
-         handler_options: [
-           server_private_key: Secret.wrap(server_private_key),
-           server_public_key: server_public_key
-         ]}
-      )
+      start_supervised!({ThousandIsland,
+       port: 0,
+       num_acceptors: 3,
+       transport_options: [
+         ip: {127, 0, 0, 1},
+         send_timeout: @write_timeout_ms,
+         send_timeout_close: true,
+         # A floor, not a cap: Linux doubles SO_SNDBUF and enforces its own
+         # minimum, so the frozen socket may take a little longer to back up.
+         sndbuf: 1_024
+       ],
+       handler_module: Handler,
+       handler_options: [
+         server_private_key: Secret.wrap(server_private_key),
+         server_public_key: server_public_key
+       ]})
 
     {:ok, {_address, port}} = ThousandIsland.listener_info(server)
     port
@@ -187,6 +216,16 @@ defmodule Derpex.System.SendFreezeTest do
   # Upstream's isEmpty, which inspects only the ReceivedPacket channel.
   defp assert_no_packets(reader, name) do
     assert DerpClient.packets(reader) == 0, "packet received by #{name}, want none"
+  end
+
+  # Upstream's `recv` fails the test on any message that is not a
+  # ReceivedPacket; no frame in this scenario should be anything else.
+  defp assert_only_packets(reader, name) do
+    assert DerpClient.peer_gone_frames(reader) == 0,
+           "peer_gone frame received by #{name}, want none"
+
+    assert DerpClient.other_frames(reader) == 0,
+           "unexpected frame type received by #{name}, want none"
   end
 
   # Delivery is asynchronous, so let the tail of the stream land before the

@@ -1,6 +1,6 @@
 # Boots a real DERPEX relay inside its own OS process for the system suite.
 #
-# `mix run --no-start --no-halt test/system/support/relay_boot.exs` gives the
+# `mix run --no-start --no-halt test/support/system/relay_boot.exs` gives the
 # suite a relay it can signal for real: the VM owns an OS process id, OTP's
 # signal server is live, and `Derpex.Application` supervises the same tree a
 # release would. Everything the test needs to talk to the relay is announced on
