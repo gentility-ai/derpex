@@ -33,6 +33,13 @@ policy revision, revocation Unix time in milliseconds, and a bounded reason.
 Revocation revision `R` invalidates leases for that node whose policy revision
 is at most `R`.
 
+Gentility prunes revocations older than the configured maximum lease lifetime:
+every lease such a record could still deny has expired by then, so
+reconciliation only ever has to replay that window. Reconciliation is paged —
+each call returns a bounded batch and the position after it, and a `nil`
+position ends the pass — so replaying that window never depends on one
+unbounded response.
+
 Authorization has exactly two authoritative answers, and both are signed
 records: a lease admits the requested node key, and a revocation for that node
 key denies it, dropping any cached lease and closing its established

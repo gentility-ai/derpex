@@ -142,6 +142,21 @@ rejected with `cache_full` and the counter behind
 means the cache bound is below the instance's working set: raise
 `DERPEX_GENTILITY_MAX_CACHE_ENTRIES` or reduce the nodes homed on the instance.
 
+## Revocation delivery
+
+Revocations reach every relay two ways: a live stream, and a reconciliation
+pass that replays what a disconnected relay missed. A pass is paged — DERPEX
+asks for a page, applies it, and asks again with the position it was given
+until the control plane answers with no position — so a backlog of tens of
+thousands of records never depends on one oversized response. A pass is bounded
+by page count as well as by records and bytes per page, so a control plane that
+never finishes a pass is abandoned and retried instead of looping.
+
+Gentility prunes revocations older than `DERPEX_GENTILITY_MAX_LEASE_MS`. Every
+lease such a record could still deny has expired by then, which is what keeps
+reconciliation bounded: the window that must be replayed is exactly one maximum
+lease lifetime.
+
 ## Admission metrics
 
 Every admission decision the controller answers is counted under a fixed label
