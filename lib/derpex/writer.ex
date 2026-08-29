@@ -20,7 +20,6 @@ defmodule Derpex.Writer do
   @wake_message :derpex_outbox_ready
   @retry_message :derpex_outbox_retry
   @retry_interval_ms 5
-  @websocket_chunk_size 16 * 1_024
   @packet_classes [:ordinary, :disco, :pong]
 
   @type rings :: %{
@@ -299,19 +298,10 @@ defmodule Derpex.Writer do
   defp send_data(%{wire_mode: :native} = state, data),
     do: state.transport.send(state.socket, data)
 
+  # One WebSocket message per DERP frame, as iodata. Splitting a frame into
+  # 16 KB messages restarted the socket's write deadline on every chunk, so a
+  # stalled client could hold the writer far longer than its write timeout, and
+  # flattening the iodata copied every relayed packet.
   defp send_data(%{wire_mode: :websocket} = state, data),
-    do: send_websocket_chunks(state, IO.iodata_to_binary(data))
-
-  defp send_websocket_chunks(state, data) when byte_size(data) <= @websocket_chunk_size do
-    state.transport.send(state.socket, WebSocketFrame.encode_binary(data))
-  end
-
-  defp send_websocket_chunks(state, data) do
-    <<chunk::binary-size(@websocket_chunk_size), rest::binary>> = data
-
-    case state.transport.send(state.socket, WebSocketFrame.encode_binary(chunk)) do
-      :ok -> send_websocket_chunks(state, rest)
-      {:error, _reason} = error -> error
-    end
-  end
+    do: state.transport.send(state.socket, WebSocketFrame.encode_binary(data))
 end

@@ -41,17 +41,22 @@ defmodule Derpex.WebSocket.FrameTest do
   end
 
   test "encodes unmasked server frames at every length tier" do
-    assert <<0x82, 0>> = Frame.encode_binary("")
-    assert <<0x82, 125, _payload::binary-size(125)>> = Frame.encode_binary(:binary.copy("a", 125))
+    assert <<0x82, 0>> = encoded_binary("")
+    assert <<0x82, 125, _payload::binary-size(125)>> = encoded_binary(:binary.copy("a", 125))
 
     assert <<0x82, 126, 126::unsigned-big-16, _payload::binary-size(126)>> =
-             Frame.encode_binary(:binary.copy("a", 126))
+             encoded_binary(:binary.copy("a", 126))
 
     assert <<0x82, 127, 65_536::unsigned-big-64, _payload::binary-size(65_536)>> =
-             Frame.encode_binary(:binary.copy("a", 65_536))
+             encoded_binary(:binary.copy("a", 65_536))
 
-    assert Frame.encode_pong("ping") == <<0x8A, 4, "ping">>
+    # The payload is never copied into the frame: a relayed packet stays the
+    # binary the reader handed over.
+    assert [_header, "a"] = Frame.encode_binary("a")
+    assert IO.iodata_to_binary(Frame.encode_pong("ping")) == <<0x8A, 4, "ping">>
   end
+
+  defp encoded_binary(payload), do: IO.iodata_to_binary(Frame.encode_binary(payload))
 
   defp client_frame(opcode, payload, fin? \\ true) do
     mask = <<1, 2, 3, 4>>
