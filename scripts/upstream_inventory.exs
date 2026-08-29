@@ -172,7 +172,7 @@ defmodule Derpex.UpstreamInventory do
     {"cmd/derper/ipcert_test.go", "TestIPCertManager"} =>
       "upstream drives issuance against a fake ACME server; DERPEX has no RFC 8555 client (PLAN.md section 2.3), so only the self-signed issuer behind DERPEX_IP_CERT_ISSUER=self is wired",
     {"cmd/derper/ipcert_test.go", "TestIPCertManagerNextProvider"} =>
-      "next-provider delegation is only observable once an ACME hostname provider exists; PLAN.md section 2.3 records ACME as pending"
+      "the `:next_provider` hook exists but has no production caller — nothing can supply a DNS hostname provider until the ACME client does — so the delegation test in test/derpex/certificates/ip_manager_test.exs exercises a test-only fixture and does not close this row; PLAN.md section 2.3 records ACME as pending"
   }
 
   # A row about a Go implementation detail. The behavior it protects is still
