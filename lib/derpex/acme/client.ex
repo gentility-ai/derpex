@@ -44,9 +44,10 @@ defmodule Derpex.ACME.Client do
   @bad_nonce_suffix "badnonce"
   @nonce_attempts 3
   @nonce_backoff_ms 200
-  @poll_interval_ms 250
-  @maximum_poll_interval_ms 10_000
+  @default_retry_ms 1_000
+  @minimum_retry_ms 250
   @order_deadline_ms 180_000
+  @minimum_request_ms 1_000
 
   @type subject :: {:ip, binary()} | {:dns, binary()}
   @type certificate :: %{certificate_der: binary(), chain: [binary()], private_key: tuple()}
@@ -81,17 +82,19 @@ defmodule Derpex.ACME.Client do
   @spec issue(GenServer.server(), subject(), binary() | nil, keyword()) ::
           {:ok, certificate()} | {:error, term()}
   def issue(client, identifier, profile \\ nil, options \\ []) do
+    # Monotonic, not wall clock: an order must not be cut short or extended by
+    # the clock stepping while it runs, and NTP corrections are ordinary.
     deadline =
-      Clock.system_time(:millisecond) + Keyword.get(options, :deadline_ms, @order_deadline_ms)
+      Clock.monotonic_time(:millisecond) + Keyword.get(options, :deadline_ms, @order_deadline_ms)
 
     with {:ok, session} <- GenServer.call(client, :session, :infinity),
          :ok <- supported_profile(session, profile),
-         {:ok, order} <- create_order(client, session, identifier, profile),
+         {:ok, order} <- create_order(client, session, identifier, profile, deadline),
          :ok <- authorize(client, session, order, deadline),
          {:ok, order} <- await_ready(client, session, order, deadline),
          {:ok, {csr, private_key}} <- CSR.generate(identifier),
          {:ok, order} <- finalize(client, session, order, csr, deadline),
-         {:ok, chain} <- download(client, session, order),
+         {:ok, chain} <- download(client, session, order, deadline),
          :ok <- verify_key(chain, private_key) do
       {:ok, %{certificate_der: hd(chain), chain: chain, private_key: private_key}}
     end
@@ -321,9 +324,15 @@ defmodule Derpex.ACME.Client do
     end
   end
 
-  defp create_order(client, session, identifier, profile) do
+  defp create_order(client, session, identifier, profile, deadline) do
     with {:ok, response} <-
-           post(client, session, session.directory.new_order, Order.payload(identifier, profile)) do
+           post(
+             client,
+             session,
+             session.directory.new_order,
+             Order.payload(identifier, profile),
+             deadline
+           ) do
       Order.parse(response)
     end
   end
@@ -338,7 +347,7 @@ defmodule Derpex.ACME.Client do
   end
 
   defp fulfill(client, session, url, deadline) do
-    with {:ok, response} <- post(client, session, url, :post_as_get),
+    with {:ok, response} <- post(client, session, url, :post_as_get, deadline),
          {:ok, _status, challenge} <- Challenge.select(response) do
       accept(client, session, url, challenge, deadline)
     end
@@ -353,7 +362,7 @@ defmodule Derpex.ACME.Client do
     :ok = module.put_challenge(server, path, response)
 
     try do
-      with {:ok, _accepted} <- post(client, session, challenge.url, %{}) do
+      with {:ok, _accepted} <- post(client, session, challenge.url, %{}, deadline) do
         await_authorization(client, session, authorization_url, deadline)
       end
     after
@@ -395,7 +404,7 @@ defmodule Derpex.ACME.Client do
 
   defp finalize(client, session, order, csr, deadline) do
     with {:ok, response} <-
-           post(client, session, order.finalize, Order.finalize_payload(csr)),
+           post(client, session, order.finalize, Order.finalize_payload(csr), deadline),
          {:ok, finalized} <- Order.parse(response) do
       finalized = %{finalized | url: finalized.url || order.url}
 
@@ -426,8 +435,8 @@ defmodule Derpex.ACME.Client do
     end
   end
 
-  defp download(client, session, %{certificate: url}) when is_binary(url) do
-    with {:ok, response} <- post(client, session, url, :post_as_get) do
+  defp download(client, session, %{certificate: url}, deadline) when is_binary(url) do
+    with {:ok, response} <- post(client, session, url, :post_as_get, deadline) do
       case certificates(response.body) do
         [] -> {:error, :empty_certificate_chain}
         chain -> {:ok, chain}
@@ -435,7 +444,7 @@ defmodule Derpex.ACME.Client do
     end
   end
 
-  defp download(_client, _session, _order), do: {:error, :order_without_certificate}
+  defp download(_client, _session, _order, _deadline), do: {:error, :order_without_certificate}
 
   # autocert's `validCert`: a chain whose leaf does not carry the public key of
   # the key we generated is not ours to serve, however well formed it is.
@@ -466,7 +475,7 @@ defmodule Derpex.ACME.Client do
   # `Derpex.Clock` and is therefore steerable. The pause itself is a delay
   # inside one order's own process, not a protocol timer.
   defp poll(client, session, url, deadline, decide) do
-    with {:ok, response} <- post(client, session, url, :post_as_get) do
+    with {:ok, response} <- post(client, session, url, :post_as_get, deadline) do
       case decide.(response) do
         {:done, result} -> result
         :again -> poll_again(client, session, url, deadline, decide, response)
@@ -485,36 +494,63 @@ defmodule Derpex.ACME.Client do
     end
   end
 
-  defp remaining(deadline), do: max(deadline - Clock.system_time(:millisecond), 0)
+  defp remaining(deadline), do: max(deadline - Clock.monotonic_time(:millisecond), 0)
 
+  # RFC 7231 allows either delta-seconds or an HTTP-date, and upstream waits a
+  # second when the header is absent. An explicit value is honoured down to a
+  # quarter second, below which polling would spin. The only ceiling is the
+  # order's own deadline, applied by the caller: an authority asking for a
+  # minute is entitled to it, and polling sooner would just be refused.
   defp retry_after(response) do
     case HTTP.header(response, "retry-after") do
-      value when is_binary(value) ->
-        case Integer.parse(String.trim(value)) do
-          {seconds, ""} when seconds >= 0 ->
-            seconds |> Kernel.*(1_000) |> max(@poll_interval_ms) |> min(@maximum_poll_interval_ms)
+      value when is_binary(value) -> parse_retry_after(String.trim(value))
+      nil -> @default_retry_ms
+    end
+  end
 
-          _not_delta_seconds ->
-            @poll_interval_ms
-        end
+  defp parse_retry_after(value) do
+    case Integer.parse(value) do
+      {seconds, ""} when seconds >= 0 -> max(seconds * 1_000, @minimum_retry_ms)
+      _not_delta_seconds -> retry_after_date(value)
+    end
+  end
 
-      nil ->
-        @poll_interval_ms
+  # RFC 7231 IMF-fixdate: `Sun, 06 Nov 1994 08:49:37 GMT`. The obsolete formats
+  # are not accepted; an authority sending one gets the default wait.
+  defp retry_after_date(
+         <<_day::binary-size(3), ", ", date::binary-size(2), " ", month::binary-size(3), " ",
+           year::binary-size(4), " ", time::binary-size(8), " GMT">>
+       ) do
+    with {:ok, month} <- month_number(month),
+         {:ok, at, 0} <- DateTime.from_iso8601("#{year}-#{month}-#{date}T#{time}Z") do
+      at |> DateTime.diff(DateTime.utc_now(), :millisecond) |> max(@minimum_retry_ms)
+    else
+      _unparsable -> @default_retry_ms
+    end
+  end
+
+  defp retry_after_date(_other), do: @default_retry_ms
+
+  defp month_number(month) do
+    case Enum.find_index(~w(Jan Feb Mar Apr May Jun Jul Aug Sep Oct Nov Dec), &(&1 == month)) do
+      nil -> :error
+      index -> {:ok, (index + 1) |> Integer.to_string() |> String.pad_leading(2, "0")}
     end
   end
 
   # A nonce that cannot be fetched is an error, never a request sent without
   # one: RFC 8555 rejects an unauthenticated replay, and a JWS with no nonce
   # would be indistinguishable from one at the far end.
-  defp post(client, session, url, payload, attempt \\ 1) do
-    with {:ok, nonce} <- GenServer.call(client, :take_nonce, :infinity) do
+  defp post(client, session, url, payload, deadline, attempt \\ 1) do
+    with {:ok, options} <- request_options(session, url, deadline),
+         {:ok, nonce} <- GenServer.call(client, :take_nonce, :infinity) do
       body =
         JWS.encode(payload, session.account_key, kid: session.kid, nonce: nonce, url: url)
 
-      case HTTP.post(url, body, session.http_options) do
+      case HTTP.post(url, body, options) do
         {:ok, response} ->
           store_nonce(client, response)
-          posted(client, session, url, payload, attempt, response)
+          posted(client, session, url, payload, deadline, attempt, response)
 
         {:error, reason} ->
           {:error, reason}
@@ -522,18 +558,32 @@ defmodule Derpex.ACME.Client do
     end
   end
 
+  # Every request is capped by what is left of the order, and one that could
+  # not finish inside the deadline is not started: a request begun with less
+  # than a second left can only end in a timeout the order has no time to
+  # recover from.
+  defp request_options(session, url, deadline) do
+    case remaining(deadline) do
+      left when left < @minimum_request_ms ->
+        {:error, {:order_deadline, url}}
+
+      left ->
+        {:ok, Keyword.put(session.http_options, :timeout_ms, left)}
+    end
+  end
+
   # RFC 8555 section 6.5: a rejected nonce is retried with a fresh one. Every
   # nonce held is suspect once the server rejects one, so the pool is emptied
   # rather than spent one rejection at a time, and the retries back off.
-  defp posted(client, session, url, payload, attempt, response) do
+  defp posted(client, session, url, payload, deadline, attempt, response) do
     cond do
       response.status < 400 ->
         {:ok, response}
 
       bad_nonce?(response) and attempt < @nonce_attempts ->
         GenServer.call(client, :clear_nonces, :infinity)
-        Process.sleep(@nonce_backoff_ms * attempt)
-        post(client, session, url, payload, attempt + 1)
+        Process.sleep(min(@nonce_backoff_ms * attempt, remaining(deadline)))
+        post(client, session, url, payload, deadline, attempt + 1)
 
       true ->
         {:error, error(response)}

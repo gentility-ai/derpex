@@ -161,6 +161,31 @@ defmodule Derpex.ACME.ClientTest do
              Client.issue(client, {:ip, "127.0.0.1"}, "shortlived", deadline_ms: 500)
   end
 
+  test "waits the HTTP-date a certificate authority names", context do
+    client = start_client(context)
+    # Three seconds out, so honouring the date is distinguishable from falling
+    # back to the one-second default. The format truncates to whole seconds.
+    at = DateTime.utc_now() |> DateTime.add(3, :second) |> imf_fixdate()
+    :ok = FakeACME.defer_order(context.authority, 1, at)
+
+    started = System.monotonic_time(:millisecond)
+    assert {:ok, _certificate} = Client.issue(client, {:ip, "127.0.0.1"}, "shortlived")
+    elapsed = System.monotonic_time(:millisecond) - started
+
+    assert elapsed >= 1_800
+    assert elapsed < 10_000
+  end
+
+  test "does not start a request it has no time to finish", context do
+    client = start_client(context)
+    :ok = FakeACME.defer_order(context.authority, :forever, "0")
+
+    # Under a second left is not enough to begin a request, so the order stops
+    # at its deadline rather than opening one more connection.
+    assert {:error, {:order_deadline, _url}} =
+             Client.issue(client, {:ip, "127.0.0.1"}, "shortlived", deadline_ms: 1_500)
+  end
+
   test "treats a differently cased badNonce URN as one", context do
     client = start_client(context)
 
@@ -188,6 +213,16 @@ defmodule Derpex.ACME.ClientTest do
     assert {:ok, _certificate} = Client.issue(client, {:ip, "127.0.0.1"}, "shortlived")
     assert FakeACME.orders(context.authority) == 1
   end
+
+  defp imf_fixdate(at) do
+    day = Enum.at(~w(Mon Tue Wed Thu Fri Sat Sun), Date.day_of_week(at) - 1)
+    month = Enum.at(~w(Jan Feb Mar Apr May Jun Jul Aug Sep Oct Nov Dec), at.month - 1)
+
+    "#{day}, #{pad(at.day)} #{month} #{at.year} " <>
+      "#{pad(at.hour)}:#{pad(at.minute)}:#{pad(at.second)} GMT"
+  end
+
+  defp pad(value), do: value |> Integer.to_string() |> String.pad_leading(2, "0")
 
   defp start_client(context) do
     start_supervised!(
