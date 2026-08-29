@@ -143,6 +143,8 @@ defmodule Derpex.Listener.Handler do
             SocketOptions.mesh_write_timeout_ms()
           ),
         debug_traffic: nil,
+        paced: nil,
+        paced_data: <<>>,
         tcp_rtt: nil,
         tcp_rtt_options: tcp_rtt_options
       }
@@ -174,6 +176,12 @@ defmodule Derpex.Listener.Handler do
     end
   end
 
+  # While paced the socket is passive, but one message may already have been in
+  # flight. It waits with the rest of the client's bytes.
+  def handle_data(data, _socket, %{paced: paced} = state) when paced != nil do
+    {:continue, %{state | paced_data: state.paced_data <> data}, {:continue, :derpex_pause_reads}}
+  end
+
   def handle_data(data, socket, state) do
     case Session.receive_data(state.session, data) do
       {:ok, session, actions} ->
@@ -202,6 +210,17 @@ defmodule Derpex.Listener.Handler do
 
   def handle_info({:derpex_admission_close, reason}, {socket, state}) do
     {:stop, {:shutdown, {:admission, reason}}, {socket, state}}
+  end
+
+  def handle_info(
+        {:derpex_rate_limit_ready, token},
+        {socket, %{paced: {token, _timer, pending}} = state}
+      ) do
+    resume_reads(socket, %{state | paced: nil}, pending)
+  end
+
+  def handle_info({:derpex_rate_limit_ready, _stale_token}, {socket, state}) do
+    {:noreply, {socket, state}}
   end
 
   def handle_info({:derpex_drain_close, _token}, {socket, state}) do
@@ -295,18 +314,108 @@ defmodule Derpex.Listener.Handler do
 
   defp continue_after_actions(socket, state, actions) do
     case execute_actions(socket, state, actions) do
-      {:ok, state} -> {:continue, state}
-      {:error, {:admission, _reason}, state} -> {:close, state}
-      {:error, {:connection_close, _reason}, state} -> {:close, state}
-      {:error, reason, state} -> {:error, reason, state}
+      {:ok, state} ->
+        {:continue, state}
+
+      {:pace, delay, state, pending} ->
+        {:continue, pace(state, delay, pending), {:continue, :derpex_pause_reads}}
+
+      {:error, {:admission, _reason}, state} ->
+        {:close, state}
+
+      {:error, {:connection_close, _reason}, state} ->
+        {:close, state}
+
+      {:error, reason, state} ->
+        {:error, reason, state}
     end
   end
 
   defp close_after_actions(socket, state, actions) do
     case execute_actions(socket, state, actions) do
       {:ok, state} -> {:close, state}
+      {:pace, _delay, state, _pending} -> {:close, state}
       {:error, reason, state} -> {:error, reason, state}
     end
+  end
+
+  @impl GenServer
+  def handle_continue(:derpex_pause_reads, {socket, state}) do
+    _ignored = ThousandIsland.Socket.setopts(socket, active: false)
+    {:noreply, {socket, state}}
+  end
+
+  # Finishing the paced frame can pace again on the next one, and the data that
+  # arrived just before the socket went passive is parsed here rather than
+  # thrown away.
+  defp resume_reads(socket, state, pending_actions) do
+    case execute_actions(socket, state, pending_actions) do
+      {:ok, state} ->
+        resume_paced_data(socket, state)
+
+      {:pace, delay, state, pending} ->
+        {:noreply, {socket, pace(state, delay, pending)}}
+
+      {:error, {:admission, _reason}, state} ->
+        {:stop, {:shutdown, :admission}, {socket, state}}
+
+      {:error, {:connection_close, reason}, state} ->
+        {:stop, {:shutdown, reason}, {socket, state}}
+
+      {:error, reason, state} ->
+        {:stop, reason, {socket, state}}
+    end
+  end
+
+  defp resume_paced_data(socket, %{paced_data: <<>>} = state) do
+    _ignored = ThousandIsland.Socket.setopts(socket, active: :once)
+    {:noreply, {socket, state}}
+  end
+
+  defp resume_paced_data(socket, state) do
+    data = state.paced_data
+    state = %{state | paced_data: <<>>}
+
+    case Session.receive_data(state.session, data) do
+      {:ok, session, actions} ->
+        continue_paced(socket, %{state | session: session}, actions)
+
+      {:close, session, reason, actions} ->
+        case execute_actions(socket, %{state | session: session}, actions) do
+          {:ok, state} -> {:stop, {:shutdown, reason}, {socket, state}}
+          {:pace, _delay, state, _pending} -> {:stop, {:shutdown, reason}, {socket, state}}
+          {:error, error, state} -> {:stop, error, {socket, state}}
+        end
+    end
+  end
+
+  defp continue_paced(socket, state, actions) do
+    case execute_actions(socket, state, actions) do
+      {:ok, state} ->
+        resume_paced_data(socket, state)
+
+      {:pace, delay, state, pending} ->
+        {:noreply, {socket, pace(state, delay, pending)}}
+
+      {:error, {:admission, _reason}, state} ->
+        {:stop, {:shutdown, :admission}, {socket, state}}
+
+      {:error, {:connection_close, reason}, state} ->
+        {:stop, {:shutdown, reason}, {socket, state}}
+
+      {:error, reason, state} ->
+        {:stop, reason, {socket, state}}
+    end
+  end
+
+  # Pacing is a state, not a pause in the code: the handler keeps answering
+  # keepalives, rate updates and close requests while the client's own bytes
+  # wait in the kernel buffer.
+  defp pace(state, delay_microseconds, pending_actions) do
+    token = make_ref()
+    milliseconds = max(div(delay_microseconds + 999, 1_000), 1)
+    timer = Clock.send_after(self(), {:derpex_rate_limit_ready, token}, milliseconds)
+    %{state | paced: {token, timer, pending_actions}}
   end
 
   # A control write may not give up before the socket does. The socket's own
@@ -315,13 +424,14 @@ defmodule Derpex.Listener.Handler do
     Writer.write_control(state.writer, data, state.write_timeout_ms + 1_000)
   end
 
-  defp execute_actions(socket, state, actions) do
-    Enum.reduce_while(actions, {:ok, state}, fn action, {:ok, state} ->
-      case execute_action(socket, state, action) do
-        {:ok, state} -> {:cont, {:ok, state}}
-        {:error, reason, state} -> {:halt, {:error, reason, state}}
-      end
-    end)
+  defp execute_actions(_socket, state, []), do: {:ok, state}
+
+  defp execute_actions(socket, state, [action | rest]) do
+    case execute_action(socket, state, action) do
+      {:ok, state} -> execute_actions(socket, state, rest)
+      {:pace, delay_microseconds, state} -> {:pace, delay_microseconds, state, rest}
+      {:error, reason, state} -> {:error, reason, state}
+    end
   end
 
   defp execute_action(_socket, state, {:send, data}) do
@@ -355,8 +465,8 @@ defmodule Derpex.Listener.Handler do
     end
   end
 
-  defp execute_action(socket, state, {:rate_limit, frame_length}) do
-    rate_limit(socket, state, frame_length)
+  defp execute_action(_socket, state, {:rate_limit, frame_length}) do
+    rate_limit(state, frame_length)
   end
 
   defp execute_action(socket, state, {:authenticated, key, info, can_mesh}) do
@@ -764,19 +874,20 @@ defmodule Derpex.Listener.Handler do
     %{state | receive_limiter: ReceiveLimiter.new(config)}
   end
 
-  defp rate_limit(socket, state, frame_length) do
+  defp rate_limit(state, frame_length) do
     with {:ok, admission_delay} <-
            Admission.reserve_bytes(
              state.admission_policy,
              state.admission_context,
              frame_length
            ),
-         {:ok, receive_delay, state} <- reserve_receive_bytes(state, frame_length),
-         :ok <- wait_for_rate_limit(socket, max(admission_delay, receive_delay)) do
-      {:ok, state}
+         {:ok, receive_delay, state} <- reserve_receive_bytes(state, frame_length) do
+      case max(admission_delay, receive_delay) do
+        0 -> {:ok, state}
+        delay_microseconds -> {:pace, delay_microseconds, state}
+      end
     else
       {:error, reason, state} -> {:error, {:rate_limit, reason}, state}
-      {:error, {:connection_close, _reason} = reason} -> {:error, reason, state}
       {:error, reason} -> {:error, {:rate_limit, reason}, state}
     end
   end
@@ -791,40 +902,6 @@ defmodule Derpex.Listener.Handler do
 
       {:error, reason} ->
         {:error, reason, state}
-    end
-  end
-
-  defp wait_for_rate_limit(_socket, 0), do: :ok
-
-  defp wait_for_rate_limit(socket, delay_microseconds) do
-    token = make_ref()
-    milliseconds = max(div(delay_microseconds + 999, 1_000), 1)
-    timer = Clock.send_after(self(), {:derpex_rate_limit_ready, token}, milliseconds)
-    raw_socket = socket.socket
-
-    receive do
-      {:derpex_rate_limit_ready, ^token} ->
-        :ok
-
-      {:tcp_closed, ^raw_socket} ->
-        _remaining = Clock.cancel_timer(timer)
-        {:error, :peer_closed}
-
-      {:ssl_closed, ^raw_socket} ->
-        _remaining = Clock.cancel_timer(timer)
-        {:error, :peer_closed}
-
-      {:derpex_close_peer, _key} ->
-        _remaining = Clock.cancel_timer(timer)
-        {:error, {:connection_close, :close_peer}}
-
-      {:derpex_admission_close, reason} ->
-        _remaining = Clock.cancel_timer(timer)
-        {:error, {:connection_close, {:admission, reason}}}
-
-      {:EXIT, _process, reason} ->
-        _remaining = Clock.cancel_timer(timer)
-        {:error, {:shutdown, reason}}
     end
   end
 
