@@ -378,6 +378,41 @@ defmodule Derpex.RouterTest do
     Process.exit(second, :kill)
   end
 
+  test "a sole connection's activity notes never reach a table" do
+    key = :crypto.strong_rand_bytes(32)
+    ring = Ring.new(1)
+    connection = activity_reporter(self(), key, ring)
+
+    assert_receive {:registered, ^connection}
+    on_exit(fn -> Process.exit(connection, :kill) end)
+
+    assert measure_lookups(connection) == 0
+    assert Router.unregister(key, connection) == :ok
+  end
+
+  test "a connection promoted to a duplicate resumes noting its activity" do
+    key = :crypto.strong_rand_bytes(32)
+    source = :crypto.strong_rand_bytes(32)
+    first_ring = Ring.new(2)
+    second_ring = Ring.new(2)
+    first = activity_reporter(self(), key, first_ring)
+    assert_receive {:registered, ^first}
+
+    second = spawn(fn -> Process.sleep(:infinity) end)
+    on_exit(fn -> Enum.each([first, second], &Process.exit(&1, :kill)) end)
+
+    assert Router.register(key, second, second_ring) == :ok
+    assert Router.route(source, key, "newest") == {:ok, :wake}
+    assert Ring.take(second_ring) == {:ok, {:recv_packet, source, "newest"}}
+
+    assert measure_lookups(first) > 0
+    assert Router.route(source, key, "promoted") == {:ok, :wake}
+    assert Ring.take(first_ring) == {:ok, {:recv_packet, source, "promoted"}}
+
+    assert Router.unregister(key, first) == :ok
+    assert Router.unregister(key, second) == :ok
+  end
+
   test "closing a peer asks every duplicate connection to stop" do
     key = :crypto.strong_rand_bytes(32)
     first = reporting_connection(self())
@@ -481,6 +516,52 @@ defmodule Derpex.RouterTest do
     assert Process.alive?(Process.whereis(Router))
 
     Process.exit(source_connection, :kill)
+  end
+
+  # Registers from inside the spawned process, the way a listener handler does,
+  # then notes activity 10_000 times on demand so the caller can measure it.
+  defp activity_reporter(parent, key, ring) do
+    spawn(fn ->
+      :ok = Router.register(key, self(), ring)
+      send(parent, {:registered, self()})
+
+      receive do
+        :note_activity -> :ok
+      end
+
+      Enum.each(1..10_000, fn _index ->
+        :ok = Router.note_activity(key, self())
+      end)
+
+      send(parent, {:noted, self()})
+      Process.sleep(:infinity)
+    end)
+  end
+
+  defp measure_lookups(connection) do
+    counter = spawn_link(fn -> count_lookups(0) end)
+    :erlang.trace_pattern({:ets, :lookup, 2}, true, [])
+    :erlang.trace(connection, true, [:call, {:tracer, counter}])
+
+    try do
+      send(connection, :note_activity)
+      assert_receive {:noted, ^connection}, 10_000
+      reference = :erlang.trace_delivered(connection)
+      assert_receive {:trace_delivered, ^connection, ^reference}, 5_000
+      send(counter, {:count, self()})
+      assert_receive {:lookups, count}, 5_000
+      count
+    after
+      :erlang.trace(connection, false, [:call])
+      :erlang.trace_pattern({:ets, :lookup, 2}, false, [])
+    end
+  end
+
+  defp count_lookups(count) do
+    receive do
+      {:trace, _pid, :call, {:ets, :lookup, _arguments}} -> count_lookups(count + 1)
+      {:count, caller} -> send(caller, {:lookups, count})
+    end
   end
 
   defp reporting_connection(parent) do

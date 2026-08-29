@@ -18,6 +18,14 @@ defmodule Derpex.Router do
   @duplicates_table __MODULE__.Duplicates
   @forwarders_table __MODULE__.Forwarders
 
+  # Each registration owns one atomics array: slot 1 orders duplicate
+  # connections by last activity, slot 2 is Go's `sclient.isDup`. A connection
+  # that is not a duplicate can never win a promotion, so it reads slot 2 and
+  # skips the tables entirely.
+  @activity_slot 1
+  @duplicate_slot 2
+  @activity_cache __MODULE__.CachedActivity
+
   @default_presence %{
     ip: <<0::128>>,
     port: 0,
@@ -87,10 +95,13 @@ defmodule Derpex.Router do
       )
       when is_pid(connection) and port in 0..65_535 and flags in 0..255 and
              is_binary(app_name) do
-    GenServer.call(
-      __MODULE__,
-      {:register, key, connection, ordinary, disco, lifecycle, presence}
-    )
+    {:ok, activity} =
+      GenServer.call(
+        __MODULE__,
+        {:register, key, connection, ordinary, disco, lifecycle, presence}
+      )
+
+    cache_activity(key, connection, activity)
   end
 
   @doc "Removes a connection only if it is still the active route."
@@ -160,13 +171,41 @@ defmodule Derpex.Router do
     ReversePaths.note(source, destination_connection, lifecycle)
   end
 
-  @doc "Promotes a duplicate connection when it is the latest one to send a frame."
+  @doc """
+  Promotes a duplicate connection when it is the latest one to send a frame.
+
+  Called for every client frame, so the common case must stay off the tables.
+  `register/6` leaves the caller's own activity handle in its process
+  dictionary, which turns the sole-connection case into one atomics read.
+  """
   @spec note_activity(binary(), pid()) :: :ok
   def note_activity(<<key::binary-size(32)>>, connection) when is_pid(connection) do
+    case Process.get(@activity_cache) do
+      {^key, ^connection, activity} -> promote_cached_duplicate(key, connection, activity)
+      _uncached -> promote_duplicate(key, connection)
+    end
+  end
+
+  defp cache_activity(key, connection, activity) do
+    if connection == self() do
+      Process.put(@activity_cache, {key, connection, activity})
+    end
+
+    :ok
+  end
+
+  defp promote_cached_duplicate(key, connection, activity) do
+    case :atomics.get(activity, @duplicate_slot) do
+      0 -> :ok
+      _duplicate -> promote_duplicate(key, connection)
+    end
+  end
+
+  defp promote_duplicate(key, connection) do
     with [{^key}] <- :ets.lookup(@duplicates_table, key),
          [{{^key, ^connection}, ordinary, {disco, lifecycle}, activity}] <-
            :ets.lookup(@registrations_table, {key, connection}) do
-      :atomics.put(activity, 1, activity_sequence())
+      :atomics.put(activity, @activity_slot, activity_sequence())
       true = :ets.insert(@table, {key, connection, ordinary, disco, lifecycle})
     end
 
@@ -276,8 +315,8 @@ defmodule Derpex.Router do
         state
       ) do
     {monitor, monitors} = ensure_monitor(state.monitors, connection)
-    activity = :atomics.new(1, signed: false)
-    :atomics.put(activity, 1, activity_sequence())
+    activity = :atomics.new(2, signed: false)
+    :atomics.put(activity, @activity_slot, activity_sequence())
 
     previous_entries = Map.get(state.routes, key, [])
 
@@ -316,7 +355,8 @@ defmodule Derpex.Router do
     monitors =
       Map.put(monitors, connection, {monitor, MapSet.put(keys_for(monitors, connection), key)})
 
-    {:reply, :ok, %{state | monitors: monitors, routes: Map.put(state.routes, key, entries)}}
+    {:reply, {:ok, activity},
+     %{state | monitors: monitors, routes: Map.put(state.routes, key, entries)}}
   end
 
   def handle_call({:unregister, key, connection}, _from, state) do
@@ -556,20 +596,21 @@ defmodule Derpex.Router do
   defp remove_route(routes, key, connection, forwarders) do
     true = :ets.delete(@registrations_table, {key, connection})
 
-    entries =
+    {removed, entries} =
       routes
       |> Map.get(key, [])
-      |> Enum.reject(fn {
-                          registered_connection,
-                          _ordinary,
-                          _disco,
-                          _lifecycle,
-                          _activity,
-                          _presence
-                        } ->
+      |> Enum.split_with(fn {
+                              registered_connection,
+                              _ordinary,
+                              _disco,
+                              _lifecycle,
+                              _activity,
+                              _presence
+                            } ->
         registered_connection == connection
       end)
 
+    Enum.each(removed, &mark_duplicate(&1, 0))
     update_duplicate_marker(key, entries)
 
     case entries do
@@ -618,11 +659,21 @@ defmodule Derpex.Router do
   end
 
   defp update_duplicate_marker(key, entries) do
-    if length(entries) > 1 do
+    duplicate = if length(entries) > 1, do: 1, else: 0
+    Enum.each(entries, &mark_duplicate(&1, duplicate))
+
+    if duplicate == 1 do
       true = :ets.insert(@duplicates_table, {key})
     else
       true = :ets.delete(@duplicates_table, key)
     end
+  end
+
+  defp mark_duplicate(
+         {_connection, _ordinary, _disco, _lifecycle, activity, _presence},
+         duplicate
+       ) do
+    :atomics.put(activity, @duplicate_slot, duplicate)
   end
 
   defp snapshot_presence(routes) do
