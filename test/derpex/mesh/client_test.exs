@@ -399,6 +399,101 @@ defmodule Derpex.Mesh.ClientTest do
     assert_receive {:mesh_event, {:connected, _reconnected_key}}, 2_000
   end
 
+  test "a deep forwarding backlog yields to socket data between drains" do
+    parent = self()
+    {_server_public, server_private} = Crypto.generate_keypair()
+    {_local_public, local_private} = Crypto.generate_keypair()
+    mesh_key = :crypto.strong_rand_bytes(32)
+    remote_peer = :crypto.strong_rand_bytes(32)
+
+    {:ok, listener} =
+      :gen_tcp.listen(0, [:binary, packet: :raw, active: false, reuseaddr: true])
+
+    {:ok, {_ip, port}} = :inet.sockname(listener)
+
+    fake =
+      spawn(fn -> drain_order_server(listener, server_private, mesh_key, remote_peer, parent) end)
+
+    on_exit(fn ->
+      :gen_tcp.close(listener)
+      if Process.alive?(fake), do: Process.exit(fake, :kill)
+    end)
+
+    client =
+      start_supervised!(
+        {Client,
+         url: "http://127.0.0.1:#{port}/derp",
+         private_key: Secret.wrap(local_private),
+         mesh_key: Secret.wrap(mesh_key),
+         queue_capacity: 256,
+         reconnect_interval: 60_000,
+         event_handler: fn event -> send(parent, {:mesh_event, event}) end}
+      )
+
+    assert_receive :drain_ready, 2_000
+    assert_receive {:mesh_event, {:peer_present, ^remote_peer}}, 2_000
+
+    source = :crypto.strong_rand_bytes(32)
+    :ok = :sys.suspend(client)
+
+    Enum.each(1..200, fn _index ->
+      Router.route(source, remote_peer, :binary.copy(<<0x11>>, 100))
+    end)
+
+    send(fake, :send_ping)
+    await_queued_messages(client, 2)
+    :ok = :sys.resume(client)
+
+    assert_receive {:forwards_before_pong, forwarded}, 5_000
+    assert forwarded > 0
+    assert forwarded <= 64
+  end
+
+  defp await_queued_messages(client, wanted) do
+    {:message_queue_len, queued} = Process.info(client, :message_queue_len)
+
+    if queued >= wanted do
+      :ok
+    else
+      Process.sleep(5)
+      await_queued_messages(client, wanted)
+    end
+  end
+
+  defp drain_order_server(listener, server_private, mesh_key, remote_peer, parent) do
+    {:ok, socket} = :gen_tcp.accept(listener)
+    read_ahead = mesh_handshake(socket, server_private, mesh_key, remote_peer)
+    send(parent, :drain_ready)
+
+    receive do
+      :send_ping ->
+        {:ok, ping} = Body.encode_server({:ping, "ordering"})
+        :ok = :gen_tcp.send(socket, ping)
+    end
+
+    count_until_pong(socket, read_ahead, 0, parent)
+  rescue
+    error -> send(parent, {:fake_error, error, __STACKTRACE__})
+  end
+
+  defp count_until_pong(socket, buffer, forwarded, parent) do
+    {:ok, type, _body, rest} = receive_frame(socket, buffer)
+
+    if type == Frame.type(:pong) do
+      send(parent, {:forwards_before_pong, forwarded})
+      discard_frames(socket, rest)
+    else
+      count_until_pong(socket, rest, forwarded + 1, parent)
+    end
+  end
+
+  defp discard_frames(socket, buffer) do
+    case receive_frame(socket, buffer) do
+      {:ok, _type, _body, rest} -> discard_frames(socket, rest)
+      {:error, _reason} -> :ok
+    end
+  end
+
   defp stalled_tls_server(listener, server_private, mesh_key, remote_peer, parent) do
     Enum.each(1..2, fn generation ->
       {:ok, pending} = :ssl.transport_accept(listener)

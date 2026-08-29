@@ -21,6 +21,10 @@ defmodule Derpex.Mesh.Client do
   `120 * time.Second` read deadline `derp.Client.Recv` sets before each frame.
   A peer that misses it has its learned forwarders withdrawn and its
   connection retried, so mesh routes never outlive the link that taught them.
+
+  One wakeup forwards at most 64 queued packets and then re-sends itself the
+  wake message rather than looping until the ring empties, so a deep backlog
+  cannot starve inbound frames, peer-gone updates, timers or calls.
   """
 
   use GenServer
@@ -46,6 +50,7 @@ defmodule Derpex.Mesh.Client do
   @default_queue_capacity 32
   @default_send_timeout 5_000
   @default_recv_deadline 120_000
+  @max_drain_per_wake 64
   @max_http_head_bytes 1 * 1_024 * 1_024
   @max_server_frame_bytes Frame.max_info_length() + Frame.nonce_length()
 
@@ -359,12 +364,20 @@ defmodule Derpex.Mesh.Client do
     end
   end
 
-  defp drain_forwarded_packets(state) do
+  defp drain_forwarded_packets(state),
+    do: drain_forwarded_packets(state, @max_drain_per_wake)
+
+  defp drain_forwarded_packets(_state, 0) do
+    send(self(), @wake_message)
+    :ok
+  end
+
+  defp drain_forwarded_packets(state, budget) do
     case Ring.take(state.ring) do
       {:ok, {:forward_packet, source, destination, packet}} ->
         with {:ok, frame} <- Body.encode_client({:forward_packet, source, destination, packet}),
              :ok <- socket_send(state, frame) do
-          drain_forwarded_packets(state)
+          drain_forwarded_packets(state, budget - 1)
         end
 
       :empty ->
