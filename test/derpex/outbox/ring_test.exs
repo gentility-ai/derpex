@@ -49,7 +49,7 @@ defmodule Derpex.Outbox.RingTest do
     assert Ring.take(ring) == {:ok, {:packet, 9_969}}
   end
 
-  test "a held lock makes every producer attempt an immediate counted tail drop" do
+  test "a held lock turns every producer attempt into a counted tail drop" do
     parent = self()
     ring = Ring.new(1, wake_message: :ready, test_hook: holding_hook(parent))
     {holder, holder_monitor} = spawn_monitor(fn -> Ring.enqueue(ring, :first) end)
@@ -57,17 +57,17 @@ defmodule Derpex.Outbox.RingTest do
 
     assert Ring.enqueue(ring, :second) == {:dropped, :contention}
 
-    # A producer that waited on the lock would need at least one millisecond per
-    # attempt; a single attempt costs microseconds even when the lock is held.
-    attempts = 1_000
+    # Every attempt against a lock that is never released gives up inside its
+    # bounded retry budget instead of waiting for the holder, so the contender
+    # finishes all of its attempts while the lock is still held.
+    attempts = 5
 
     {contender, contender_monitor} =
-      spawn_monitor(fn -> send(parent, contend_many(ring, attempts)) end)
+      spawn_monitor(fn -> send(parent, {:attempted, contend_many(ring, attempts)}) end)
 
-    assert_receive {elapsed_microseconds, results}
+    assert_receive {:attempted, results}, 5_000
     assert_receive {:DOWN, ^contender_monitor, :process, ^contender, :normal}
     assert results == %{{:dropped, :contention} => attempts}
-    assert elapsed_microseconds < 500_000
 
     send(holder, :release)
     assert_receive {:DOWN, ^holder_monitor, :process, ^holder, :normal}
@@ -76,14 +76,13 @@ defmodule Derpex.Outbox.RingTest do
     assert Ring.stats(ring).tail_drops == attempts + 1
   end
 
-  # Saturating fan-in is the worst case for a single-attempt lock: most attempts
-  # of eight producers that never pause land on a held lock and become counted
-  # tail drops. What must hold is that nothing is lost silently and no producer
-  # ever waits for the writer.
-  test "concurrent producers never wait and every item is delivered or counted" do
+  # Saturating fan-in is the worst case for a single ring lock: eight producers
+  # that never pause exhaust their retry budgets and take counted tail drops.
+  # What must hold is that nothing is lost silently.
+  test "concurrent producers keep every item delivered or counted" do
     parent = self()
     producer_count = 8
-    per_producer = 500
+    per_producer = 200
     sent = producer_count * per_producer
     consumer = spawn_link(&await_ring/0)
     ring = Ring.new(32, notifier: consumer, wake_message: :ready)
@@ -108,7 +107,7 @@ defmodule Derpex.Outbox.RingTest do
     stats = Ring.stats(ring)
 
     results =
-      Enum.reduce(outcomes, %{}, fn {_elapsed, counts}, tally ->
+      Enum.reduce(outcomes, %{}, fn counts, tally ->
         Map.merge(tally, counts, fn _result, left, right -> left + right end)
       end)
 
@@ -195,10 +194,8 @@ defmodule Derpex.Outbox.RingTest do
   end
 
   defp contend_many(ring, count, index \\ 0) do
-    :timer.tc(fn ->
-      Enum.reduce(1..count, %{}, fn sequence, results ->
-        Map.update(results, Ring.enqueue(ring, {index, sequence}), 1, &(&1 + 1))
-      end)
+    Enum.reduce(1..count, %{}, fn sequence, results ->
+      Map.update(results, Ring.enqueue(ring, {index, sequence}), 1, &(&1 + 1))
     end)
   end
 

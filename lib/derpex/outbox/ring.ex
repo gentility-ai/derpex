@@ -2,10 +2,12 @@ defmodule Derpex.Outbox.Ring do
   @moduledoc """
   Fixed-capacity, non-blocking packet storage for one writer.
 
-  Producers make a single lock attempt and never wait: contention is an
-  immediate, counted tail drop; a full ring replaces its oldest item. Packet
-  references live only in the preallocated ETS slots. The writer receives at
-  most one coalesced atom wakeup and pulls values directly from the ring.
+  A producer that meets a held lock retries for a bounded number of attempts
+  and then tail-drops, counting the drop. It keeps no shared waiting state, so
+  it can be killed mid-attempt without wedging anyone. A full ring replaces its
+  oldest item. Packet references live only in the preallocated ETS slots. The
+  writer receives at most one coalesced atom wakeup and pulls values directly
+  from the ring.
 
   A tiny ETS journal makes interrupted mutations recoverable by the next
   producer or consumer. It contains indices and counters, never the packet.
@@ -21,6 +23,9 @@ defmodule Derpex.Outbox.Ring do
   @tail_drops 5
   @closed 6
   @lock_retries 1_024
+  @producer_yields 32
+  @producer_naps 4
+  @producer_nap_ms 1
 
   defstruct [
     :table,
@@ -292,7 +297,30 @@ defmodule Derpex.Outbox.Ring do
     :atomics.put(ring.state, @head_drops, head_drops)
   end
 
-  defp acquire_producer(ring), do: try_acquire(ring)
+  # Producers hold no shared "waiting" state: every attempt is a plain lock
+  # attempt, so a producer killed between attempts leaves nothing behind for
+  # the next caller. Yields cover the common case, where the holder is running
+  # its few microseconds of ETS work. The bounded naps cover the uncommon one,
+  # where the holder used up its reduction budget inside the critical section
+  # and has to be rescheduled; dropping there would lose a packet the ring has
+  # room for, which the Go relay never does.
+  defp acquire_producer(ring) do
+    case acquire(ring, @producer_yields) do
+      :busy -> acquire_after_nap(ring, @producer_naps)
+      result -> result
+    end
+  end
+
+  defp acquire_after_nap(_ring, 0), do: :busy
+
+  defp acquire_after_nap(ring, naps_left) do
+    Process.sleep(@producer_nap_ms)
+
+    case try_acquire(ring) do
+      :busy -> acquire_after_nap(ring, naps_left - 1)
+      result -> result
+    end
+  end
 
   defp acquire_consumer(ring), do: try_acquire(ring)
 
