@@ -199,6 +199,10 @@ random `DERPEX_OPERATIONS_TOKEN` of at least 16 bytes to enable `GET /metrics`
 and `GET /debug/check`, then send it as `Authorization: Bearer <token>`.
 Metrics use a fixed schema with only protocol-defined finite labels; relay
 identity, organization, peer, and source-IP values are never metric labels.
+Alert on a sustained non-zero rate of `derpex_accept_limiter_untracked_total`:
+it means the per-IP admission table is full, so new sources are sharing one
+overflow bucket instead of getting their own, and per-IP limits are no longer
+enforced individually. Raise `DERPEX_ACCEPT_MAX_TRACKED_IPS` when it fires.
 
 The baseline-compatible `/debug/`, `/debug/vars`, `/debug/varz`,
 `/debug/check`, and live Linux `/debug/traffic` routes permit direct loopback

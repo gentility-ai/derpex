@@ -8,10 +8,17 @@ defmodule Derpex.AcceptLimiter do
 
   The tracking set is a memory bound, not an admission bound. When every
   tracked IP holds a live connection there is nothing to evict, so a new source
-  is admitted *untracked*: it consumes the shared accept token but no per-IP
-  bucket, no per-IP connection slot, and no monitor. Each such admission
-  increments `:ip_untracked`, so the loss of per-IP enforcement is visible in
-  the operational counters rather than turning into a self-inflicted outage.
+  is admitted *untracked* rather than refused outright.
+
+  Untracked mode degrades to a shared bucket, not to nothing. Untracked sources
+  cannot be told apart, so they are pooled: they contend for one overflow token
+  bucket (`overflow_rate`/`overflow_burst`, defaulting to the per-IP rate and
+  burst) and one overflow connection cap (`max_untracked_connections`,
+  defaulting to sixteen times the per-IP connection maximum). Exhausting either
+  denies with `:overflow_limited`. Successful untracked admissions increment
+  `:ip_untracked`, so the loss of *per-IP* resolution is visible in the
+  operational counters without the tracking bound becoming a self-inflicted
+  outage or an unmetered hole.
   """
 
   use GenServer
@@ -20,6 +27,16 @@ defmodule Derpex.AcceptLimiter do
   alias Derpex.RateLimiter
 
   @default_max_tracked_ips 16_384
+  @untracked_connection_factor 16
+
+  @default_settings %{
+    global: nil,
+    per_ip: nil,
+    per_ip_connections: nil,
+    max_tracked_ips: @default_max_tracked_ips,
+    overflow: nil,
+    max_untracked_connections: nil
+  }
 
   @type rate_config :: {number(), pos_integer()}
   @type config :: nil | rate_config() | keyword()
@@ -43,7 +60,11 @@ defmodule Derpex.AcceptLimiter do
   @doc "Claims one pre-authentication connection slot for the calling process."
   @spec claim(GenServer.server() | nil, :inet.ip_address()) ::
           :ok
-          | {:error, :accept_rate_limited | :ip_rate_limited | :ip_connection_limited}
+          | {:error,
+             :accept_rate_limited
+             | :ip_rate_limited
+             | :ip_connection_limited
+             | :overflow_limited}
   def claim(server \\ __MODULE__, source_ip)
 
   def claim(nil, _source_ip), do: :ok
@@ -137,20 +158,27 @@ defmodule Derpex.AcceptLimiter do
     {global_allowed?, global} = allow_bucket(state.global, now)
     state = %{state | global: global}
 
-    with true <- global_allowed? || {:error, :accept_rate_limited},
-         {:ok, entry, state} <- fetch_entry(state, source_ip),
-         {true, entry} <- allow_entry_bucket(entry, now) do
-      if connection_available?(entry, state.per_ip_connections) do
-        {entry, state} = touch_entry(state, source_ip, entry, now)
-        state = maybe_monitor_claim(state, source_ip, pid, entry)
-        {:ok, count(state, :allowed)}
-      else
-        state = put_touched_entry(state, source_ip, entry, now)
-        {{:error, :ip_connection_limited}, count(state, :ip_connection_limited)}
+    if global_allowed? do
+      case fetch_entry(state, source_ip) do
+        {:tracked, entry, state} -> claim_tracked(state, source_ip, pid, entry, now)
+        {:untracked, state} -> claim_untracked(state, pid, now)
       end
     else
-      {:error, reason} ->
-        {{:error, reason}, count(state, reason)}
+      {{:error, :accept_rate_limited}, count(state, :accept_rate_limited)}
+    end
+  end
+
+  defp claim_tracked(state, source_ip, pid, entry, now) do
+    case allow_entry_bucket(entry, now) do
+      {true, entry} ->
+        if connection_available?(entry, state.per_ip_connections) do
+          {entry, state} = touch_entry(state, source_ip, entry, now)
+          state = maybe_monitor_claim(state, source_ip, pid, entry)
+          {:ok, count(state, :allowed)}
+        else
+          state = put_touched_entry(state, source_ip, entry, now)
+          {{:error, :ip_connection_limited}, count(state, :ip_connection_limited)}
+        end
 
       {false, entry} ->
         state = put_touched_entry(state, source_ip, entry, now)
@@ -158,22 +186,59 @@ defmodule Derpex.AcceptLimiter do
     end
   end
 
+  defp claim_untracked(state, pid, now) do
+    with true <- untracked_connection_available?(state),
+         {true, overflow} <- allow_bucket(state.overflow, now) do
+      state =
+        %{state | overflow: overflow}
+        |> monitor_untracked_claim(pid)
+        |> count(:ip_untracked)
+        |> count(:allowed)
+
+      {:ok, state}
+    else
+      false ->
+        {{:error, :overflow_limited}, count(state, :overflow_limited)}
+
+      {false, overflow} ->
+        state = %{state | overflow: overflow}
+        {{:error, :overflow_limited}, count(state, :overflow_limited)}
+    end
+  end
+
+  defp untracked_connection_available?(%{max_untracked_connections: nil}), do: true
+
+  defp untracked_connection_available?(state),
+    do: state.untracked_connections < state.max_untracked_connections
+
+  defp monitor_untracked_claim(%{max_untracked_connections: nil} = state, _pid), do: state
+
+  defp monitor_untracked_claim(state, pid) do
+    reference = Process.monitor(pid)
+
+    %{
+      state
+      | untracked_connections: state.untracked_connections + 1,
+        claims: Map.put(state.claims, pid, %{source_ip: :untracked, monitor: reference})
+    }
+  end
+
   defp fetch_entry(%{per_ip: nil, per_ip_connections: nil} = state, _source_ip),
-    do: {:ok, nil, state}
+    do: {:tracked, nil, state}
 
   defp fetch_entry(state, source_ip) do
     case Map.fetch(state.entries, source_ip) do
       {:ok, entry} ->
-        {:ok, entry, remove_evictable(state, entry)}
+        {:tracked, entry, remove_evictable(state, entry)}
 
       :error ->
         case ensure_tracking_capacity(state) do
           {:ok, state} ->
             entry = %{bucket: new_bucket(state.per_ip), connections: 0, lru_key: nil}
-            {:ok, entry, state}
+            {:tracked, entry, state}
 
           {:untracked, state} ->
-            {:ok, nil, count(state, :ip_untracked)}
+            {:untracked, state}
         end
     end
   end
@@ -241,6 +306,15 @@ defmodule Derpex.AcceptLimiter do
       {nil, _claims} ->
         state
 
+      {%{source_ip: :untracked, monitor: reference}, claims} ->
+        if demonitor?, do: Process.demonitor(reference, [:flush])
+
+        %{
+          state
+          | claims: claims,
+            untracked_connections: max(state.untracked_connections - 1, 0)
+        }
+
       {%{source_ip: source_ip, monitor: reference}, claims} ->
         if demonitor?, do: Process.demonitor(reference, [:flush])
         entry = Map.fetch!(state.entries, source_ip)
@@ -282,13 +356,16 @@ defmodule Derpex.AcceptLimiter do
   defp allow_bucket(bucket), do: allow_bucket(bucket, Clock.monotonic_time(:millisecond))
 
   defp new_state(config) do
-    {global, per_ip, per_ip_connections, max_tracked_ips} = parse_config!(config)
+    settings = parse_config!(config)
 
     %{
-      global: new_bucket(global),
-      per_ip: per_ip,
-      per_ip_connections: per_ip_connections,
-      max_tracked_ips: max_tracked_ips,
+      global: new_bucket(settings.global),
+      per_ip: settings.per_ip,
+      per_ip_connections: settings.per_ip_connections,
+      max_tracked_ips: settings.max_tracked_ips,
+      overflow: new_bucket(settings.overflow),
+      max_untracked_connections: settings.max_untracked_connections,
+      untracked_connections: 0,
       entries: %{},
       evictable: :gb_trees.empty(),
       sequence: 0,
@@ -298,31 +375,57 @@ defmodule Derpex.AcceptLimiter do
         accept_rate_limited: 0,
         ip_rate_limited: 0,
         ip_connection_limited: 0,
-        ip_tracking_limited: 0,
-        ip_untracked: 0
+        ip_untracked: 0,
+        overflow_limited: 0
       }
     }
   end
 
-  defp parse_config!(nil), do: {nil, nil, nil, @default_max_tracked_ips}
+  defp parse_config!(nil), do: @default_settings
 
   defp parse_config!({rate, burst}),
-    do: {validate_rate!({rate, burst}), nil, nil, @default_max_tracked_ips}
+    do: %{@default_settings | global: validate_rate!({rate, burst})}
 
   defp parse_config!(config) when is_list(config) do
-    global = config |> Keyword.get(:global) |> validate_optional_rate!()
     per_ip = config |> Keyword.get(:per_ip) |> validate_optional_rate!()
 
     per_ip_connections =
       positive_or_nil!(Keyword.get(config, :per_ip_connections), :per_ip_connections)
 
-    max_tracked_ips =
-      positive!(Keyword.get(config, :max_tracked_ips, @default_max_tracked_ips), :max_tracked_ips)
-
-    {global, per_ip, per_ip_connections, max_tracked_ips}
+    %{
+      global: config |> Keyword.get(:global) |> validate_optional_rate!(),
+      per_ip: per_ip,
+      per_ip_connections: per_ip_connections,
+      max_tracked_ips:
+        positive!(
+          Keyword.get(config, :max_tracked_ips, @default_max_tracked_ips),
+          :max_tracked_ips
+        ),
+      overflow: parse_overflow!(config, per_ip),
+      max_untracked_connections: parse_untracked_connections!(config, per_ip_connections)
+    }
   end
 
   defp parse_config!(_invalid), do: raise(ArgumentError, "invalid accept limiter configuration")
+
+  defp parse_overflow!(config, per_ip) do
+    {default_rate, default_burst} = per_ip || {nil, nil}
+
+    case {Keyword.get(config, :overflow_rate, default_rate),
+          Keyword.get(config, :overflow_burst, default_burst)} do
+      {nil, nil} -> nil
+      overflow -> validate_rate!(overflow)
+    end
+  end
+
+  defp parse_untracked_connections!(config, per_ip_connections) do
+    default = per_ip_connections && per_ip_connections * @untracked_connection_factor
+
+    positive_or_nil!(
+      Keyword.get(config, :max_untracked_connections, default),
+      :max_untracked_connections
+    )
+  end
 
   defp validate_optional_rate!(nil), do: nil
   defp validate_optional_rate!(config), do: validate_rate!(config)

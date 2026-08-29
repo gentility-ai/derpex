@@ -233,8 +233,8 @@ defmodule Derpex.Operations do
       accept_rate_limited: "derpex_accept_global_rate_limited_total",
       ip_rate_limited: "derpex_accept_ip_rate_limited_total",
       ip_connection_limited: "derpex_accept_ip_connection_limited_total",
-      ip_tracking_limited: "derpex_accept_ip_tracking_limited_total",
       ip_untracked: "derpex_accept_limiter_untracked_total",
+      overflow_limited: "derpex_accept_overflow_limited_total",
       tracked_ips: "derpex_accept_tracked_ips",
       active_connections: "derpex_accept_active_connections",
       max_tracked_ips: "derpex_accept_max_tracked_ips"

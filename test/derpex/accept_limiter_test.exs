@@ -51,9 +51,9 @@ defmodule Derpex.AcceptLimiterTest do
              allowed: 3,
              ip_connection_limited: 0,
              ip_rate_limited: 1,
-             ip_tracking_limited: 0,
              ip_untracked: 0,
              max_tracked_ips: 2,
+             overflow_limited: 0,
              tracked_ips: 2
            }
   end
@@ -76,10 +76,90 @@ defmodule Derpex.AcceptLimiterTest do
     stats = AcceptLimiter.stats(limiter)
     assert stats.allowed == 3
     assert stats.ip_untracked == 1
-    assert stats.ip_tracking_limited == 0
+    assert stats.overflow_limited == 0
     assert stats.tracked_ips == 2
 
     Enum.each([first, second, third], &send(&1, :release))
+  end
+
+  test "denies untracked sources once the shared overflow bucket is empty" do
+    limiter =
+      start_supervised!(
+        {AcceptLimiter,
+         name: nil, config: [per_ip: {0, 1}, per_ip_connections: 1, max_tracked_ips: 1]}
+      )
+
+    tracked = start_claimant(limiter, {203, 0, 113, 10})
+    assert_receive {:claim_result, ^tracked, :ok}
+
+    first_untracked = start_claimant(limiter, {203, 0, 113, 11})
+    assert_receive {:claim_result, ^first_untracked, :ok}
+
+    second_untracked = start_claimant(limiter, {203, 0, 113, 12})
+    assert_receive {:claim_result, ^second_untracked, {:error, :overflow_limited}}
+
+    stats = AcceptLimiter.stats(limiter)
+    assert stats.allowed == 2
+    assert stats.ip_untracked == 1
+    assert stats.overflow_limited == 1
+
+    Enum.each([tracked, first_untracked, second_untracked], &send(&1, :stop))
+  end
+
+  test "denies untracked sources once the shared overflow connection cap is reached" do
+    limiter =
+      start_supervised!(
+        {AcceptLimiter,
+         name: nil,
+         config: [per_ip_connections: 1, max_tracked_ips: 1, max_untracked_connections: 1]}
+      )
+
+    tracked = start_claimant(limiter, {198, 51, 100, 10})
+    assert_receive {:claim_result, ^tracked, :ok}
+
+    untracked = start_claimant(limiter, {198, 51, 100, 11})
+    assert_receive {:claim_result, ^untracked, :ok}
+
+    rejected = start_claimant(limiter, {198, 51, 100, 12})
+    assert_receive {:claim_result, ^rejected, {:error, :overflow_limited}}
+
+    stats = AcceptLimiter.stats(limiter)
+    assert stats.ip_untracked == 1
+    assert stats.overflow_limited == 1
+    assert stats.active_connections == 2
+
+    # Releasing the shared untracked slot readmits the next untracked source.
+    send(untracked, :release)
+    eventually(fn -> AcceptLimiter.stats(limiter).active_connections == 1 end)
+
+    readmitted = start_claimant(limiter, {198, 51, 100, 13})
+    assert_receive {:claim_result, ^readmitted, :ok}
+
+    Enum.each([tracked, readmitted], &send(&1, :release))
+  end
+
+  test "defaults the untracked connection cap to sixteen times the per-IP maximum" do
+    limiter =
+      start_supervised!(
+        {AcceptLimiter, name: nil, config: [per_ip_connections: 2, max_tracked_ips: 1]}
+      )
+
+    tracked = start_claimant(limiter, {192, 0, 2, 20})
+    assert_receive {:claim_result, ^tracked, :ok}
+
+    admitted =
+      Enum.map(1..32, fn index ->
+        claimant = start_claimant(limiter, {192, 0, 2, 100 + index})
+        assert_receive {:claim_result, ^claimant, :ok}
+        claimant
+      end)
+
+    rejected = start_claimant(limiter, {192, 0, 2, 200})
+    assert_receive {:claim_result, ^rejected, {:error, :overflow_limited}}
+
+    assert AcceptLimiter.stats(limiter).ip_untracked == 32
+
+    Enum.each([tracked | admitted], &send(&1, :stop))
   end
 
   test "caps concurrent connections and repairs slots after abrupt exits" do
@@ -102,8 +182,9 @@ defmodule Derpex.AcceptLimiterTest do
     overflow = start_claimant(limiter, {192, 0, 2, 12})
     assert_receive {:claim_result, ^overflow, :ok}
     assert AcceptLimiter.stats(limiter).ip_untracked == 1
-    assert AcceptLimiter.stats(limiter).active_connections == 2
+    assert AcceptLimiter.stats(limiter).active_connections == 3
     send(overflow, :stop)
+    eventually(fn -> AcceptLimiter.stats(limiter).active_connections == 2 end)
 
     Process.exit(first, :kill)
     eventually(fn -> AcceptLimiter.stats(limiter).active_connections == 1 end)

@@ -153,7 +153,7 @@ defmodule Derpex.Listener.Handler do
              :accept_rate_limited,
              :ip_rate_limited,
              :ip_connection_limited,
-             :ip_tracking_limited
+             :overflow_limited
            ] ->
         :ok = AcceptLimiter.release(accept_limiter)
         {:close, %{session: nil, timers: %{}, event_handler: event_handler}}
