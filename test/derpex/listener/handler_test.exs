@@ -425,6 +425,155 @@ defmodule Derpex.Listener.HandlerTest do
     :gen_tcp.close(socket)
   end
 
+  test "a paced WebSocket connection is paced, not crashed" do
+    start_supervised!({Manual, monotonic_time: 0})
+    previous_clock = Application.fetch_env!(:derpex, :clock)
+    Application.put_env(:derpex, :clock, Manual)
+    on_exit(fn -> Application.put_env(:derpex, :clock, previous_clock) end)
+
+    rate_controller =
+      start_supervised!(
+        {RateController,
+         name: nil,
+         config: %RateConfig{
+           per_client_rate_limit_bytes_per_second: 1,
+           per_client_rate_burst_bytes: RateConfig.minimum_burst()
+         }}
+      )
+
+    {server_public, server_private} = Crypto.generate_keypair()
+    {_client_public, client_private} = Crypto.generate_keypair()
+    destination = :crypto.strong_rand_bytes(32)
+    payload = :binary.copy(<<0xA5>>, 65_536)
+    parent = self()
+
+    event_handler = fn event ->
+      send(parent, {:handler_event, self(), event})
+      :ok
+    end
+
+    {:ok, server} =
+      ThousandIsland.start_link(
+        port: 0,
+        transport_options: [ip: {127, 0, 0, 1}],
+        num_acceptors: 1,
+        handler_module: Handler,
+        handler_options: [
+          server_private_key: Secret.wrap(server_private),
+          server_public_key: server_public,
+          event_handler: event_handler,
+          rate_controller: rate_controller
+        ]
+      )
+
+    stop_server_on_exit(server)
+    {:ok, {_ip, port}} = ThousandIsland.listener_info(server)
+    socket = connect_websocket(port, server_public, client_private)
+    assert_receive {:handler_event, handler, {:authenticated, _key, %ClientInfo{}}}, 2_000
+    monitor = Process.monitor(handler)
+
+    packet = IO.iodata_to_binary(Frame.encode(:send_packet, [destination, payload]))
+    :ok = :gen_tcp.send(socket, websocket_client_frame(packet))
+
+    assert_receive {:handler_event, ^handler,
+                    {:client_message, {:send_packet, ^destination, ^payload}}},
+                   2_000
+
+    # The second message is the one that pauses: it is a rate-limit decision
+    # the WebSocket path used to have no branch for, and the connection died of
+    # a CaseClauseError instead of waiting.
+    :ok = :gen_tcp.send(socket, websocket_client_frame(packet))
+    assert_eventually(fn -> Manual.pending_timer_count() == 2 end)
+    refute_received {:DOWN, ^monitor, :process, ^handler, _reason}
+
+    # Paced, and still answering: a drain close closes it without the clock
+    # ever reaching the pace deadline.
+    send(handler, {:derpex_drain_close, make_ref()})
+    assert_receive {:DOWN, ^monitor, :process, ^handler, _reason}, 100
+    :gen_tcp.close(socket)
+  end
+
+  defp connect_websocket(port, server_public, client_private) do
+    {:ok, socket} = :gen_tcp.connect({127, 0, 0, 1}, port, [:binary, active: false])
+    key = Base.encode64(:crypto.strong_rand_bytes(16))
+
+    request =
+      "GET /derp HTTP/1.1\r\nHost: localhost\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n" <>
+        "Sec-WebSocket-Version: 13\r\nSec-WebSocket-Key: #{key}\r\n" <>
+        "Sec-WebSocket-Protocol: derp\r\n\r\n"
+
+    :ok = :gen_tcp.send(socket, request)
+    :ok = read_until_blank_line(socket)
+
+    {:ok, :server_key, greeting} = recv_websocket_frame(socket)
+    {:ok, ^server_public} = Handshake.decode_server_key(greeting)
+
+    info = %ClientInfo{version: 2, can_ack_pings: true, app_name: "ws-pacing"}
+    {:ok, client_info} = Handshake.client_info_frame(client_private, server_public, info)
+    :ok = :gen_tcp.send(socket, websocket_client_frame(IO.iodata_to_binary(client_info)))
+    {:ok, :server_info, _payload} = recv_websocket_frame(socket)
+    socket
+  end
+
+  defp read_until_blank_line(socket, seen \\ "") do
+    {:ok, data} = :gen_tcp.recv(socket, 0, 2_000)
+    seen = seen <> data
+
+    if String.contains?(seen, "\r\n\r\n") do
+      [_headers, rest] = String.split(seen, "\r\n\r\n", parts: 2)
+      Process.put({:ws_buffer, socket}, rest)
+      :ok
+    else
+      read_until_blank_line(socket, seen)
+    end
+  end
+
+  defp recv_websocket_frame(socket) do
+    <<0x82, first>> = read_exactly(socket, 2)
+
+    length =
+      case first do
+        126 -> :binary.decode_unsigned(read_exactly(socket, 2))
+        127 -> :binary.decode_unsigned(read_exactly(socket, 8))
+        length -> length
+      end
+
+    <<type, frame_length::unsigned-big-32, payload::binary-size(frame_length)>> =
+      read_exactly(socket, length)
+
+    {:ok, name} = Frame.type_name(type)
+    {:ok, name, payload}
+  end
+
+  defp read_exactly(socket, length) do
+    buffered = Process.get({:ws_buffer, socket}, "")
+
+    if byte_size(buffered) >= length do
+      <<wanted::binary-size(^length), rest::binary>> = buffered
+      Process.put({:ws_buffer, socket}, rest)
+      wanted
+    else
+      {:ok, data} = :gen_tcp.recv(socket, 0, 2_000)
+      Process.put({:ws_buffer, socket}, buffered <> data)
+      read_exactly(socket, length)
+    end
+  end
+
+  defp websocket_client_frame(payload) do
+    mask = :crypto.strong_rand_bytes(4)
+    length = byte_size(payload)
+
+    header =
+      cond do
+        length < 126 -> <<1::1, 0::3, 0x2::4, 1::1, length::7>>
+        length <= 65_535 -> <<1::1, 0::3, 0x2::4, 1::1, 126::7, length::unsigned-big-16>>
+        true -> <<1::1, 0::3, 0x2::4, 1::1, 127::7, length::unsigned-big-64>>
+      end
+
+    repeated = :binary.copy(mask, div(length + 3, 4))
+    header <> mask <> :crypto.exor(binary_part(repeated, 0, length), payload)
+  end
+
   test "accept limiting closes excess sockets before HTTP session allocation" do
     limiter = start_supervised!({AcceptLimiter, name: nil, config: {0, 1}})
     {server_public, server_private} = Crypto.generate_keypair()
