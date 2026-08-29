@@ -5,9 +5,13 @@ defmodule Derpex.Listener.Handler do
 
   require Logger
 
-  # What a paced connection may hold while it waits: one segment's worth, not a
-  # client's entire send buffer.
-  @paced_read_limit 64 * 1_024
+  # A backstop, not a policy. A paced connection is kept passive, so what it can
+  # hold is the delivery already in flight when the pause took effect; the cap
+  # is well above that and above the largest frame the server accepts, so
+  # reaching it means something is putting bytes into this process that the
+  # socket was told to stop sending. It is counted as such and never reached by
+  # a client that is merely fast.
+  @paced_read_limit 256 * 1_024
 
   alias Derpex.AcceptLimiter
   alias Derpex.Admission
@@ -182,20 +186,15 @@ defmodule Derpex.Listener.Handler do
     end
   end
 
-  # Thousand Island re-arms the socket on its way out of every handle_data, so a
-  # paced connection is handed one more segment per cycle however passive we
-  # make it in between. That is fine while it is one segment; it is not fine
-  # unbounded, so what a paced connection may hold is capped, and a client that
-  # keeps sending past the cap is closed rather than buffered.
+  # A paced connection reads nothing: the bytes stay in the kernel receive
+  # buffer, which is the backpressure Go's read loop gets from blocking on its
+  # own rate limiter. What arrives here is what was already in flight, and it is
+  # held rather than dropped because the stream cannot skip a frame.
   @impl ThousandIsland.Handler
-  def handle_data(data, _socket, %{paced: paced} = state) when paced != nil do
-    buffered = state.paced_data <> data
-
-    if byte_size(buffered) > @paced_read_limit do
-      :ok = Metrics.add(state.metrics, :paced_read_overruns, 1)
-      {:error, {:paced_read_overrun, byte_size(buffered)}, state}
-    else
-      {:continue, %{state | paced_data: buffered}, {:continue, :derpex_pause_reads}}
+  def handle_data(data, socket, %{paced: paced} = state) when paced != nil do
+    case buffer_paced(state, data) do
+      {:ok, state} -> pause_reads(socket, state)
+      {:error, reason, state} -> {:error, reason, state}
     end
   end
 
@@ -205,7 +204,7 @@ defmodule Derpex.Listener.Handler do
         {:continue, state}
 
       {:pace, delay, state, actions, events} ->
-        {:continue, pace(state, delay, actions, events), {:continue, :derpex_pause_reads}}
+        pause_reads(socket, pace(state, delay, actions, events))
 
       {:close, state} ->
         {:close, state}
@@ -362,8 +361,7 @@ defmodule Derpex.Listener.Handler do
         {:continue, state}
 
       {:pace, delay, state, pending_actions, pending_events} ->
-        {:continue, pace(state, delay, pending_actions, pending_events),
-         {:continue, :derpex_pause_reads}}
+        pause_reads(socket, pace(state, delay, pending_actions, pending_events))
 
       {:error, reason, state} ->
         close_or_error(reason, state)
@@ -396,10 +394,51 @@ defmodule Derpex.Listener.Handler do
     end
   end
 
+  # Thousand Island re-arms the socket on its way out of every handle_data, so
+  # the socket is made passive twice: once here, before returning, and once in
+  # the continuation that runs after the re-arm. The re-arm can still have
+  # delivered one message, and that message is taken here rather than left in
+  # the mailbox, because handling it as a read would return through Thousand
+  # Island again and re-arm again, and the cycle would pull the client's whole
+  # send buffer into this process one delivery at a time.
+  defp pause_reads(socket, state) do
+    _ignored = ThousandIsland.Socket.setopts(socket, active: false)
+    {:continue, state, {:continue, :derpex_pause_reads}}
+  end
+
   @impl GenServer
   def handle_continue(:derpex_pause_reads, {socket, state}) do
     _ignored = ThousandIsland.Socket.setopts(socket, active: false)
-    {:noreply, {socket, state}}
+
+    case take_delivered_reads(socket, state) do
+      {:ok, state} -> {:noreply, {socket, state}}
+      {:error, reason, state} -> {:stop, reason, {socket, state}}
+    end
+  end
+
+  defp take_delivered_reads(socket, state) do
+    raw_socket = socket.socket
+
+    receive do
+      {message, ^raw_socket, data} when message in [:tcp, :ssl] ->
+        with {:ok, state} <- buffer_paced(state, data),
+             do: take_delivered_reads(socket, state)
+    after
+      0 -> {:ok, state}
+    end
+  end
+
+  # The cap is a backstop against bytes arriving at a socket that was told to
+  # stop sending them, not a limit on how fast a client may talk.
+  defp buffer_paced(state, data) do
+    buffered = state.paced_data <> data
+
+    if byte_size(buffered) > @paced_read_limit do
+      :ok = Metrics.add(state.metrics, :paced_read_overruns, 1)
+      {:error, {:paced_read_overrun, byte_size(buffered)}, state}
+    else
+      {:ok, %{state | paced_data: buffered}}
+    end
   end
 
   # Finishing the paced frame can pace again on the next one, and both the

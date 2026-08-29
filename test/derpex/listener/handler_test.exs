@@ -501,13 +501,98 @@ defmodule Derpex.Listener.HandlerTest do
            "a paced handler held #{div(peak, 1_024)} KiB of binaries"
 
     # Whatever Thousand Island hands over while the socket is meant to be
-    # passive, the handler holds at most the cap.
+    # passive, the handler holds one delivery of it, not a delivery per cycle.
+    # The 256 KiB backstop is far above this; reaching it would mean the socket
+    # kept sending after it was told to stop.
     {_socket, paced_state} = :sys.get_state(handler)
-    assert byte_size(paced_state.paced_data) <= 64 * 1_024
+    assert byte_size(paced_state.paced_data) <= 128 * 1_024
     assert Process.alive?(handler)
     refute_received {:DOWN, ^monitor, :process, ^handler, _reason}
 
     :gen_tcp.close(socket)
+  end
+
+  # Go's read loop waits on its rate limiter and lets the kernel receive buffer
+  # slow the client down; it never disconnects a client for reading too fast.
+  # A paced read cap smaller than one frame the server itself accepts made the
+  # relay do exactly that: a client sending maximum-size packets — nothing
+  # malformed, nothing oversized — was closed with a paced-read overrun.
+  test "a client that outruns its byte rate is throttled rather than closed" do
+    scenarios = [
+      # A maximum-size packet is 65,573 bytes on the wire, larger than a 64 KiB
+      # cap on its own, and its rate allows exactly one of them per second.
+      {65_536, 65_568, 6},
+      # Nothing about the fault needs large frames: ordinary 1280-byte packets
+      # at 100 KB/s pace once the burst is spent, and then buffer just the same.
+      {1_280, 100_000, 400},
+      # The extreme: a rate no packet can be paid for inside the test.
+      {65_536, 1, 3}
+    ]
+
+    Enum.each(scenarios, &assert_throttled_not_closed/1)
+  end
+
+  defp assert_throttled_not_closed({payload_size, rate, frames}) do
+    rate_controller =
+      start_supervised!(
+        {RateController,
+         name: nil,
+         config: %RateConfig{
+           per_client_rate_limit_bytes_per_second: rate,
+           per_client_rate_burst_bytes: RateConfig.minimum_burst()
+         }},
+        id: {:rate_controller, payload_size, rate}
+      )
+
+    {server_public, server_private} = Crypto.generate_keypair()
+    {client_public, client_private} = Crypto.generate_keypair()
+    parent = self()
+
+    event_handler = fn event ->
+      send(parent, {:handler_event, self(), event})
+      :ok
+    end
+
+    {:ok, server} =
+      ThousandIsland.start_link(
+        port: 0,
+        transport_options: [ip: {127, 0, 0, 1}],
+        num_acceptors: 1,
+        handler_module: Handler,
+        handler_options: [
+          server_private_key: Secret.wrap(server_private),
+          server_public_key: server_public,
+          event_handler: event_handler,
+          rate_controller: rate_controller
+        ]
+      )
+
+    stop_server_on_exit(server)
+    {:ok, {_ip, port}} = ThousandIsland.listener_info(server)
+    socket = connect_and_send_info(port, server_public, client_private, %ClientInfo{version: 2})
+    assert_receive {:handler_event, handler, {:authenticated, ^client_public, _info}}, 2_000
+    monitor = Process.monitor(handler)
+
+    # A send that times out is the backpressure working: the server is meant to
+    # stop reading, not to stop the connection.
+    :ok = :inet.setopts(socket, send_timeout: 200)
+    destination = :crypto.strong_rand_bytes(32)
+    payload = :binary.copy(<<0xA5>>, payload_size)
+    frame = IO.iodata_to_binary(Frame.encode(:send_packet, [destination, payload]))
+    send_until_refused(socket, frame, frames)
+
+    refute_receive {:DOWN, ^monitor, :process, ^handler, _reason}, 1_000
+    assert Process.alive?(handler)
+    :gen_tcp.close(socket)
+  end
+
+  defp send_until_refused(_socket, _frame, 0), do: :ok
+
+  defp send_until_refused(socket, frame, remaining) do
+    case :gen_tcp.send(socket, frame) do
+      :ok -> send_until_refused(socket, frame, remaining - 1)
+      {:error, _blocked_or_closed} -> :ok
+    end
   end
 
   defp flood_paced(_socket, _junk, 0, peak, _handler), do: peak
