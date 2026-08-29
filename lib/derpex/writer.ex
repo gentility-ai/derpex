@@ -12,6 +12,8 @@ defmodule Derpex.Writer do
   alias Derpex.Cardinality
   alias Derpex.Frame.Body
   alias Derpex.Metrics
+  alias Derpex.Outbox
+  alias Derpex.Outbox.LifecycleQueue
   alias Derpex.Outbox.Ring
   alias Derpex.Router
   alias Derpex.SocketOptions
@@ -27,7 +29,7 @@ defmodule Derpex.Writer do
           ordinary: Ring.t(),
           disco: Ring.t(),
           pong: Ring.t(),
-          lifecycle: Ring.t()
+          lifecycle: Ring.t() | LifecycleQueue.t()
         }
 
   @doc false
@@ -209,7 +211,7 @@ defmodule Derpex.Writer do
   # picking the oldest head instead would drain a full ordinary ring before a
   # pong that arrived after it.
   defp take_next(state) do
-    case Ring.take_with_age(state.rings.lifecycle) do
+    case Outbox.take_with_age(state.rings.lifecycle) do
       :empty -> take_packet(state)
       result -> {result, state}
     end

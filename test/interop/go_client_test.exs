@@ -435,6 +435,8 @@ defmodule Derpex.Interop.GoClientTest do
 
     assert output =~
              "official Go mesh watcher observed snapshot, app names, flags, and disconnects"
+
+    assert output =~ "official Go mesh watchers each saw all 100 clients"
   end
 
   test "official mesh client forwards asserted sources and closes duplicate peers" do

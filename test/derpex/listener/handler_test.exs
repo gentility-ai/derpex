@@ -11,6 +11,7 @@ defmodule Derpex.Listener.HandlerTest do
   alias Derpex.Handshake
   alias Derpex.Listener.Handler
   alias Derpex.Metrics
+  alias Derpex.Outbox.LifecycleQueue
   alias Derpex.Outbox.Ring
   alias Derpex.RateConfig
   alias Derpex.RateController
@@ -630,7 +631,9 @@ defmodule Derpex.Listener.HandlerTest do
     {_thousand_island_socket, state} = :sys.get_state(handler)
     assert Ring.stats(state.ordinary).capacity == 64
     assert Ring.stats(state.disco).capacity == 64
-    assert Ring.stats(state.lifecycle).capacity == 32
+    # Lifecycle frames are state changes, so their queue grows instead of
+    # replacing: it has a soft cap, not a capacity.
+    assert LifecycleQueue.stats(state.lifecycle).soft_cap == 65_536
     assert Ring.stats(state.pong).capacity == 1
     :gen_tcp.close(socket)
   end

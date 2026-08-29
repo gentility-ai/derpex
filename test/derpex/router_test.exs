@@ -2,6 +2,7 @@ defmodule Derpex.RouterTest do
   use ExUnit.Case, async: false
 
   alias Derpex.Metrics
+  alias Derpex.Outbox.LifecycleQueue
   alias Derpex.Outbox.Ring
   alias Derpex.Router
   alias Derpex.Router.ReversePaths
@@ -576,6 +577,33 @@ defmodule Derpex.RouterTest do
     Process.exit(first_connection, :kill)
     Process.exit(second_connection, :kill)
     Process.exit(watcher, :kill)
+  end
+
+  test "a stalled watcher still learns about every peer that arrived" do
+    watcher = spawn(fn -> Process.sleep(:infinity) end)
+    lifecycle = LifecycleQueue.new(notifier: watcher, owner: watcher)
+    peers = for _index <- 1..100, do: :crypto.strong_rand_bytes(32)
+
+    on_exit(fn ->
+      Enum.each(peers, &Router.unregister(&1, watcher))
+      Process.exit(watcher, :kill)
+    end)
+
+    assert Router.watch(watcher, lifecycle) == :ok
+
+    # The watcher's writer never drains while the region fills up. A fixed ring
+    # would have kept the last thirty-two arrivals and quietly lost the rest.
+    Enum.each(peers, fn peer ->
+      assert Router.register(peer, watcher, Ring.new(1), Ring.new(1), lifecycle) == :ok
+    end)
+
+    present =
+      Stream.repeatedly(fn -> LifecycleQueue.take(lifecycle) end)
+      |> Enum.take_while(&match?({:ok, {:peer_present, _key, _ip, _port, _flags, _app}}, &1))
+      |> Enum.map(fn {:ok, {:peer_present, key, _ip, _port, _flags, _app}} -> key end)
+
+    assert length(present) == 100
+    assert Enum.sort(present) == Enum.sort(peers)
   end
 
   test "a packet for a torn-down destination counts as a disconnect drop" do

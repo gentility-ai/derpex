@@ -102,6 +102,13 @@ so they are not implemented by accident:
   payload is under 200 bytes and the frame is read before the peer is
   authenticated. A conforming client is never affected; an oversize frame is
   closed at its header instead of after its body.
+- Go keeps a client's pending presence changes in `sclient.peerStateChange`, a
+  slice with no cap, so a watcher that stops reading grows the relay's memory
+  without limit. DERPEX keeps the same unbounded queue but adds a soft cap of
+  65,536 frames, beyond which that watcher's connection is closed with a logged
+  reason and a counted `derp_lifecycle_queue_overflows`. A watcher that far
+  behind would be served a view of the past even if it caught up; a mesh peer
+  reconnects and takes a fresh snapshot. See ADR 0003.
 - Go's `sawSrc` set records, per connection, which sources it has relayed a
   packet from, so a `peerGone` is owed only once. It never forgets a source,
   which it can afford because the set dies with the connection. DERPEX forgets

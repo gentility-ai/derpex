@@ -3,6 +3,8 @@ defmodule Derpex.Listener.Handler do
 
   use ThousandIsland.Handler
 
+  require Logger
+
   alias Derpex.AcceptLimiter
   alias Derpex.Admission
   alias Derpex.Admission.Request, as: AdmissionRequest
@@ -12,6 +14,10 @@ defmodule Derpex.Listener.Handler do
   alias Derpex.Disco
   alias Derpex.Drain
   alias Derpex.Metrics
+  require Derpex.Outbox
+
+  alias Derpex.Outbox
+  alias Derpex.Outbox.LifecycleQueue
   alias Derpex.Outbox.Ring
   alias Derpex.RateConfig
   alias Derpex.RateController
@@ -85,7 +91,12 @@ defmodule Derpex.Listener.Handler do
          pong =
            Ring.new(1, notifier: writer, wake_message: Writer.wake_message()),
          lifecycle =
-           Ring.new(32, notifier: writer, wake_message: Writer.wake_message()),
+           LifecycleQueue.new(
+             notifier: writer,
+             owner: self(),
+             wake_message: Writer.wake_message(),
+             metrics: metrics
+           ),
          :ok <-
            Writer.attach(writer, %{
              ordinary: ordinary,
@@ -221,6 +232,17 @@ defmodule Derpex.Listener.Handler do
 
   def handle_info({:derpex_rate_limit_ready, _stale_token}, {socket, state}) do
     {:noreply, {socket, state}}
+  end
+
+  # A watcher this far behind is not going to catch up, and its queue is the
+  # only thing keeping those frames alive. See ADR 0003.
+  def handle_info({:derpex_lifecycle_overflow, size}, {socket, state}) do
+    Logger.warning(
+      "closing watcher connection at #{format_remote_address(state.remote_address)}: " <>
+        "its lifecycle queue reached #{size} frames"
+    )
+
+    {:stop, {:shutdown, :lifecycle_overflow}, {socket, state}}
   end
 
   def handle_info({:derpex_drain_close, _token}, {socket, state}) do
@@ -510,7 +532,7 @@ defmodule Derpex.Listener.Handler do
   end
 
   defp execute_action(_socket, state, {:server_message, message}) do
-    _enqueue_result = Ring.enqueue(state.lifecycle, message)
+    _enqueue_result = Outbox.enqueue(state.lifecycle, message)
     {:ok, state}
   end
 
@@ -659,7 +681,7 @@ defmodule Derpex.Listener.Handler do
       state = %{state | peer_gone_limiter: limiter}
 
       if allowed? do
-        _enqueue_result = Ring.enqueue(state.lifecycle, {:peer_gone, destination, 0x01})
+        _enqueue_result = Outbox.enqueue(state.lifecycle, {:peer_gone, destination, 0x01})
       end
 
       {:ok, state}
@@ -732,8 +754,8 @@ defmodule Derpex.Listener.Handler do
 
   defp cleanup(_pre_connection_options), do: :ok
 
-  defp close_ring(%Ring{} = ring) do
-    _result = Ring.close(ring)
+  defp close_ring(outbox) when Outbox.is_outbox(outbox) do
+    _result = Outbox.close(outbox)
     :ok
   rescue
     ArgumentError -> :ok

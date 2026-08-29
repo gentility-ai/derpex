@@ -18,6 +18,7 @@ defmodule Derpex.Outbox.Ring do
 
   alias Derpex.Clock
   alias Derpex.Metrics
+  alias Derpex.Outbox.Lock
 
   @head 1
   @size 2
@@ -25,10 +26,6 @@ defmodule Derpex.Outbox.Ring do
   @head_drops 4
   @tail_drops 5
   @closed 6
-  @lock_retries 1_024
-  @producer_yields 4
-  @producer_nap_ms 1
-  @acquire_budget_microseconds 4_000
 
   defstruct [
     :table,
@@ -104,14 +101,14 @@ defmodule Derpex.Outbox.Ring do
     # queue timestamp is taken before the lock rather than inside it.
     enqueued_at = Clock.monotonic_time(:microsecond)
 
-    case acquire_producer(ring, wait?) do
+    case Lock.acquire_producer(ring.table, wait?, ring.metrics) do
       {:ok, lock_token} ->
         {result, pending_drop} =
           try do
             recover(ring)
             enqueue_locked(ring, item, enqueued_at, lock_token)
           after
-            release(ring, lock_token)
+            Lock.release(ring.table, lock_token)
           end
 
         record_pending_drop(ring, pending_drop)
@@ -139,14 +136,14 @@ defmodule Derpex.Outbox.Ring do
   @doc "Takes the next item with its non-negative queue residence time."
   @spec take_with_age(t()) :: {:ok, term(), non_neg_integer()} | :empty | :closed | :busy
   def take_with_age(%__MODULE__{} = ring) do
-    case acquire_consumer(ring) do
+    case Lock.acquire_consumer(ring.table) do
       {:ok, lock_token} ->
         taken =
           try do
             recover(ring)
             take_locked(ring, lock_token)
           after
-            release(ring, lock_token)
+            Lock.release(ring.table, lock_token)
           end
 
         with {:ok, item, enqueued_at} <- taken do
@@ -165,7 +162,7 @@ defmodule Derpex.Outbox.Ring do
   @doc "Closes the ring and releases every retained item. Idempotent."
   @spec close(t()) :: :ok | :busy
   def close(%__MODULE__{} = ring) do
-    case acquire(ring) do
+    case Lock.acquire(ring.table) do
       {:ok, lock_token} ->
         try do
           recover(ring)
@@ -177,7 +174,7 @@ defmodule Derpex.Outbox.Ring do
           :ets.delete(ring.table, :journal)
           :ok
         after
-          release(ring, lock_token)
+          Lock.release(ring.table, lock_token)
         end
 
       :busy ->
@@ -188,7 +185,7 @@ defmodule Derpex.Outbox.Ring do
   @doc "Returns consistent queue and drop counters, or `:busy` under mutation."
   @spec stats(t()) :: map() | :busy
   def stats(%__MODULE__{} = ring) do
-    case acquire(ring) do
+    case Lock.acquire(ring.table) do
       {:ok, lock_token} ->
         try do
           recover(ring)
@@ -203,7 +200,7 @@ defmodule Derpex.Outbox.Ring do
             packet_slots: packet_slot_count(ring)
           }
         after
-          release(ring, lock_token)
+          Lock.release(ring.table, lock_token)
         end
 
       :busy ->
@@ -361,117 +358,6 @@ defmodule Derpex.Outbox.Ring do
     :atomics.put(ring.state, @size, size)
     :atomics.put(ring.state, @head_drops, head_drops)
   end
-
-  # Producers hold no shared "waiting" state: every attempt is a plain lock
-  # attempt, so a producer killed between attempts leaves nothing behind for
-  # the next caller. Yields cover the common case, where the holder is running
-  # its few microseconds of ETS work. The naps cover the uncommon one, where the
-  # holder used up its reduction budget inside the critical section and has to
-  # be rescheduled; dropping there would lose a packet the ring has room for,
-  # which the Go relay never does. A yield takes microseconds on an idle node
-  # and tens of milliseconds behind a long run queue, so the wall clock, not the
-  # attempt count, is what bounds the wait.
-  defp acquire_producer(ring, wait?) do
-    acquire_producer(ring, @producer_yields, wait?, budget_deadline())
-  end
-
-  defp acquire_producer(ring, yields_left, wait?, deadline) when yields_left > 0 do
-    case try_acquire(ring) do
-      :busy ->
-        :erlang.yield()
-
-        if expired?(deadline),
-          do: :busy,
-          else: acquire_producer(ring, yields_left - 1, wait?, deadline)
-
-      result ->
-        result
-    end
-  end
-
-  # A caller that will not nap still makes the reclaiming attempt, so a lock
-  # left by a dead producer cannot outlive it.
-  defp acquire_producer(ring, 0, false, _deadline), do: try_acquire_or_reclaim(ring)
-
-  defp acquire_producer(ring, 0, true, deadline) do
-    case try_acquire_or_reclaim(ring) do
-      :busy ->
-        if nap_fits?(deadline) do
-          Metrics.add(ring.metrics, :ring_producer_naps, 1)
-          Process.sleep(@producer_nap_ms)
-          acquire_producer(ring, 0, true, deadline)
-        else
-          :busy
-        end
-
-      result ->
-        result
-    end
-  end
-
-  defp acquire_consumer(ring), do: try_acquire_or_reclaim(ring)
-
-  defp acquire(ring), do: acquire(ring, @lock_retries, budget_deadline())
-
-  defp acquire(ring, retries_left, deadline) do
-    case try_acquire_or_reclaim(ring) do
-      :busy when retries_left > 0 ->
-        :erlang.yield()
-
-        if expired?(deadline), do: :busy, else: acquire(ring, retries_left - 1, deadline)
-
-      result ->
-        result
-    end
-  end
-
-  defp budget_deadline do
-    :erlang.monotonic_time(:microsecond) + @acquire_budget_microseconds
-  end
-
-  defp expired?(deadline), do: :erlang.monotonic_time(:microsecond) >= deadline
-
-  defp nap_fits?(deadline) do
-    :erlang.monotonic_time(:microsecond) + @producer_nap_ms * 1_000 <= deadline
-  end
-
-  # The stale-owner check costs a lookup and a liveness call, which is waste on
-  # the common path where the owner is alive and about to release.
-  defp try_acquire(ring) do
-    token = unique_token()
-    if :ets.insert_new(ring.table, {:lock, token, self()}), do: {:ok, token}, else: :busy
-  end
-
-  defp try_acquire_or_reclaim(ring) do
-    token = unique_token()
-
-    if :ets.insert_new(ring.table, {:lock, token, self()}) do
-      {:ok, token}
-    else
-      reclaim_stale_lock(ring, token)
-    end
-  end
-
-  defp reclaim_stale_lock(ring, token) do
-    case :ets.lookup(ring.table, :lock) do
-      [{:lock, old_token, owner}] ->
-        if Process.alive?(owner) do
-          :busy
-        else
-          :ets.delete_object(ring.table, {:lock, old_token, owner})
-          try_insert_lock(ring, token)
-        end
-
-      [] ->
-        try_insert_lock(ring, token)
-    end
-  end
-
-  defp try_insert_lock(ring, token) do
-    if :ets.insert_new(ring.table, {:lock, token, self()}), do: {:ok, token}, else: :busy
-  end
-
-  defp release(ring, token), do: :ets.delete_object(ring.table, {:lock, token, self()})
 
   defp clear_slots(ring) do
     operation_token = unique_token()

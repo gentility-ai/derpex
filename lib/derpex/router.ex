@@ -10,6 +10,9 @@ defmodule Derpex.Router do
 
   alias Derpex.Disco
   alias Derpex.Metrics
+  require Derpex.Outbox
+
+  alias Derpex.Outbox
   alias Derpex.Outbox.Ring
   alias Derpex.Router.ReversePaths
 
@@ -59,9 +62,9 @@ defmodule Derpex.Router do
         <<key::binary-size(32)>>,
         connection,
         %Ring{} = ordinary,
-        %Ring{} = lifecycle
+        lifecycle
       )
-      when is_pid(connection) do
+      when is_pid(connection) and Outbox.is_outbox(lifecycle) do
     register(key, connection, ordinary, ordinary, lifecycle)
   end
 
@@ -72,9 +75,9 @@ defmodule Derpex.Router do
         connection,
         %Ring{} = ordinary,
         %Ring{} = disco,
-        %Ring{} = lifecycle
+        lifecycle
       )
-      when is_pid(connection) do
+      when is_pid(connection) and Outbox.is_outbox(lifecycle) do
     register(key, connection, ordinary, disco, lifecycle, @default_presence)
   end
 
@@ -85,7 +88,7 @@ defmodule Derpex.Router do
         connection,
         %Ring{} = ordinary,
         %Ring{} = disco,
-        %Ring{} = lifecycle,
+        lifecycle,
         %{
           ip: <<_ip::binary-size(16)>>,
           port: port,
@@ -94,7 +97,7 @@ defmodule Derpex.Router do
         } = presence
       )
       when is_pid(connection) and port in 0..65_535 and flags in 0..255 and
-             is_binary(app_name) do
+             is_binary(app_name) and Outbox.is_outbox(lifecycle) do
     {:ok, activity} =
       GenServer.call(
         __MODULE__,
@@ -112,7 +115,7 @@ defmodule Derpex.Router do
 
   @doc "Subscribes a trusted connection to the current snapshot and future presence changes."
   @spec watch(pid(), Ring.t()) :: :ok
-  def watch(connection, %Ring{} = lifecycle) when is_pid(connection) do
+  def watch(connection, lifecycle) when is_pid(connection) and Outbox.is_outbox(lifecycle) do
     GenServer.call(__MODULE__, {:watch, connection, lifecycle})
   end
 
@@ -166,8 +169,8 @@ defmodule Derpex.Router do
 
   @doc "Records a reverse path after the destination writer emits a packet."
   @spec note_send(binary(), pid(), Ring.t()) :: :ok
-  def note_send(<<source::binary-size(32)>>, destination_connection, %Ring{} = lifecycle)
-      when is_pid(destination_connection) do
+  def note_send(<<source::binary-size(32)>>, destination_connection, lifecycle)
+      when is_pid(destination_connection) and Outbox.is_outbox(lifecycle) do
     ReversePaths.note(source, destination_connection, lifecycle)
   end
 
@@ -734,7 +737,7 @@ defmodule Derpex.Router do
   end
 
   defp safe_enqueue(ring, message, options \\ []) do
-    Ring.enqueue(ring, message, options)
+    Outbox.enqueue(ring, message, options)
   rescue
     # The ring's table died with its owner between the route lookup and the
     # publish. The ring cannot count a drop it never reached, so it is counted

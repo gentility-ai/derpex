@@ -29,7 +29,8 @@ defmodule Derpex.Metrics do
     :home_moves_in,
     :home_moves_out,
     :write_errors,
-    :ring_producer_naps
+    :ring_producer_naps,
+    :lifecycle_queue_overflows
   ]
 
   @drop_reasons [
