@@ -56,6 +56,9 @@ defmodule Derpex.Certificates.IPManager do
   @maximum_retry_delay_ms 30 * 60_000
   @renew_interval_ms 60 * 60_000
   @bootstrap_report_interval_ms 60_000
+  @sni_timeout_ms 5_000
+  @maximum_waiters 256
+  @flight_deadline_ms 200_000
   @bootstrap_key {__MODULE__, :bootstrap_subjects}
   @never -(1 <<< 60)
 
@@ -95,17 +98,29 @@ defmodule Derpex.Certificates.IPManager do
   The DER encoding of the private key is done once, when the certificate is
   issued or loaded, so answering a hello is a map lookup and a list append.
   """
-  @spec certs_keys(GenServer.server(), binary(), binary(), binary()) ::
+  @spec certs_keys(GenServer.server(), binary(), binary(), binary(), keyword()) ::
           {:ok, certs_keys()} | {:error, term()}
-  def certs_keys(manager, local_ip, server_name, meta_certificate)
+  def certs_keys(manager, local_ip, server_name, meta_certificate, options \\ [])
       when is_binary(meta_certificate) do
-    case GenServer.call(manager, {:certs_keys, local_ip, server_name}, :infinity) do
+    timeout = Keyword.get(options, :timeout, :infinity)
+
+    case call(manager, {:certs_keys, local_ip, server_name}, timeout) do
       {:ok, %{cert: chain, key: key}} ->
         {:ok, %{cert: Certificates.append_meta_certificate(chain, meta_certificate), key: key}}
 
       {:error, reason} ->
         {:error, reason}
     end
+  end
+
+  # A timeout leaves the caller's request queued in the manager, which replies
+  # to a `from` nobody is waiting on any more. That is harmless and bounded:
+  # the waiter cap and the waiter monitors both cover it.
+  defp call(manager, message, timeout) do
+    GenServer.call(manager, message, timeout)
+  catch
+    :exit, {:timeout, _call} -> {:error, :certificate_timeout}
+    :exit, reason -> {:error, {:certificate_manager_down, reason}}
   end
 
   @doc "Installs one active HTTP-01 response."
@@ -241,7 +256,12 @@ defmodule Derpex.Certificates.IPManager do
           (charlist() -> keyword() | :unrecognized)
   def sni_fun(manager, local_ip, meta_certificate) when is_binary(meta_certificate) do
     fn server_name ->
-      case certs_keys(manager, local_ip, IO.chardata_to_string(server_name), meta_certificate) do
+      # A hello is a client holding a socket open, so it waits with a deadline
+      # rather than `:infinity`: an issuance that hangs must cost one refused
+      # handshake, not an accumulating pile of blocked acceptors.
+      case certs_keys(manager, local_ip, IO.chardata_to_string(server_name), meta_certificate,
+             timeout: @sni_timeout_ms
+           ) do
         {:ok, certs_keys} -> [certs_keys: [certs_keys]]
         {:error, _refused} -> :unrecognized
       end
@@ -263,7 +283,8 @@ defmodule Derpex.Certificates.IPManager do
       issuer: issuer,
       next_provider: Keyword.get(options, :next_provider),
       hostnames: hostnames(Keyword.get(options, :hostnames, [])),
-      snapshot: Keyword.get(options, :snapshot),
+      snapshots: %{},
+      waiters: %{},
       renew_interval_ms: Keyword.get(options, :renew_interval_ms, @renew_interval_ms),
       entries: %{},
       flights: %{},
@@ -304,7 +325,10 @@ defmodule Derpex.Certificates.IPManager do
   # A manager that is gone is not serving a placeholder, so its subject leaves
   # the set the readiness probe and the gauge read.
   @impl true
-  def terminate(_reason, %{snapshot: {_key, subject, _meta}}), do: clear_bootstrap(subject)
+  def terminate(_reason, %{snapshots: snapshots}) do
+    Enum.each(Map.keys(snapshots), &clear_bootstrap/1)
+  end
+
   def terminate(_reason, _state), do: :ok
 
   @impl true
@@ -318,7 +342,17 @@ defmodule Derpex.Certificates.IPManager do
 
   def handle_call({:publish_to, key, subject, meta_certificate}, _from, state) do
     subject = canonical_subject(subject)
-    state = %{state | snapshot: {key, subject, meta_certificate}}
+
+    # A relay bound to both an IPv4 and an IPv6 address has one listener each,
+    # and both have to see a renewal. Registrations accumulate per subject
+    # rather than replacing one another.
+    registrations =
+      state.snapshots
+      |> Map.get(subject, [])
+      |> List.keydelete(key, 0)
+      |> List.insert_at(-1, {key, meta_certificate})
+
+    state = %{state | snapshots: Map.put(state.snapshots, subject, registrations)}
     state = load_cached_entry(state, subject)
 
     case Map.get(state.entries, subject) do
@@ -393,13 +427,32 @@ defmodule Derpex.Certificates.IPManager do
 
   def handle_info({:DOWN, reference, :process, _pid, reason}, state) do
     case Map.pop(state.flights, reference) do
-      {nil, _flights} ->
-        {:noreply, state}
-
-      {ip, flights} ->
-        state = %{state | flights: flights}
-        {:noreply, finish_flight(state, ip, {:error, {:issuance, {:flight_failed, reason}}})}
+      {nil, _flights} -> {:noreply, waiter_down(state, reference)}
+      {ip, flights} -> {:noreply, flight_down(%{state | flights: flights}, ip, reason)}
     end
+  end
+
+  # An issuance that outlives its deadline is killed here rather than left to a
+  # certificate authority's own idea of how long to take. The kill arrives as a
+  # DOWN, so it finishes the flight and backs off like any other failure.
+  def handle_info({:flight_deadline, ip, reference}, state) do
+    case get_in(state.entries, [ip, :flight]) do
+      %{reference: ^reference, pid: pid} -> Process.exit(pid, :kill)
+      _finished_or_replaced -> :ok
+    end
+
+    {:noreply, state}
+  end
+
+  defp waiter_down(state, reference) do
+    case Map.get(state.waiters, reference) do
+      nil -> state
+      ip -> drop_waiter(state, reference, ip)
+    end
+  end
+
+  defp flight_down(state, ip, reason) do
+    finish_flight(state, ip, {:error, {:issuance, {:flight_failed, reason}}})
   end
 
   defp schedule_renewal(state) do
@@ -417,9 +470,17 @@ defmodule Derpex.Certificates.IPManager do
 
   defp answer(state, local_ip, server_name, from, projection) do
     case resolve(state, local_ip, server_name) do
-      {:ok, result, state} -> {:reply, project(result, projection), state}
-      {:error, reason, state} -> {:reply, {:error, reason}, state}
-      {:wait, ip, state} -> {:noreply, add_waiter(state, ip, from, projection)}
+      {:ok, result, state} ->
+        {:reply, project(result, projection), state}
+
+      {:error, reason, state} ->
+        {:reply, {:error, reason}, state}
+
+      {:wait, ip, state} ->
+        case add_waiter(state, ip, from, projection) do
+          {:ok, state} -> {:noreply, state}
+          :full -> {:reply, {:error, :certificate_waiters_exhausted}, state}
+        end
     end
   end
 
@@ -430,8 +491,46 @@ defmodule Derpex.Certificates.IPManager do
   defp project({:delegated, _certificate}, :certs_keys),
     do: {:error, :next_provider_certificate_not_supported}
 
-  defp add_waiter(state, ip, from, projection) do
-    update_in(state.entries[ip].flight.waiters, &[{from, projection} | &1])
+  # Waiters are capped and monitored. A stalled issuance would otherwise hold
+  # one entry per hello for as long as it stalls, and hellos arrive as fast as
+  # a client can open sockets; a caller that gives up or dies is dropped rather
+  # than kept until the flight ends.
+  defp add_waiter(state, ip, {pid, _tag} = from, projection) do
+    waiters = state.entries[ip].flight.waiters
+
+    if length(waiters) >= @maximum_waiters do
+      :full
+    else
+      reference = Process.monitor(pid)
+
+      state =
+        state
+        |> update_in([:entries, ip, :flight, :waiters], &[{from, projection, reference} | &1])
+        |> put_in([:waiters, reference], ip)
+
+      {:ok, state}
+    end
+  end
+
+  defp drop_waiter(state, reference, ip) do
+    state = %{state | waiters: Map.delete(state.waiters, reference)}
+
+    case get_in(state.entries, [ip, :flight]) do
+      nil ->
+        state
+
+      flight ->
+        remaining =
+          Enum.reject(flight.waiters, fn {_from, _projection, ref} -> ref == reference end)
+
+        put_in(state.entries[ip].flight.waiters, remaining)
+    end
+  end
+
+  defp release_waiters(waiters) do
+    Enum.each(waiters, fn {_from, _projection, reference} ->
+      Process.demonitor(reference, [:flush])
+    end)
   end
 
   # The flight is linked as well as monitored: a manager that goes down takes
@@ -449,6 +548,7 @@ defmodule Derpex.Certificates.IPManager do
       end)
 
     reference = Process.monitor(pid)
+    _timer = Clock.send_after(self(), {:flight_deadline, ip, reference}, @flight_deadline_ms)
     flight = %{reference: reference, pid: pid, waiters: []}
     state = put_entry(state, ip, %{entry | flight: flight})
     %{state | flights: Map.put(state.flights, reference, ip)}
@@ -464,6 +564,7 @@ defmodule Derpex.Certificates.IPManager do
   defp finish_flight(state, ip, result) do
     entry = Map.get(state.entries, ip, new_entry())
     flight = entry.flight || %{reference: nil, pid: nil, waiters: []}
+    state = %{state | waiters: forget_waiters(state.waiters, flight.waiters)}
     state = state |> release_monitor(flight.reference) |> reclaim_challenges(flight.pid)
 
     {entry, reply} =
@@ -487,7 +588,9 @@ defmodule Derpex.Certificates.IPManager do
     # certificate it was just handed.
     state = put_entry(state, ip, entry)
 
-    Enum.each(flight.waiters, fn {from, projection} ->
+    release_waiters(flight.waiters)
+
+    Enum.each(flight.waiters, fn {from, projection, _reference} ->
       GenServer.reply(from, reply(reply, projection))
     end)
 
@@ -506,6 +609,12 @@ defmodule Derpex.Certificates.IPManager do
       Map.reject(state.challenges, fn {_path, {_response, owner}} -> owner == pid end)
 
     %{state | challenges: challenges}
+  end
+
+  defp forget_waiters(waiters, flight_waiters) do
+    Enum.reduce(flight_waiters, waiters, fn {_from, _projection, reference}, waiters ->
+      Map.delete(waiters, reference)
+    end)
   end
 
   defp release_monitor(state, nil), do: state
@@ -705,15 +814,20 @@ defmodule Derpex.Certificates.IPManager do
   # `:persistent_term` snapshot — the same mechanism a rotated file-backed
   # certificate uses. Without this a renewed certificate would reach clients
   # that send SNI and never reach those that do not.
-  defp publish_snapshot(%{snapshot: nil}, _ip, _entry), do: :ok
+  defp publish_snapshot(_state, _ip, %{tls: nil}), do: :ok
 
-  defp publish_snapshot(%{snapshot: {key, subject, meta_certificate}}, ip, entry) do
-    if ip == subject and not is_nil(entry.tls) do
-      :persistent_term.put(key, [with_meta_certificate(entry.tls, meta_certificate)])
-      :ok = clear_bootstrap(subject)
+  defp publish_snapshot(state, ip, entry) do
+    case Map.get(state.snapshots, ip, []) do
+      [] ->
+        :ok
+
+      registrations ->
+        Enum.each(registrations, fn {key, meta_certificate} ->
+          :persistent_term.put(key, [with_meta_certificate(entry.tls, meta_certificate)])
+        end)
+
+        clear_bootstrap(ip)
     end
-
-    :ok
   end
 
   # Revealed only on the way out, to `:ssl`, which needs the bytes.
