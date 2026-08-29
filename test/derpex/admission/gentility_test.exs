@@ -53,6 +53,57 @@ defmodule Derpex.Admission.GentilityTest do
     assert Gentility.authorize(request(node_key), policy) == {:error, :no_cached_lease}
   end
 
+  test "any authority failure serves the cached lease instead of denying" do
+    node_key = node_key(24)
+    {:ok, authority} = Agent.start_link(fn -> {:ok, signed_lease(node_key)} end)
+
+    controller = start_controller(authority: fn _request -> Agent.get(authority, & &1) end)
+    policy = Gentility.policy(controller)
+
+    assert {:ok, %{gentility: %{source: :live}}} = Gentility.authorize(request(node_key), policy)
+
+    for failure <- [
+          {:error, {:http, 503}},
+          {:error, :closed},
+          {:error, :unavailable},
+          :not_a_response
+        ] do
+      Agent.update(authority, fn _response -> failure end)
+
+      assert {:ok, %{gentility: %{source: :cached}}} =
+               Gentility.authorize(request(node_key), policy)
+    end
+  end
+
+  test "a denial arrives as a signed revocation record, not an authority error" do
+    parent = self()
+    node_key = node_key(25)
+    {:ok, authority} = Agent.start_link(fn -> {:ok, signed_lease(node_key)} end)
+
+    controller =
+      start_controller(
+        authority: fn _request -> Agent.get(authority, & &1) end,
+        close_peer: fn key -> send(parent, {:closed, key}) end
+      )
+
+    policy = Gentility.policy(controller)
+    assert {:ok, _context} = Gentility.authorize(request(node_key), policy)
+
+    Agent.update(authority, fn _response -> {:ok, signed_revocation(node_key, 10)} end)
+
+    assert Gentility.authorize(request(node_key), policy) == {:error, :lease_revoked}
+    assert_receive {:closed, ^node_key}
+    assert Gentility.stats(controller).cache_entries == 0
+
+    Agent.update(authority, fn _response -> {:error, :unavailable} end)
+    assert Gentility.authorize(request(node_key), policy) == {:error, :no_cached_lease}
+
+    Agent.update(authority, fn _response -> {:ok, signed_revocation(node_key(26), 10)} end)
+
+    assert Gentility.authorize(request(node_key), policy) ==
+             {:error, :revocation_node_key_mismatch}
+  end
+
   test "active revocation is idempotent, rejects stale leases, and allows a newer revision" do
     parent = self()
     node_key = node_key(3)

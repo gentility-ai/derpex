@@ -33,6 +33,19 @@ policy revision, revocation Unix time in milliseconds, and a bounded reason.
 Revocation revision `R` invalidates leases for that node whose policy revision
 is at most `R`.
 
+Authorization has exactly two authoritative answers, and both are signed
+records: a lease admits the requested node key, and a revocation for that node
+key denies it, dropping any cached lease and closing its established
+connections. An error returned by the control-plane transport is a failure to
+answer, never a denial, whatever its reason term. DERPEX therefore treats every
+error tuple, timeout, exit, and unrecognized return value identically: it
+serves the cached lease for that node key while one is unexpired, and rejects
+the connection once none is. Encoding a denial as an error — an HTTP 403, for
+instance — would make a control-plane outage indistinguishable from a mass
+denial and would darken every relay the moment Gentility became unreachable.
+Denial during an outage is expressed by a previously published revocation or by
+lease expiry, which bounds the worst case at the maximum lease lifetime.
+
 Verification keys are configured as a bounded key-ID map. Rotation publishes
 the new public key before Gentility signs with it and retains the old key until
 every lease it signed has expired. DERPEX rejects unknown key IDs, signatures

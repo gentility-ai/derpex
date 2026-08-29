@@ -5,6 +5,12 @@ defmodule Derpex.Admission.Gentility do
   Live authorization is attempted outside the controller process so expiry and
   revocation remain responsive during a control-plane outage. An atomic gate
   rejects excess work before it can enter the controller mailbox.
+
+  An authority answer is authoritative only when it is a signed contract v1
+  record: a lease admits, and a revocation denies. Every other answer — an
+  error tuple of any shape, a timeout, an exit, or an unrecognized term — is a
+  failure of the control plane, never a denial, so admission falls back to the
+  cached lease. A node with no unexpired cached lease is still rejected.
   """
 
   use GenServer
@@ -15,6 +21,7 @@ defmodule Derpex.Admission.Gentility do
   alias Derpex.Admission.Gentility.Cache
   alias Derpex.Admission.Gentility.Contract
   alias Derpex.Admission.Gentility.Lease
+  alias Derpex.Admission.Gentility.Revocation
   alias Derpex.Admission.Gentility.Usage
   alias Derpex.Admission.Gentility.UsageWorker
   alias Derpex.Admission.Request
@@ -227,15 +234,9 @@ defmodule Derpex.Admission.Gentility do
   def handle_call({:accept_live, node_key, wire}, _from, state) do
     state = purge_expired(state)
 
-    case verify_lease(state, wire) do
-      {:ok, %Lease{node_key: ^node_key} = lease} ->
-        accept_verified_lease(state, wire, lease)
-
-      {:ok, %Lease{}} ->
-        {:reply, {:error, :lease_node_key_mismatch}, state}
-
-      {:error, _reason} = error ->
-        {:reply, error, state}
+    case Contract.record_type(wire) do
+      {:ok, :revocation} -> accept_live_denial(state, node_key, wire)
+      _lease_or_unknown -> accept_live_lease(state, node_key, wire)
     end
   end
 
@@ -387,16 +388,7 @@ defmodule Derpex.Admission.Gentility do
       {:ok, {:ok, wire}} when is_binary(wire) ->
         controller_call(policy.server, {:accept_live, request.node_key, wire})
 
-      {:ok, {:error, :unavailable}} ->
-        controller_call(policy.server, {:cached, request.node_key})
-
-      {:ok, {:error, reason}} ->
-        {:error, reason}
-
-      {:ok, other} ->
-        {:error, {:invalid_authority_response, other}}
-
-      {:error, _unavailable} ->
+      _authority_failed ->
         controller_call(policy.server, {:cached, request.node_key})
     end
   end
@@ -449,6 +441,33 @@ defmodule Derpex.Admission.Gentility do
 
       true ->
         reserve(gate, maximum)
+    end
+  end
+
+  defp accept_live_lease(state, node_key, wire) do
+    case verify_lease(state, wire) do
+      {:ok, %Lease{node_key: ^node_key} = lease} ->
+        accept_verified_lease(state, wire, lease)
+
+      {:ok, %Lease{}} ->
+        {:reply, {:error, :lease_node_key_mismatch}, state}
+
+      {:error, _reason} = error ->
+        {:reply, error, state}
+    end
+  end
+
+  defp accept_live_denial(state, node_key, wire) do
+    case Contract.verify_revocation(wire, state.verification_keys) do
+      {:ok, %Revocation{node_key: ^node_key} = revocation} ->
+        {:reply, _applied_or_stale, state} = apply_one_revocation(state, wire, revocation)
+        {:reply, {:error, :lease_revoked}, state}
+
+      {:ok, %Revocation{}} ->
+        {:reply, {:error, :revocation_node_key_mismatch}, state}
+
+      {:error, _reason} = error ->
+        {:reply, error, state}
     end
   end
 
