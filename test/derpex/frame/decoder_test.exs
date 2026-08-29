@@ -114,6 +114,15 @@ defmodule Derpex.Frame.DecoderTest do
              {:error, {:unexpected, 0xFD}}
   end
 
+  test "refuses a successor policy that is not a two-argument function" do
+    policy = fn _type, _length -> {:buffer, :not_a_policy} end
+    decoder = Decoder.new(frame_policy: policy)
+
+    assert_raise CaseClauseError, fn ->
+      Decoder.push(decoder, Frame.encode_header(0xFD, 0))
+    end
+  end
+
   defp decode_chunks(chunks) do
     {frames, decoder} =
       Enum.reduce(chunks, {[], Decoder.new()}, fn chunk, {frames, decoder} ->

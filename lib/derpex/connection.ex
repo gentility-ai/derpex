@@ -25,6 +25,10 @@ defmodule Derpex.Connection do
   # in PLAN.md Section 2.3.
   @max_client_info_length 16 * 1_024
 
+  # Go's `recvClientKey` rejects `fl < derp.KeyLen + derp.NonceLen` as "short
+  # client info" before reading the body.
+  @min_client_info_length Frame.key_length() + Frame.nonce_length()
+
   @derive {Inspect, except: [:private_key, :mesh_key]}
   defstruct [
     :private_key,
@@ -257,6 +261,9 @@ defmodule Derpex.Connection do
 
       length > @max_client_info_length ->
         {:error, {:frame_too_large, length, @max_client_info_length}}
+
+      length < @min_client_info_length ->
+        {:error, {:frame_too_small, length, @min_client_info_length}}
 
       true ->
         {:buffer, &pending_frame_policy/2}

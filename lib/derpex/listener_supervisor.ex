@@ -36,20 +36,25 @@ defmodule Derpex.ListenerSupervisor do
     Supervisor.init(children, strategy: :one_for_one)
   end
 
+  # The public key is derived once here and threaded through the certificate
+  # reloader, the TLS options, and the handler options, so no connection pays
+  # for a scalar multiplication that only depends on the listener's identity.
   defp listener_children(options, index, private_key) do
     {reload_interval_ms, options} =
       Keyword.pop(options, :certificate_reload_interval_ms, 0)
 
-    case certificate_reloader(options, index, private_key, reload_interval_ms) do
+    public_key = server_public_key!(private_key)
+
+    case certificate_reloader(options, index, public_key, reload_interval_ms) do
       {:ok, reloader, options} ->
-        [reloader, listener_child(options, index, private_key)]
+        [reloader, listener_child(options, index, private_key, public_key)]
 
       :disabled ->
-        [listener_child(options, index, private_key)]
+        [listener_child(options, index, private_key, public_key)]
     end
   end
 
-  defp listener_child(options, index, private_key) do
+  defp listener_child(options, index, private_key, public_key) do
     {socket_options, options} = Keyword.pop(options, :socket_options, [])
 
     handler_options =
@@ -58,26 +63,33 @@ defmodule Derpex.ListenerSupervisor do
       |> resolve_admission()
       |> Keyword.put_new(:mesh_write_timeout, SocketOptions.mesh_write_timeout_ms())
       |> Keyword.put(:server_private_key, private_key)
+      |> Keyword.put(:server_public_key, public_key)
 
     options =
       options
       |> Keyword.put(:handler_module, Handler)
       |> Keyword.put(:handler_options, handler_options)
-      |> configure_tls(private_key)
+      |> configure_tls(public_key)
       |> configure_socket(socket_options)
       |> configure_transport()
 
     Supervisor.child_spec({ThousandIsland, options}, id: {ThousandIsland, index})
   end
 
-  defp certificate_reloader(options, index, private_key, interval_ms)
+  defp server_public_key!(private_key) do
+    case Crypto.public_key(Secret.reveal(private_key)) do
+      {:ok, public_key} -> public_key
+      {:error, reason} -> raise "invalid DERP server private key: #{inspect(reason)}"
+    end
+  end
+
+  defp certificate_reloader(options, index, server_public_key, interval_ms)
        when is_integer(interval_ms) and interval_ms > 0 do
     transport_options = Keyword.get(options, :transport_options, [])
 
     with true <- Keyword.get(options, :transport_module) == ThousandIsland.Transports.SSL,
          certfile when is_binary(certfile) <- Keyword.get(transport_options, :certfile),
-         keyfile when is_binary(keyfile) <- Keyword.get(transport_options, :keyfile),
-         {:ok, server_public_key} <- Crypto.public_key(Secret.reveal(private_key)) do
+         keyfile when is_binary(keyfile) <- Keyword.get(transport_options, :keyfile) do
       snapshot_key = {__MODULE__, :certificate_snapshot, make_ref()}
       sni_fun = Reloader.sni_fun(snapshot_key)
       transport_options = Keyword.put(transport_options, :sni_fun, sni_fun)
@@ -100,7 +112,7 @@ defmodule Derpex.ListenerSupervisor do
     end
   end
 
-  defp certificate_reloader(_options, _index, _private_key, _interval_ms),
+  defp certificate_reloader(_options, _index, _server_public_key, _interval_ms),
     do: :disabled
 
   defp resolve_admission(handler_options) do
@@ -125,13 +137,12 @@ defmodule Derpex.ListenerSupervisor do
     Keyword.put(options, :transport_options, transport_options)
   end
 
-  defp configure_tls(options, private_key) do
+  defp configure_tls(options, server_public_key) do
     if Keyword.get(options, :transport_module) == ThousandIsland.Transports.SSL do
       transport_options = Keyword.get(options, :transport_options, [])
 
       with certfile when is_binary(certfile) <- Keyword.get(transport_options, :certfile),
-           keyfile when is_binary(keyfile) <- Keyword.get(transport_options, :keyfile),
-           {:ok, server_public_key} <- Crypto.public_key(Secret.reveal(private_key)) do
+           keyfile when is_binary(keyfile) <- Keyword.get(transport_options, :keyfile) do
         loaded = Certificates.transport_options(certfile, keyfile, server_public_key)
 
         transport_options =

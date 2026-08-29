@@ -108,7 +108,7 @@ defmodule Derpex.Frame.Decoder do
       mode when mode in [:buffer, :discard] ->
         start_frame(decoder, type, payload_length, mode, chunk, frames)
 
-      {mode, next_policy} when mode in [:buffer, :discard] ->
+      {mode, next_policy} when mode in [:buffer, :discard] and is_function(next_policy, 2) ->
         decoder = %{decoder | frame_policy: next_policy}
         start_frame(decoder, type, payload_length, mode, chunk, frames)
 

@@ -232,6 +232,21 @@ defmodule Derpex.ConnectionTest do
     assert microseconds < 100_000
   end
 
+  test "closes on a client-info frame below Go's key-and-nonce minimum" do
+    {_server_public, server_private} = Crypto.generate_keypair()
+    {:ok, state, _actions} = Connection.new(Secret.wrap(server_private))
+
+    at_minimum = Frame.encode_header(Frame.type(:client_info), 56)
+    assert {:ok, _state, []} = Connection.receive_data(state, IO.iodata_to_binary(at_minimum))
+
+    below_minimum = Frame.encode_header(Frame.type(:client_info), 55)
+
+    assert {:close, closed, {:frame_too_small, 55, 56}, []} =
+             Connection.receive_data(state, IO.iodata_to_binary(below_minimum))
+
+    assert Connection.info(closed).phase == :closed
+  end
+
   test "closes on a client-info frame above the pre-authentication cap" do
     {_server_public, server_private} = Crypto.generate_keypair()
     {:ok, state, _actions} = Connection.new(Secret.wrap(server_private))
