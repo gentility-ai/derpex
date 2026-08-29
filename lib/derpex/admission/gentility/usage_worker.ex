@@ -45,13 +45,17 @@ defmodule Derpex.Admission.Gentility.UsageWorker do
   @spec handle(GenServer.server()) :: Handle.t()
   def handle(server), do: GenServer.call(server, :handle)
 
-  @doc false
+  @doc """
+  Stops the worker within the controller's shutdown budget.
+
+  The link is deliberately left in place: unlinking would hide a worker that
+  died on its own, and the controller traps exits precisely so that it sees it.
+  """
   @spec stop(nil | Handle.t()) :: :ok
   def stop(nil), do: :ok
 
   def stop(%Handle{server: server}) do
-    Process.unlink(server)
-    GenServer.stop(server, :shutdown)
+    GenServer.stop(server, :shutdown, 1_500)
   catch
     :exit, _reason -> :ok
   end
@@ -153,7 +157,14 @@ defmodule Derpex.Admission.Gentility.UsageWorker do
   def handle_info({:DOWN, _monitor, :process, _pid, _reason}, state), do: {:noreply, state}
 
   def handle_info({:EXIT, owner, reason}, %{owner: owner} = state), do: {:stop, reason, state}
-  def handle_info({:EXIT, _pid, _reason}, state), do: {:noreply, state}
+  def handle_info({:EXIT, _pid, :normal}, state), do: {:noreply, state}
+
+  # Export workers are linked, so a normal completion is routine and silent; any
+  # other exit is a failure the monitor handles, and worth a line either way.
+  def handle_info({:EXIT, pid, reason}, state) do
+    Logger.warning("gentility usage worker saw #{inspect(pid)} exit: #{inspect(reason)}")
+    {:noreply, state}
+  end
 
   @impl GenServer
   def terminate(_reason, state) do

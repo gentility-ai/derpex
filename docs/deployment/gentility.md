@@ -124,6 +124,11 @@ that can never be encoded would otherwise block the spool and shed every
 relayed packet behind it. Every other row sharing its window is still
 exported. Any increase in that counter is an accounting loss and must alert.
 
+`derpex_gentility_usage_dropped_rows` counts since the usage worker started, so
+a restart resets it to zero. Alert on an increase rather than an absolute
+value, and read a reset as a restart, not as recovery. Spooled batches survive
+a restart; the counter does not.
+
 ## Milestone 0 launch inputs
 
 The following values must be jointly fixed before Milestone 0 exits:
