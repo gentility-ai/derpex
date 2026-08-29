@@ -71,8 +71,12 @@ defmodule Derpex.ListenerSupervisor do
          keyfile when is_binary(keyfile) <- Keyword.get(transport_options, :keyfile),
          {:ok, server_public_key} <- Crypto.public_key(server_private_key) do
       snapshot_key = {__MODULE__, :certificate_snapshot, make_ref()}
-      sni_fun = Reloader.sni_fun(snapshot_key)
-      transport_options = Keyword.put(transport_options, :sni_fun, sni_fun)
+
+      transport_options =
+        transport_options
+        |> Keyword.put(:sni_fun, Reloader.sni_fun(snapshot_key))
+        |> Keyword.put(Transports.SSL.snapshot_option(), snapshot_key)
+
       options = Keyword.put(options, :transport_options, transport_options)
 
       reloader =

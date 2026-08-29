@@ -1,5 +1,28 @@
 defmodule Derpex.Certificates.Reloader do
-  @moduledoc "Validates and atomically publishes rotated file-backed TLS certificates."
+  @moduledoc """
+  Validates and atomically publishes rotated file-backed TLS certificates.
+
+  A reload writes a validated `certs_keys` snapshot into `:persistent_term` and
+  keeps the previous snapshot when the new files are unusable, so a half-written
+  rotation never takes the listener down.
+
+  ## How a rotated certificate reaches clients
+
+  `sni_fun/1` covers hellos that carry SNI, but OTP never consults it for a
+  hello without a `server_name` extension: those fall back to the certificate
+  baked into the listen socket at boot, which would pin no-SNI clients to the
+  certificate the relay started with. `Derpex.Listener.Transports.SSL`
+  therefore opens the listen socket with `handshake: :hello` and finishes every
+  accepted connection with `:ssl.handshake_continue/2`, passing
+  `current_options/1`. Both hello shapes then read the same live snapshot.
+
+  The alternative — `ThousandIsland.suspend/1`, new listen options,
+  `ThousandIsland.resume/1` — was rejected. Thousand Island 1.5 holds
+  `transport_options` in an immutable `ServerConfig` built at start, so a resume
+  re-listens with the *original* certificate (and, for `port: 0`, on a different
+  port). It cannot rotate anything. The `handshake_continue` path is also
+  strictly per connection, so established connections are untouched by a reload.
+  """
 
   use GenServer
 

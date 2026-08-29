@@ -45,7 +45,80 @@ defmodule Derpex.Certificates.ReloaderTest do
     {active, replacement} = certificate_pair_directories()
     {_server_public, server_private} = Crypto.generate_keypair()
 
-    listener = [
+    supervisor = start_supervised!({ListenerSupervisor, {[listener(active)], server_private}})
+    children = Supervisor.which_children(supervisor)
+    listener_pid = child_pid(children, ThousandIsland)
+    reloader_pid = child_pid(children, Reloader)
+
+    assert peer_certificate(listener_pid, "reload.test") == active.certificate_der
+    rotate_files(active, replacement)
+    assert Reloader.reload(reloader_pid) == {:ok, :changed}
+    assert peer_certificate(listener_pid, "reload.test") == replacement.certificate_der
+    assert Process.alive?(listener_pid)
+  end
+
+  test "new no-SNI handshakes use a rotated certificate and keep live connections" do
+    {active, replacement} = certificate_pair_directories()
+    {_server_public, server_private} = Crypto.generate_keypair()
+
+    supervisor = start_supervised!({ListenerSupervisor, {[listener(active)], server_private}})
+    children = Supervisor.which_children(supervisor)
+    listener_pid = child_pid(children, ThousandIsland)
+    reloader_pid = child_pid(children, Reloader)
+
+    {:ok, listener_info} = ThousandIsland.listener_info(listener_pid)
+    assert peer_certificate(listener_pid, nil) == active.certificate_der
+
+    established = open_idle_connection(listener_pid)
+    rotate_files(active, replacement)
+    assert Reloader.reload(reloader_pid) == {:ok, :changed}
+
+    assert peer_certificate(listener_pid, nil) == replacement.certificate_der
+    assert peer_certificate(listener_pid, "reload.test") == replacement.certificate_der
+
+    assert Process.alive?(listener_pid)
+    assert Process.alive?(established)
+    assert ThousandIsland.listener_info(listener_pid) == {:ok, listener_info}
+  end
+
+  defp open_idle_connection(listener) do
+    {:ok, {_ip, port}} = ThousandIsland.listener_info(listener)
+    openssl = System.find_executable("openssl") || flunk("openssl is required for this test")
+    {:ok, existing} = ThousandIsland.connection_pids(listener)
+
+    command =
+      Port.open(
+        {:spawn_executable, openssl},
+        [
+          :binary,
+          :exit_status,
+          :stderr_to_stdout,
+          args: ["s_client", "-connect", "127.0.0.1:#{port}", "-noservername", "-quiet"]
+        ]
+      )
+
+    on_exit(fn -> if Port.info(command), do: Port.close(command) end)
+    await_connection(listener, MapSet.new(existing), 400)
+  end
+
+  defp await_connection(listener, existing, attempts) do
+    {:ok, pids} = ThousandIsland.connection_pids(listener)
+
+    case Enum.find(pids, &(not MapSet.member?(existing, &1))) do
+      pid when is_pid(pid) ->
+        pid
+
+      nil when attempts > 0 ->
+        Process.sleep(5)
+        await_connection(listener, existing, attempts - 1)
+
+      nil ->
+        flunk("no connection was accepted by the TLS listener")
+    end
+  end
+
+  defp listener(active) do
+    [
       port: 0,
       transport_module: ThousandIsland.Transports.SSL,
       certificate_reload_interval_ms: 60_000,
@@ -58,17 +131,6 @@ defmodule Derpex.Certificates.ReloaderTest do
         alpn_preferred_protocols: ["http/1.1"]
       ]
     ]
-
-    supervisor = start_supervised!({ListenerSupervisor, {[listener], server_private}})
-    children = Supervisor.which_children(supervisor)
-    listener_pid = child_pid(children, ThousandIsland)
-    reloader_pid = child_pid(children, Reloader)
-
-    assert peer_certificate(listener_pid) == active.certificate_der
-    rotate_files(active, replacement)
-    assert Reloader.reload(reloader_pid) == {:ok, :changed}
-    assert peer_certificate(listener_pid) == replacement.certificate_der
-    assert Process.alive?(listener_pid)
   end
 
   defp certificate_pair_directories do
@@ -103,9 +165,12 @@ defmodule Derpex.Certificates.ReloaderTest do
     |> tap(&assert(is_pid(&1)))
   end
 
-  defp peer_certificate(listener) do
+  defp peer_certificate(listener, server_name) do
     {:ok, {_ip, port}} = ThousandIsland.listener_info(listener)
     openssl = System.find_executable("openssl") || flunk("openssl is required for this test")
+
+    server_name_arguments =
+      if server_name, do: ["-servername", server_name], else: ["-noservername"]
 
     command =
       Port.open(
@@ -114,14 +179,9 @@ defmodule Derpex.Certificates.ReloaderTest do
           :binary,
           :exit_status,
           :stderr_to_stdout,
-          args: [
-            "s_client",
-            "-connect",
-            "127.0.0.1:#{port}",
-            "-servername",
-            "reload.test",
-            "-showcerts"
-          ]
+          args:
+            ["s_client", "-connect", "127.0.0.1:#{port}", "-showcerts"] ++
+              server_name_arguments
         ]
       )
 
