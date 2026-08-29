@@ -135,7 +135,9 @@ defmodule Derpex.SessionTest do
     {:ok, session, _actions} =
       Session.new(Secret.wrap(server_private), mesh_key: Secret.wrap(mesh_key))
 
-    request = "GET /derp HTTP/1.1\r\nUpgrade: DERP\r\nConnection: Upgrade\r\n\r\n"
+    request =
+      "GET /derp HTTP/1.1\r\nHost: derp.example\r\nUpgrade: DERP\r\nConnection: Upgrade\r\n\r\n"
+
     {:ok, session, _actions} = Session.receive_data(session, request)
 
     rendered = inspect(session, limit: :infinity, structs: false, binaries: :as_binaries)
