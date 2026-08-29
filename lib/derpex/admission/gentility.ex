@@ -98,6 +98,7 @@ defmodule Derpex.Admission.Gentility do
 
   @overloaded_counter 1
   @unavailable_counter 2
+  @usage_shed_counter 3
 
   @type authority ::
           module() | {module(), term()} | (Request.t() -> {:ok, binary()} | {:error, term()})
@@ -164,7 +165,7 @@ defmodule Derpex.Admission.Gentility do
       when is_integer(bytes) and bytes >= 0 do
     now = policy.clock.monotonic_time(:microsecond)
 
-    with :ok <- usage_available(policy.usage),
+    with :ok <- usage_available(policy),
          {:ok, node_delay} <-
            ByteBudget.reserve(policy.byte_budgets, :node, gentility.node_key, bytes, now),
          {:ok, organization_delay} <-
@@ -196,7 +197,7 @@ defmodule Derpex.Admission.Gentility do
 
   def record_usage(%{gentility: gentility}, bytes, outcome, %Policy{} = policy)
       when is_integer(bytes) and bytes >= 0 and outcome in [:accepted, :dropped] do
-    with :ok <- usage_available(policy.usage) do
+    with :ok <- usage_available(policy) do
       Usage.record(
         policy.usage.table,
         policy.usage.window_ms,
@@ -286,6 +287,7 @@ defmodule Derpex.Admission.Gentility do
       authorize_counts: caller_counts(state, state.authorize_counts),
       close_peer_counts: state.close_peer_counts,
       nearest_lease_expiry_seconds: nearest_lease_expiry_seconds(state),
+      usage_shed_total: :atomics.get(state.policy.counters, @usage_shed_counter),
       cache_load_error: state.load_error != nil,
       cache_persist_error: state.persist_error != nil,
       load_error: state.load_error,
@@ -450,7 +452,7 @@ defmodule Derpex.Admission.Gentility do
     authority = Keyword.fetch!(options, :authority)
     server = Keyword.get(options, :server) || self()
     gate = :atomics.new(1, signed: false)
-    counters = :atomics.new(2, signed: false)
+    counters = :atomics.new(3, signed: false)
 
     max_concurrent_requests =
       positive_option!(options, :max_concurrent_requests, @default_max_concurrent_requests)
@@ -1821,12 +1823,17 @@ defmodule Derpex.Admission.Gentility do
     }
   end
 
-  defp usage_available(nil), do: :ok
+  defp usage_available(%Policy{usage: nil}), do: :ok
 
-  defp usage_available(usage) do
-    if :atomics.get(usage.blocked, 1) == 0,
-      do: :ok,
-      else: {:error, :usage_spool_full}
+  # Shedding is counted by the connection process itself: a relay that is
+  # shedding must not also be paying for a message per shed packet.
+  defp usage_available(%Policy{usage: usage} = policy) do
+    if :atomics.get(usage.blocked, 1) == 0 do
+      :ok
+    else
+      :atomics.add(policy.counters, @usage_shed_counter, 1)
+      {:error, :usage_spool_full}
+    end
   end
 
   # The two shedding outcomes are counted lock-free by the connection process

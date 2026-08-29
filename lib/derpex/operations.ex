@@ -298,6 +298,7 @@ defmodule Derpex.Operations do
       aggregate_entries: "derpex_gentility_usage_aggregate_entries",
       aggregate_windows: "derpex_gentility_usage_aggregate_windows",
       blocked?: "derpex_gentility_usage_blocked",
+      shed_total: "derpex_gentility_usage_shed_total",
       exporting?: "derpex_gentility_usage_exporting",
       dropped_rows: "derpex_gentility_usage_dropped_rows"
     }
@@ -306,6 +307,8 @@ defmodule Derpex.Operations do
   end
 
   defp merge_gentility_snapshot(metrics, %{usage: usage} = values) do
+    usage = Map.put(usage, :shed_total, Map.get(values, :usage_shed_total, 0))
+
     names = %{
       cache_entries: "derpex_gentility_cache_entries",
       revocations: "derpex_gentility_revocations",

@@ -293,10 +293,19 @@ defmodule Derpex.Listener.Handler do
 
   defp continue_after_actions(socket, state, actions) do
     case execute_actions(socket, state, actions) do
-      {:ok, state} -> {:continue, state}
-      {:error, {:admission, _reason}, state} -> {:close, state}
-      {:error, {:connection_close, _reason}, state} -> {:close, state}
-      {:error, reason, state} -> {:error, reason, state}
+      {:ok, state} ->
+        {:continue, state}
+
+      # Shedding for a full usage spool is a capacity decision, not a fault:
+      # the connection closes cleanly and the drop is counted by admission.
+      {:error, {kind, _reason}, state} when kind in [:admission, :connection_close, :usage] ->
+        {:close, state}
+
+      {:error, {:rate_limit, :usage_spool_full}, state} ->
+        {:close, state}
+
+      {:error, reason, state} ->
+        {:error, reason, state}
     end
   end
 
@@ -552,10 +561,17 @@ defmodule Derpex.Listener.Handler do
     case Session.receive_data(state.session, data) do
       {:ok, session, actions} ->
         case execute_actions(socket, %{state | session: session}, actions) do
-          {:ok, state} -> process_websocket_events(socket, state, rest)
-          {:error, {:admission, _reason}, state} -> {:close, state}
-          {:error, {:connection_close, _reason}, state} -> {:close, state}
-          {:error, reason, state} -> {:error, reason, state}
+          {:ok, state} ->
+            process_websocket_events(socket, state, rest)
+
+          {:error, {kind, _reason}, state} when kind in [:admission, :connection_close, :usage] ->
+            {:close, state}
+
+          {:error, {:rate_limit, :usage_spool_full}, state} ->
+            {:close, state}
+
+          {:error, reason, state} ->
+            {:error, reason, state}
         end
 
       {:close, session, _reason, actions} ->

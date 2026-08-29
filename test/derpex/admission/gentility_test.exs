@@ -1302,13 +1302,13 @@ defmodule Derpex.Admission.GentilityTest do
     log =
       ExUnit.CaptureLog.capture_log(fn ->
         Manual.advance(100)
-        eventually(fn -> Gentility.stats(controller).usage.dropped_rows == 1 end)
+        eventually(fn -> Gentility.stats(controller).usage.dropped_rows == 1 end, 400)
       end)
 
     assert log =~ "usage row dropped"
     refute Gentility.stats(controller).usage.blocked?
 
-    exported = collect_usage_entries()
+    exported = collect_usage_entries(400)
     assert Enum.map(exported, & &1.node_id) |> Enum.sort() == ["node_a", "node_b"]
     assert Enum.map(exported, & &1.accepted_bytes) |> Enum.sort() == [10, 20]
 
