@@ -38,22 +38,19 @@ import (
 )
 
 const (
-	// modeExact compares a step's counter deltas as absolute integers.
-	modeExact = "exact"
-	// modeSaturating compares only the sign of a step's counter deltas. It is
-	// used where the magnitude depends on kernel socket buffer sizes.
-	modeSaturating = "saturating"
-
-	// floodPackets overflows both the recipient's socket buffers and the
-	// server's per-client send queue while staying far inside the two-second
-	// write deadline both servers apply to a stalled recipient.
-	floodPackets = 128
+	// ordinaryFloodPackets first fills the stalled recipient's socket buffers
+	// and then overruns its ordinary send queue.
+	ordinaryFloodPackets = 128
+	// discoFloodPackets overruns the separate disco send queue, which by then
+	// cannot drain at all because the writer is blocked on the ordinary one.
+	discoFloodPackets = 64
 	// drainIdle ends the catch-up read of the stalled recipient.
 	drainIdle = 500 * time.Millisecond
 
-	recvBudget   = 10 * time.Second
-	settleBudget = 10 * time.Second
-	settlePoll   = 10 * time.Millisecond
+	recvBudget    = 10 * time.Second
+	settleBudget  = 10 * time.Second
+	settlePoll    = 10 * time.Millisecond
+	scrapeTimeout = 15 * time.Second
 )
 
 type semanticTrace struct {
@@ -66,10 +63,13 @@ type scenarioTrace struct {
 }
 
 type stepTrace struct {
-	Step     string           `json:"step"`
-	Mode     string           `json:"mode"`
-	Events   []traceEvent     `json:"events"`
-	Counters map[string]int64 `json:"counters"`
+	Step string `json:"step"`
+	// Saturating names the counters this step compares by sign rather than by
+	// value, because their magnitude depends on kernel socket buffer sizes.
+	// Every other tracked counter in the step is compared exactly.
+	Saturating []string         `json:"saturating"`
+	Events     []traceEvent     `json:"events"`
+	Counters   map[string]int64 `json:"counters"`
 }
 
 // traceEvent is one semantic observation made by a driving client. Keys are
@@ -123,6 +123,7 @@ func main() {
 		url:       derpURL,
 		meshKey:   meshKey,
 		labels:    map[key.NodePublic]string{},
+		raw:       map[string]map[string]int64{},
 		collector: newCollector(metricsURL, token),
 	}
 
@@ -142,6 +143,8 @@ func main() {
 func startOracle(meshKeyHex string) (string, string, func()) {
 	server := derpserver.New(key.NewNode(), logger.Discard)
 	must(server.SetMeshKey(meshKeyHex))
+	// The drop counters register themselves during derpserver package
+	// initialization; only the per-server set has to be published here.
 	expvar.Publish("derp", server.ExpVar(false))
 
 	mux := http.NewServeMux()
@@ -156,24 +159,24 @@ func startOracle(meshKeyHex string) (string, string, func()) {
 	}
 }
 
-// trackedCounters is the compared subset of server counters, named as Go's
-// varz exposes them.
-var trackedCounters = buildTrackedCounters()
+var (
+	// trackedCounters is the compared subset of server counters, named as Go's
+	// varz exposes them.
+	trackedCounters = buildTrackedCounters()
+	// droppedCounters is every packets_dropped reason/kind cell.
+	droppedCounters = buildDroppedCounters()
+	// queuePressure names the counters whose magnitude under a stalled
+	// recipient depends on kernel socket buffer sizes.
+	queuePressure = buildQueuePressure()
+)
 
-func buildTrackedCounters() []string {
-	names := []string{
-		"derp_current_connections",
-		"derp_current_dup_client_conns",
-		"derp_current_dup_client_keys",
-		"derp_got_ping",
-		"derp_packets_received",
-		"derp_packets_sent",
-		"derp_peer_gone_disconnected_frames",
-		"derp_peer_gone_not_here_frames",
-		"derp_sent_pong",
-		"derp_total_dup_client_conns",
-		"derp_unknown_frames",
-	}
+func buildQueuePressure() []string {
+	names := append([]string{"derp_packets_sent"}, buildDroppedCounters()...)
+	sort.Strings(names)
+	return names
+}
+
+func buildDroppedCounters() []string {
 	reasons := []string{
 		"dup_client",
 		"gone_disconnected",
@@ -183,6 +186,7 @@ func buildTrackedCounters() []string {
 		"unknown_dest_on_fwd",
 		"write_error",
 	}
+	names := []string{}
 	for _, kind := range []string{"disco", "other"} {
 		for _, reason := range reasons {
 			names = append(names,
@@ -193,15 +197,40 @@ func buildTrackedCounters() []string {
 	return names
 }
 
+func buildTrackedCounters() []string {
+	names := []string{
+		"derp_current_connections",
+		"derp_current_dup_client_conns",
+		"derp_current_dup_client_keys",
+		"derp_got_ping",
+		"derp_packets_forwarded_in",
+		"derp_packets_received",
+		"derp_packets_sent",
+		"derp_peer_gone_disconnected_frames",
+		"derp_peer_gone_not_here_frames",
+		"derp_sent_pong",
+		"derp_total_dup_client_conns",
+		"derp_unknown_frames",
+	}
+	names = append(names, buildDroppedCounters()...)
+	sort.Strings(names)
+	return names
+}
+
 type collector struct {
 	url      string
 	token    string
+	client   *http.Client
 	base     int64
 	previous map[string]int64
 }
 
 func newCollector(url, token string) *collector {
-	collector := &collector{url: url, token: token}
+	collector := &collector{
+		url:    url,
+		token:  token,
+		client: &http.Client{Timeout: scrapeTimeout},
+	}
 	values := collector.scrape()
 	collector.base = values["derp_current_connections"]
 	collector.previous = values
@@ -218,7 +247,7 @@ func (c *collector) scrape() map[string]int64 {
 		request.Header.Set("Authorization", "Bearer "+c.token)
 	}
 
-	response, err := http.DefaultClient.Do(request)
+	response, err := c.client.Do(request)
 	must(err)
 	defer response.Body.Close()
 
@@ -257,22 +286,50 @@ func (c *collector) settle(connections int64) map[string]int64 {
 	}
 }
 
-func (c *collector) step(name, mode string, connections int64, events []traceEvent) stepTrace {
+// step snapshots the tracked counters and returns both the trace record, whose
+// saturating counters are reduced to their sign, and the raw deltas.
+func (c *collector) step(
+	name string,
+	saturating []string,
+	connections int64,
+	events []traceEvent,
+) (stepTrace, map[string]int64) {
 	values := c.settle(connections)
+	saturated := make(map[string]bool, len(saturating))
+	for _, metric := range saturating {
+		saturated[metric] = true
+	}
+
+	raw := make(map[string]int64, len(trackedCounters))
 	counters := make(map[string]int64, len(trackedCounters))
 	for _, metric := range trackedCounters {
 		delta := values[metric] - c.previous[metric]
-		if mode == modeSaturating {
+		raw[metric] = delta
+		if saturated[metric] {
 			delta = sign(delta)
 		}
 		counters[metric] = delta
 	}
 	c.previous = values
 
+	if os.Getenv("DERPEX_TRACE_RAW") != "" {
+		encoded, err := json.Marshal(raw)
+		must(err)
+		fmt.Fprintf(os.Stderr, "DERPEX_TRACE_RAW %s %s\n", name, encoded)
+	}
+
 	if events == nil {
 		events = []traceEvent{}
 	}
-	return stepTrace{Step: name, Mode: mode, Events: events, Counters: counters}
+	if saturating == nil {
+		saturating = []string{}
+	}
+	return stepTrace{
+		Step:       name,
+		Saturating: saturating,
+		Events:     events,
+		Counters:   counters,
+	}, raw
 }
 
 func sign(value int64) int64 {
@@ -342,12 +399,28 @@ type runner struct {
 	url         string
 	meshKey     key.DERPMesh
 	labels      map[key.NodePublic]string
+	raw         map[string]map[string]int64
 	collector   *collector
 	connections int64
 }
 
-func (r *runner) step(name, mode string, events []traceEvent) stepTrace {
-	return r.collector.step(name, mode, r.connections, events)
+// step round-trips a ping on every named client before snapshotting. A DERP
+// server reads one connection's frames in order and drains its pong last, so a
+// received pong proves both that the frames that client sent have been routed
+// and that the frames queued for it have been written and counted.
+func (r *runner) step(
+	name string,
+	saturating []string,
+	barriers []*derphttp.Client,
+	events []traceEvent,
+) stepTrace {
+	for _, client := range barriers {
+		pingPong(client, [8]byte{0x9b, 0x1c, 0x2d, 0x3e, 0x4f, 0x50, 0x61, 0x72})
+	}
+
+	step, raw := r.collector.step(name, saturating, r.connections, events)
+	r.raw[name] = raw
+	return step
 }
 
 func (r *runner) connect(
@@ -397,6 +470,13 @@ func (r *runner) label(peer key.NodePublic) string {
 		fail("no label registered for peer %v", peer)
 	}
 	return label
+}
+
+// unknownPeer mints a key that never connects, under a stable trace label.
+func (r *runner) unknownPeer(label string) key.NodePublic {
+	peer := key.NewNode().Public()
+	r.labels[peer] = label
+	return peer
 }
 
 func (r *runner) packetEvent(client string, packet derp.ReceivedPacket) traceEvent {
@@ -456,15 +536,15 @@ func presenceFlags(flags derp.PeerPresentFlags) string {
 	return strings.Join(names, "|")
 }
 
-// relayAndDrops relays packets, answers a ping, reports an unknown destination,
-// and then overruns a recipient that has stopped reading.
+// relayAndDrops relays packets, answers a ping, reports unknown destinations of
+// both packet kinds, and then overruns a recipient that has stopped reading.
 func relayAndDrops(r *runner) scenarioTrace {
 	scenario := scenarioTrace{Name: "relay_and_drops"}
 
 	first, firstInfo := r.connect("first", "", key.NewNode(), key.DERPMesh{}, false)
 	second, secondInfo := r.connect("second", "", key.NewNode(), key.DERPMesh{}, false)
 	stalled, stalledInfo := r.connect("stalled", "", key.NewNode(), key.DERPMesh{}, false)
-	scenario.add(r.step("connect_clients", modeExact,
+	scenario.add(r.step("connect_clients", nil, nil,
 		[]traceEvent{firstInfo, secondInfo, stalledInfo}))
 
 	payloads := [][]byte{
@@ -478,50 +558,57 @@ func relayAndDrops(r *runner) scenarioTrace {
 		packet := requirePacket(recvTimeout(second), first.SelfPublicKey(), payload)
 		relayed = append(relayed, r.packetEvent("second", packet))
 	}
-	scenario.add(r.step("relay_payloads", modeExact, relayed))
+	scenario.add(r.step("relay_payloads", nil, clients(second), relayed))
 
 	pong := pingPong(first, [8]byte{0xd0, 0xe1, 0xf2, 0x03, 0x14, 0x25, 0x36, 0x47})
 	digest := sha256.Sum256(pong[:])
-	scenario.add(r.step("ping_pong", modeExact, []traceEvent{{
+	scenario.add(r.step("ping_pong", nil, nil, []traceEvent{{
 		Kind:   "pong",
 		Client: "first",
 		Size:   len(pong),
 		SHA256: hex.EncodeToString(digest[:]),
 	}}))
 
-	unknown := key.NewNode().Public()
-	r.labels[unknown] = "unknown"
-	discoPacket := unknown.AppendTo([]byte(disco.Magic))
-	discoPacket = append(discoPacket, make([]byte, disco.NonceLen)...)
-	must(second.Send(unknown, discoPacket))
-	gone := requirePeerGone(recvTimeout(second), unknown)
-	scenario.add(r.step("unknown_destination", modeExact,
-		[]traceEvent{r.peerGoneEvent("second", gone)}))
+	// A disco packet to a key nobody holds is dropped and answered with a
+	// not-here frame; a plain packet to one is dropped silently.
+	discoUnknown := r.unknownPeer("unknown_disco")
+	must(second.Send(discoUnknown, discoPayload(discoUnknown, 0)))
+	scenario.add(r.step("unknown_destination_disco", nil, clients(second), []traceEvent{
+		r.peerGoneEvent("second", requirePeerGone(recvTimeout(second), discoUnknown)),
+	}))
 
-	// The stalled client never reads, so its socket buffers and then the
-	// server's per-client send queue fill and the server starts dropping.
-	flood := bytes.Repeat([]byte{0x5a}, derp.MaxPacketSize)
-	for range floodPackets {
-		must(second.Send(stalled.SelfPublicKey(), flood))
+	plainUnknown := r.unknownPeer("unknown_plain")
+	must(first.Send(plainUnknown, []byte("plain packet to nobody")))
+	scenario.add(r.step("unknown_destination_plain", nil, clients(first), nil))
+
+	// The stalled client never reads. The ordinary flood fills its socket
+	// buffers and then overruns the ordinary send queue; with the writer stuck
+	// on that queue, the disco flood overruns the separate disco queue.
+	ordinaryFlood := bytes.Repeat([]byte{0x5a}, derp.MaxPacketSize)
+	discoFlood := discoPayload(stalled.SelfPublicKey(), derp.MaxPacketSize)
+	for range ordinaryFloodPackets {
+		must(second.Send(stalled.SelfPublicKey(), ordinaryFlood))
 	}
-	// A ping answered on the sender's own connection proves the server has
-	// read and routed every flood frame ahead of it, so the drops all land in
-	// this step rather than leaking into the next one.
-	barrier(second)
-	scenario.add(r.step("flood_stalled_recipient", modeSaturating, nil))
+	for range discoFloodPackets {
+		must(second.Send(stalled.SelfPublicKey(), discoFlood))
+	}
+	scenario.add(r.step("flood_stalled_recipient", queuePressure, clients(second), nil))
 
+	// Once the recipient reads again, the writer hands over exactly what the
+	// two 32-deep send queues plus the one packet in flight still hold, so this
+	// step pins the send-queue depth exactly; only the drop cells stay signed.
 	drain(stalled)
 	r.close(stalled)
-	scenario.add(r.step("drain_stalled_recipient", modeSaturating, nil))
+	scenario.add(r.step("drain_stalled_recipient", droppedCounters, nil, nil))
+	assertConservation(r, "flood_stalled_recipient", "drain_stalled_recipient")
 
 	firstPublic := first.SelfPublicKey()
 	r.close(first)
-	scenario.add(r.step("close_first", modeExact, []traceEvent{
-		r.peerGoneEvent("second", requirePeerGone(recvTimeout(second), firstPublic)),
-	}))
+	goneFirst := r.peerGoneEvent("second", requirePeerGone(recvTimeout(second), firstPublic))
+	scenario.add(r.step("close_first", nil, clients(second), []traceEvent{goneFirst}))
 
 	r.close(second)
-	scenario.add(r.step("close_second", modeExact, nil))
+	scenario.add(r.step("close_second", nil, nil, nil))
 	return scenario
 }
 
@@ -535,48 +622,49 @@ func duplicateKeys(r *runner) scenarioTrace {
 	older, olderInfo := r.connect("older", "", duplicate, key.DERPMesh{}, false)
 	newer, newerInfo := r.connect("newer", "", duplicate, key.DERPMesh{}, false)
 	sender, senderInfo := r.connect("sender", "", key.NewNode(), key.DERPMesh{}, false)
-	scenario.add(r.step("connect_duplicates", modeExact,
+	scenario.add(r.step("connect_duplicates", nil, nil,
 		[]traceEvent{olderInfo, newerInfo, senderInfo}))
 
 	newestPayload := []byte("newest duplicate")
 	must(sender.Send(duplicate.Public(), newestPayload))
-	scenario.add(r.step("newest_connection_receives", modeExact, []traceEvent{
-		r.packetEvent("newer",
-			requirePacket(recvTimeout(newer), sender.SelfPublicKey(), newestPayload)),
-	}))
+	newestEvent := r.packetEvent("newer",
+		requirePacket(recvTimeout(newer), sender.SelfPublicKey(), newestPayload))
+	scenario.add(r.step("newest_connection_receives", nil, clients(newer),
+		[]traceEvent{newestEvent}))
 
 	olderPayload := []byte("older active")
 	must(older.Send(sender.SelfPublicKey(), olderPayload))
-	scenario.add(r.step("older_connection_writes", modeExact, []traceEvent{
-		r.packetEvent("sender",
-			requirePacket(recvTimeout(sender), duplicate.Public(), olderPayload)),
-	}))
+	olderEvent := r.packetEvent("sender",
+		requirePacket(recvTimeout(sender), duplicate.Public(), olderPayload))
+	scenario.add(r.step("older_connection_writes", nil, clients(sender),
+		[]traceEvent{olderEvent}))
 
 	lastPayload := []byte("last writer")
 	must(sender.Send(duplicate.Public(), lastPayload))
-	scenario.add(r.step("last_writer_receives", modeExact, []traceEvent{
-		r.packetEvent("older",
-			requirePacket(recvTimeout(older), sender.SelfPublicKey(), lastPayload)),
-	}))
+	lastEvent := r.packetEvent("older",
+		requirePacket(recvTimeout(older), sender.SelfPublicKey(), lastPayload))
+	scenario.add(r.step("last_writer_receives", nil, clients(older),
+		[]traceEvent{lastEvent}))
 
 	r.close(older)
 	r.close(newer)
-	scenario.add(r.step("close_duplicate_connections", modeExact, []traceEvent{
-		r.peerGoneEvent("sender",
-			requirePeerGone(recvTimeout(sender), duplicate.Public())),
-	}))
+	goneDuplicate := r.peerGoneEvent("sender",
+		requirePeerGone(recvTimeout(sender), duplicate.Public()))
+	scenario.add(r.step("close_duplicate_connections", nil, clients(sender),
+		[]traceEvent{goneDuplicate}))
 
 	r.close(sender)
 	return scenario
 }
 
 // watchPresence drives a trusted mesh watcher over the presence snapshot, a
-// later arrival, and a departure.
+// forwarded packet for a destination this server does not hold, a later
+// arrival, and a departure.
 func watchPresence(r *runner) scenarioTrace {
 	scenario := scenarioTrace{Name: "watch_presence"}
 
 	alpha, alphaInfo := r.connect("alpha", "alpha-app", key.NewNode(), key.DERPMesh{}, false)
-	scenario.add(r.step("connect_regular", modeExact, []traceEvent{alphaInfo}))
+	scenario.add(r.step("connect_regular", nil, nil, []traceEvent{alphaInfo}))
 
 	watcher, watcherInfo := r.connect("watcher", "", key.NewNode(), r.meshKey, true)
 	snapshot := []traceEvent{}
@@ -586,29 +674,61 @@ func watchPresence(r *runner) scenarioTrace {
 	}
 	// The initial snapshot enumerates connected peers in unspecified order.
 	sortEvents(snapshot)
-	scenario.add(r.step("connect_watcher", modeExact,
+	scenario.add(r.step("connect_watcher", nil, clients(watcher),
 		append([]traceEvent{watcherInfo}, snapshot...)))
 
+	// A mesh peer may forward for a key this server does not hold. As on the
+	// local send path, only the disco packet earns a not-here reply.
+	plainForward := r.unknownPeer("unknown_forward_plain")
+	must(watcher.ForwardPacket(alpha.SelfPublicKey(), plainForward, []byte("forwarded nowhere")))
+	discoForward := r.unknownPeer("unknown_forward_disco")
+	must(watcher.ForwardPacket(
+		alpha.SelfPublicKey(), discoForward, discoPayload(discoForward, 0)))
+	goneForward := r.peerGoneEvent("watcher",
+		requirePeerGone(recvTimeout(watcher), discoForward))
+	scenario.add(r.step("forward_unknown_destination", nil, clients(watcher),
+		[]traceEvent{goneForward}))
+
 	beta, betaInfo := r.connect("beta", "beta-app", key.NewNode(), key.DERPMesh{}, false)
-	scenario.add(r.step("present_second_regular", modeExact, []traceEvent{
-		betaInfo,
-		r.presenceEvent("watcher", requirePresent(recvTimeout(watcher))),
-	}))
+	betaPresence := r.presenceEvent("watcher", requirePresent(recvTimeout(watcher)))
+	scenario.add(r.step("present_second_regular", nil, clients(watcher),
+		[]traceEvent{betaInfo, betaPresence}))
 
 	betaPublic := beta.SelfPublicKey()
 	r.close(beta)
-	scenario.add(r.step("close_second_regular", modeExact, []traceEvent{
-		r.peerGoneEvent("watcher", requirePeerGone(recvTimeout(watcher), betaPublic)),
-	}))
+	goneBeta := r.peerGoneEvent("watcher", requirePeerGone(recvTimeout(watcher), betaPublic))
+	scenario.add(r.step("close_second_regular", nil, clients(watcher),
+		[]traceEvent{goneBeta}))
 
 	r.close(watcher)
 	r.close(alpha)
 	return scenario
 }
 
+// assertConservation checks each server against itself: every packet the server
+// accepted while the recipient was stalled was either written to that recipient
+// or dropped for a recorded reason, with nothing left over once the recipient
+// has caught up and disconnected.
+func assertConservation(r *runner, floodStep, drainStep string) {
+	flood, drain := r.raw[floodStep], r.raw[drainStep]
+	sent := flood["derp_packets_sent"] + drain["derp_packets_sent"]
+
+	dropped := int64(0)
+	for _, metric := range droppedCounters {
+		dropped += flood[metric] + drain[metric]
+	}
+
+	received := flood["derp_packets_received"]
+	if received != sent+dropped {
+		fail("conservation: received %d != sent %d + dropped %d", received, sent, dropped)
+	}
+}
+
 func (s *scenarioTrace) add(step stepTrace) {
 	s.Steps = append(s.Steps, step)
 }
+
+func clients(values ...*derphttp.Client) []*derphttp.Client { return values }
 
 func sortEvents(events []traceEvent) {
 	sort.Slice(events, func(i, j int) bool {
@@ -620,11 +740,14 @@ func sortEvents(events []traceEvent) {
 	})
 }
 
-// barrier round-trips a ping on one client's own connection. A DERP server
-// reads a connection's frames in order, so the pong proves every frame that
-// client sent earlier has already been routed and accounted for.
-func barrier(client *derphttp.Client) {
-	_ = pingPong(client, [8]byte{0x9b, 0x1c, 0x2d, 0x3e, 0x4f, 0x50, 0x61, 0x72})
+// discoPayload builds a packet both servers classify as disco, padded to size.
+func discoPayload(source key.NodePublic, size int) []byte {
+	payload := source.AppendTo([]byte(disco.Magic))
+	payload = append(payload, make([]byte, disco.NonceLen)...)
+	if size > len(payload) {
+		payload = append(payload, bytes.Repeat([]byte{0x5a}, size-len(payload))...)
+	}
+	return payload
 }
 
 func pingPong(client *derphttp.Client, data [8]byte) derp.PongMessage {
@@ -636,8 +759,8 @@ func pingPong(client *derphttp.Client, data [8]byte) derp.PongMessage {
 	return pong
 }
 
-// drain lets a stalled recipient catch up so its send queue is empty before it
-// disconnects, keeping the shutdown path free of queue-pressure drops.
+// drain lets a stalled recipient catch up so its send queues are empty before
+// it disconnects, keeping the shutdown path free of queue-pressure drops.
 func drain(client *derphttp.Client) {
 	for {
 		received := make(chan recvResult, 1)

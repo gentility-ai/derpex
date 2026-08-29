@@ -50,11 +50,45 @@ defmodule Derpex.Interop.DifferentialTest do
         @operations_token
       ])
 
+    # Compare scenario by scenario and step by step first, so a divergence names
+    # the step that produced it instead of printing two whole traces.
+    assert_same_shape(derpex, oracle)
     assert derpex == oracle
 
-    # The traces are only worth comparing if the oracle's own run moved the
-    # counters the scenarios claim to exercise; identical all-zero traces would
-    # otherwise pass trivially.
+    assert_non_vacuous(oracle)
+  end
+
+  defp assert_same_shape(derpex, oracle) do
+    assert Enum.map(derpex["scenarios"], & &1["name"]) ==
+             Enum.map(oracle["scenarios"], & &1["name"])
+
+    for {derpex_scenario, oracle_scenario} <-
+          Enum.zip(derpex["scenarios"], oracle["scenarios"]) do
+      name = oracle_scenario["name"]
+
+      assert Enum.map(derpex_scenario["steps"], & &1["step"]) ==
+               Enum.map(oracle_scenario["steps"], & &1["step"]),
+             "#{name}: step sequence differs"
+
+      for {derpex_step, oracle_step} <-
+            Enum.zip(derpex_scenario["steps"], oracle_scenario["steps"]) do
+        step = oracle_step["step"]
+
+        assert derpex_step["counters"] == oracle_step["counters"],
+               "#{name}/#{step}: counter deltas differ"
+
+        assert derpex_step["events"] == oracle_step["events"],
+               "#{name}/#{step}: observed frames differ"
+
+        assert derpex_step["saturating"] == oracle_step["saturating"],
+               "#{name}/#{step}: comparison policy differs"
+      end
+    end
+  end
+
+  # Two identical all-zero traces would compare equal without proving anything,
+  # so the oracle's own run has to have moved the counters its scenarios claim.
+  defp assert_non_vacuous(oracle) do
     assert Enum.map(oracle["scenarios"], & &1["name"]) ==
              ["relay_and_drops", "duplicate_keys", "watch_presence"]
 
@@ -62,50 +96,74 @@ defmodule Derpex.Interop.DifferentialTest do
     assert counter(oracle, "relay_and_drops", "ping_pong", "derp_got_ping") == 1
     assert counter(oracle, "relay_and_drops", "ping_pong", "derp_sent_pong") == 1
 
-    assert counter(
-             oracle,
-             "relay_and_drops",
-             "unknown_destination",
-             ~s(derp_packets_dropped{kind="disco",reason="unknown_dest"})
-           ) == 1
+    for {step, kind} <- [
+          {"unknown_destination_disco", "disco"},
+          {"unknown_destination_plain", "other"}
+        ] do
+      assert counter(oracle, "relay_and_drops", step, dropped(kind, "unknown_dest")) == 1
+    end
 
+    # Only a disco packet earns a not-here reply on either server.
     assert counter(
              oracle,
              "relay_and_drops",
-             "unknown_destination",
+             "unknown_destination_disco",
              "derp_peer_gone_not_here_frames"
            ) == 1
 
     assert counter(
              oracle,
              "relay_and_drops",
-             "flood_stalled_recipient",
-             ~s(derp_packets_dropped{kind="other",reason="queue_head"})
-           ) == 1
+             "unknown_destination_plain",
+             "derp_peer_gone_not_here_frames"
+           ) == 0
+
+    # Both queues overrun. These cells are sign-compared, so 1 means "drops
+    # happened" rather than "one packet was dropped".
+    for kind <- ["disco", "other"] do
+      assert counter(
+               oracle,
+               "relay_and_drops",
+               "flood_stalled_recipient",
+               dropped(kind, "queue_head")
+             ) >
+               0
+    end
+
+    assert counter(oracle, "relay_and_drops", "flood_stalled_recipient", "derp_packets_received") ==
+             192
+
+    # 32-deep ordinary queue + 32-deep disco queue + the packet in flight.
+    assert counter(oracle, "relay_and_drops", "drain_stalled_recipient", "derp_packets_sent") ==
+             65
 
     assert counter(oracle, "relay_and_drops", "close_first", "derp_peer_gone_disconnected_frames") ==
              1
 
-    assert counter(
-             oracle,
-             "duplicate_keys",
-             "connect_duplicates",
-             "derp_total_dup_client_conns"
-           ) == 1
+    for {metric, expected} <- [
+          {"derp_total_dup_client_conns", 1},
+          {"derp_current_dup_client_keys", 1},
+          {"derp_current_dup_client_conns", 2}
+        ] do
+      assert counter(oracle, "duplicate_keys", "connect_duplicates", metric) == expected
+    end
 
     assert counter(
              oracle,
-             "duplicate_keys",
-             "connect_duplicates",
-             "derp_current_dup_client_keys"
-           ) == 1
+             "watch_presence",
+             "forward_unknown_destination",
+             "derp_packets_forwarded_in"
+           ) ==
+             2
 
-    assert counter(
-             oracle,
-             "duplicate_keys",
-             "connect_duplicates",
-             "derp_current_dup_client_conns"
-           ) == 2
+    for kind <- ["disco", "other"] do
+      assert counter(
+               oracle,
+               "watch_presence",
+               "forward_unknown_destination",
+               dropped(kind, "unknown_dest_on_fwd")
+             ) == 1
+    end
 
     assert counter(
              oracle,
@@ -117,6 +175,8 @@ defmodule Derpex.Interop.DifferentialTest do
     assert Enum.map(events(oracle, "watch_presence", "connect_watcher"), & &1["kind"]) ==
              ["server_info", "peer_present", "peer_present"]
   end
+
+  defp dropped(kind, reason), do: ~s(derp_packets_dropped{kind="#{kind}",reason="#{reason}"})
 
   defp step(trace, scenario_name, step_name) do
     scenario = Enum.find(trace["scenarios"], &(&1["name"] == scenario_name))
