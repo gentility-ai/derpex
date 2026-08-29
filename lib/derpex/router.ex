@@ -377,7 +377,7 @@ defmodule Derpex.Router do
     state.routes
     |> snapshot_presence()
     |> Enum.each(fn message ->
-      _enqueue_result = safe_enqueue(lifecycle, message)
+      _enqueue_result = notify_enqueue(lifecycle, message)
     end)
 
     {monitor, monitors} = ensure_monitor(state.monitors, connection)
@@ -663,7 +663,7 @@ defmodule Derpex.Router do
     key
     |> ReversePaths.take()
     |> Enum.each(fn {_destination_connection, lifecycle} ->
-      _enqueue_result = safe_enqueue(lifecycle, {:peer_gone, key, 0x00})
+      _enqueue_result = notify_enqueue(lifecycle, {:peer_gone, key, 0x00})
     end)
   end
 
@@ -712,7 +712,7 @@ defmodule Derpex.Router do
 
   defp broadcast(watchers, message) do
     Enum.each(watchers, fn {_connection, lifecycle} ->
-      _enqueue_result = safe_enqueue(lifecycle, message)
+      _enqueue_result = notify_enqueue(lifecycle, message)
     end)
 
     :ok
@@ -733,11 +733,16 @@ defmodule Derpex.Router do
     %{state | forwarders: Map.put(state.forwarders, key, entries)}
   end
 
-  defp safe_enqueue(ring, message) do
-    Ring.enqueue(ring, message)
+  defp safe_enqueue(ring, message, options \\ []) do
+    Ring.enqueue(ring, message, options)
   rescue
     ArgumentError -> {:dropped, :closed_destination}
   end
+
+  # The router is a singleton. Waiting a millisecond for one connection's writer
+  # is a millisecond every other connection waits for the router, so lifecycle
+  # fan-out never naps on a held ring lock.
+  defp notify_enqueue(ring, message), do: safe_enqueue(ring, message, wait: false)
 
   defp route_forwarder(source, destination, packet) do
     case :ets.lookup(@forwarders_table, destination) do

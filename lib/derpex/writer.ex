@@ -1,5 +1,11 @@
 defmodule Derpex.Writer do
-  @moduledoc "The sole socket writer for one DERP connection."
+  @moduledoc """
+  The sole socket writer for one DERP connection.
+
+  A wakeup drains the rings until they are empty. A ring locked by a producer
+  ends the drain: the writer never re-wakes itself, it schedules one short retry
+  because the producer may have coalesced its wake into the one being handled.
+  """
 
   use GenServer
 
@@ -10,6 +16,8 @@ defmodule Derpex.Writer do
   alias Derpex.WebSocket.Frame, as: WebSocketFrame
 
   @wake_message :derpex_outbox_ready
+  @retry_message :derpex_outbox_retry
+  @retry_interval_ms 5
   @websocket_chunk_size 16 * 1_024
 
   @type rings :: %{
@@ -24,8 +32,13 @@ defmodule Derpex.Writer do
     GenServer.start_link(__MODULE__, options)
   end
 
-  @doc "Attaches fixed rings before the connection is registered for routing."
-  @spec attach(pid(), rings()) :: :ok
+  @doc """
+  Attaches fixed rings before the connection is registered for routing.
+
+  The attaching call drains whatever the rings already hold, so it reports a
+  failed socket write rather than reporting success and stopping silently.
+  """
+  @spec attach(pid(), rings()) :: :ok | {:error, term()}
   def attach(writer, rings), do: GenServer.call(writer, {:attach, rings})
 
   @doc "Writes bounded handshake/HTTP control data in call order."
@@ -65,13 +78,20 @@ defmodule Derpex.Writer do
        metrics: Keyword.get(options, :metrics),
        wire_mode: :native,
        rings: nil,
+       retry_timer: nil,
        sender_cardinality: Cardinality.new()
      }}
   end
 
   @impl true
   def handle_call({:attach, rings}, _from, %{rings: nil} = state) do
-    {:reply, :ok, %{state | rings: rings}}
+    # A wakeup that arrived before the rings did was dropped, and the ring sends
+    # no other one until an empty take clears its pending wake, so the first
+    # drain happens here rather than waiting for a wakeup that never comes.
+    case drain(%{state | rings: rings}) do
+      {:ok, state} -> {:reply, :ok, state}
+      {:error, reason, state} -> {:stop, {:write_error, reason}, {:error, reason}, state}
+    end
   end
 
   def handle_call({:control, data}, _from, state) do
@@ -93,16 +113,29 @@ defmodule Derpex.Writer do
 
   @impl true
   def handle_info(@wake_message, %{rings: rings} = state) when is_map(rings) do
-    case drain(state) do
-      {:ok, state} -> {:noreply, state}
-      {:error, reason, state} -> {:stop, {:write_error, reason}, state}
-    end
+    drain_or_stop(state)
   end
 
   def handle_info(@wake_message, state), do: {:noreply, state}
 
+  # The reference makes a message from an already-cancelled timer identifiable,
+  # so it cannot clear the bookkeeping of the timer that replaced it.
+  def handle_info({@retry_message, reference}, %{retry_timer: {reference, _timer}} = state) do
+    state = %{state | retry_timer: nil}
+    if is_map(state.rings), do: drain_or_stop(state), else: {:noreply, state}
+  end
+
+  def handle_info({@retry_message, _stale_reference}, state), do: {:noreply, state}
+
   def handle_info({:DOWN, monitor, :process, _owner, reason}, %{owner_monitor: monitor} = state) do
     {:stop, {:owner_down, reason}, state}
+  end
+
+  defp drain_or_stop(state) do
+    case state |> cancel_retry() |> drain() do
+      {:ok, state} -> {:noreply, state}
+      {:error, reason, state} -> {:stop, {:write_error, reason}, state}
+    end
   end
 
   defp drain(state) do
@@ -125,12 +158,38 @@ defmodule Derpex.Writer do
         {:ok, state}
 
       :busy ->
-        send(self(), @wake_message)
-        {:ok, state}
+        {:ok, schedule_retry(state)}
 
       :closed ->
         {:ok, state}
     end
+  end
+
+  # A producer holds the ring lock. It signals the wake flag under that lock, so
+  # a wakeup is only guaranteed when the flag was clear; when it was already set
+  # by the wakeup being handled right now, this timer is the one that comes back.
+  defp schedule_retry(%{retry_timer: nil} = state) do
+    reference = make_ref()
+    timer = Process.send_after(self(), {@retry_message, reference}, @retry_interval_ms)
+    %{state | retry_timer: {reference, timer}}
+  end
+
+  defp schedule_retry(state), do: state
+
+  # The drain that is starting supersedes an earlier retry, so the writer keeps
+  # at most one outstanding retry and never accumulates timer messages.
+  defp cancel_retry(%{retry_timer: nil} = state), do: state
+
+  defp cancel_retry(%{retry_timer: {reference, timer}} = state) do
+    if Process.cancel_timer(timer) == false do
+      receive do
+        {@retry_message, ^reference} -> :ok
+      after
+        0 -> :ok
+      end
+    end
+
+    %{state | retry_timer: nil}
   end
 
   defp take_next(%{lifecycle: lifecycle} = rings) do
