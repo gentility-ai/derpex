@@ -116,26 +116,49 @@ defmodule Derpex.Connection do
         state
         |> Map.put(:decoder, decoder)
         |> process_frames(frames, actions)
+        |> charge_after_authentication()
 
       {:error, reason} ->
         close(state, reason, [])
     end
   end
 
-  # The limiter is charged for every byte a header declared, before the frames
-  # in this chunk are acted on and before the rest of a large body has arrived.
+  # The limiter is charged once per frame, for every byte that frame's header
+  # declared, before the frames in this chunk are acted on and before the rest
+  # of a large body has arrived. One charge per frame rather than one per chunk,
+  # because the limiter clamps each charge to the minimum burst: a chunk full of
+  # pipelined frames would otherwise cost what a single frame costs.
+  #
   # Before authentication there is no per-client limiter - as in Go, where
   # rateLimit runs only in the authenticated read loop - so what a pipelined
-  # frame declared stays on the decoder's tally and is charged on the next
-  # chunk, which for a large body is the next chunk of that same body.
+  # frame declared stays on the decoder's tally.
   defp charge(%__MODULE__{phase: :authenticated}, decoder) do
-    case Decoder.take_charge(decoder) do
-      {0, decoder} -> {[], decoder}
-      {charged, decoder} -> {[{:rate_limit, charged}], decoder}
-    end
+    {charges, decoder} = Decoder.take_charge(decoder)
+    {Enum.map(charges, &{:rate_limit, &1}), decoder}
   end
 
   defp charge(_state, decoder), do: {[], decoder}
+
+  # The phase is read before the frames are acted on, so the chunk carrying the
+  # ClientInfo frame is charged as unauthenticated. What was pipelined behind
+  # it is this connection's first real traffic, and it was never charged at all:
+  # by the next chunk the tally has been cleared with it. The handshake frame
+  # itself is discharged when it authenticates, so what is left here is traffic.
+  defp charge_after_authentication(
+         {:ok, %__MODULE__{phase: :authenticated} = state, actions} = result
+       ) do
+    case Decoder.take_charge(state.decoder) do
+      # The ordinary case: this chunk's headers were charged before its frames
+      # were acted on, and nothing has been added to the tally since.
+      {[], _decoder} ->
+        result
+
+      {charges, decoder} ->
+        {:ok, %{state | decoder: decoder}, actions ++ Enum.map(charges, &{:rate_limit, &1})}
+    end
+  end
+
+  defp charge_after_authentication(result), do: result
 
   @doc "Applies a named protocol deadline."
   @spec timeout(t(), atom()) :: {:ok, t(), []} | {:close, t(), atom(), []}

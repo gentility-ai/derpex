@@ -19,7 +19,7 @@ defmodule Derpex.Frame.Decoder do
             fragments: [],
             max_frame_length: @default_max_frame_length,
             frame_policy: nil,
-            charged: 0
+            charged: []
 
   @type frame :: {Frame.type_code(), binary() | {:discarded, non_neg_integer()}}
   @type frame_mode :: :buffer | :discard
@@ -36,7 +36,7 @@ defmodule Derpex.Frame.Decoder do
             fragments: [binary()],
             max_frame_length: non_neg_integer(),
             frame_policy: nil | frame_policy(),
-            charged: non_neg_integer()
+            charged: [non_neg_integer()]
           }
 
   @doc "Creates an empty decoder with a bounded accepted frame length."
@@ -52,26 +52,34 @@ defmodule Derpex.Frame.Decoder do
   end
 
   @doc """
-  Returns and clears the declared length of every header accepted so far.
+  Returns and clears the declared length of each header accepted so far.
 
-  Go charges its receive limiter as soon as it has read a frame header
-  (`derpserver.go`, right after `readFrameHeader`), not once the body has
-  arrived: a frame that declares four gigabytes must be rate-limited before it
-  streams, not after. The decoder counts what has been declared so the caller
-  can charge it at the same point.
+  Go charges its receive limiter once per frame, as soon as it has read that
+  frame's header and before it handles it: `rateLimit(int(fl))` immediately
+  after `readFrameHeader` in the authenticated read loop
+  (`../tailscale/derp/derpserver/derpserver.go`, `sclient.handleFrames`). It is
+  charged at the header rather than at the body because a frame that declares
+  four gigabytes must be rate-limited before it streams, not after.
+
+  The lengths are returned one per frame, not summed, because the limiter clamps
+  each charge to the minimum burst: summing a chunk's headers lets that clamp
+  apply to the chunk instead, so two hundred pipelined thousand-byte frames cost
+  what one maximum frame costs.
   """
-  @spec take_charge(t()) :: {non_neg_integer(), t()}
-  def take_charge(%__MODULE__{charged: charged} = decoder), do: {charged, %{decoder | charged: 0}}
+  @spec take_charge(t()) :: {[non_neg_integer()], t()}
+  def take_charge(%__MODULE__{charged: charged} = decoder),
+    do: {Enum.reverse(charged), %{decoder | charged: []}}
 
   @doc """
-  Removes `length` bytes from the tally, for a frame the caller does not charge.
+  Removes one frame of `length` bytes from the tally, for a frame the caller
+  does not charge.
 
   Go reads the ClientInfo frame before its rate-limited loop starts, so the
   handshake frame is never charged to the client it authenticates.
   """
   @spec discharge(t(), non_neg_integer()) :: t()
   def discharge(%__MODULE__{} = decoder, length),
-    do: %{decoder | charged: max(decoder.charged - length, 0)}
+    do: %{decoder | charged: List.delete(decoder.charged, length)}
 
   @doc "Changes the limit applied to subsequent frame headers."
   @spec with_max_frame_length(t(), non_neg_integer()) :: t()
@@ -149,7 +157,7 @@ defmodule Derpex.Frame.Decoder do
   defp start_frame(decoder, type, payload_length, mode, chunk, frames) do
     decoder = %{
       decoder
-      | charged: decoder.charged + payload_length,
+      | charged: [payload_length | decoder.charged],
         type: type,
         mode: mode,
         remaining: payload_length,

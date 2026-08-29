@@ -102,7 +102,8 @@ defmodule Derpex.ConnectionTest do
              {:cancel_timeout, :handshake},
              {:set_timeout, :keep_alive, _interval},
              :activity,
-             {:client_message, {:send_packet, ^destination, "packet"}}
+             {:client_message, {:send_packet, ^destination, "packet"}},
+             {:rate_limit, 38}
            ] = actions
   end
 
@@ -204,6 +205,65 @@ defmodule Derpex.ConnectionTest do
                state,
                IO.iodata_to_binary(Frame.encode(:note_preferred, "wrong"))
              )
+  end
+
+  # Go charges once per frame header, and its limiter clamps each charge to the
+  # minimum burst. One charge for a whole chunk lets that clamp apply to the
+  # chunk instead: two hundred pipelined thousand-byte frames were charged as a
+  # single 203,000-byte frame and cost the bucket 65,568 tokens — a sixteenfold
+  # undercharge, reachable through one WebSocket message.
+  test "every frame header in a chunk is charged on its own" do
+    {server_public, server_private} = Crypto.generate_keypair()
+    {_client_public, client_private} = Crypto.generate_keypair()
+
+    {:ok, client_info_frame} =
+      Handshake.client_info_frame(client_private, server_public, %ClientInfo{version: 2})
+
+    {:ok, state, _actions} = Connection.new(Secret.wrap(server_private))
+
+    {:ok, state, _actions} =
+      Connection.receive_data(state, IO.iodata_to_binary(client_info_frame))
+
+    destination = :crypto.strong_rand_bytes(32)
+    payload = :binary.copy(<<0xA5>>, 1_000)
+    frame = IO.iodata_to_binary(Frame.encode(:send_packet, [destination, payload]))
+    pipelined = 20
+
+    assert {:ok, _state, actions} =
+             Connection.receive_data(state, :binary.copy(frame, pipelined))
+
+    charges = for {:rate_limit, length} <- actions, do: length
+    assert length(charges) == pipelined
+    assert Enum.all?(charges, &(&1 == 32 + byte_size(payload)))
+  end
+
+  # The phase is read before the frames are acted on, so the chunk carrying the
+  # ClientInfo frame is charged as unauthenticated — and what was pipelined
+  # behind it, the connection's first real traffic, went through for free.
+  test "a frame pipelined behind the client info is charged" do
+    {server_public, server_private} = Crypto.generate_keypair()
+    {_client_public, client_private} = Crypto.generate_keypair()
+
+    {:ok, client_info_frame} =
+      Handshake.client_info_frame(client_private, server_public, %ClientInfo{version: 2})
+
+    {:ok, state, _actions} = Connection.new(Secret.wrap(server_private))
+    destination = :crypto.strong_rand_bytes(32)
+    payload = :binary.copy(<<0xA5>>, 1_000)
+    frame = IO.iodata_to_binary(Frame.encode(:send_packet, [destination, payload]))
+
+    assert {:ok, state, actions} =
+             Connection.receive_data(state, IO.iodata_to_binary(client_info_frame) <> frame)
+
+    # The handshake frame itself stays free, as it does in Go: it is read before
+    # the rate-limited loop starts.
+    assert [{:rate_limit, 32 + 1_000}] == for({:rate_limit, _} = action <- actions, do: action)
+
+    # And the tally is not charged a second time on the next chunk.
+    assert {:ok, _state, next_actions} = Connection.receive_data(state, frame)
+
+    assert [{:rate_limit, 32 + 1_000}] ==
+             for({:rate_limit, _} = action <- next_actions, do: action)
   end
 
   test "streams unknown authenticated frames to discard without retaining their bodies" do
