@@ -91,6 +91,43 @@ defmodule Derpex.Certificates.Manual do
     error -> {:error, {:certificate_generation, error}}
   end
 
+  @doc """
+  Generates a self-signed certificate for an IP address or a DNS name.
+
+  A relay that obtains its certificate from a certificate authority still has
+  to bind its listen socket before the first order can finish, so this supplies
+  something for it to bind that names the right identifier.
+  """
+  @spec generate_self_signed(binary()) :: {:ok, {binary(), tuple()}} | {:error, term()}
+  def generate_self_signed(hostname) when is_binary(hostname) do
+    case parse_ip(hostname) do
+      {:ok, _address} -> generate_ip(hostname)
+      :error -> generate_dns(hostname)
+    end
+  end
+
+  defp generate_dns(""), do: {:error, {:invalid_hostname, ""}}
+
+  defp generate_dns(hostname) do
+    private_key = :public_key.generate_key({:rsa, 2_048, 65_537})
+    public_key = {:RSAPublicKey, elem(private_key, 2), elem(private_key, 3)}
+    name = distinguished_name(hostname)
+
+    tbs_certificate =
+      {:OTPTBSCertificate, :v3, serial(), signature_algorithm(), name, validity(), name,
+       subject_public_key_info(public_key), :asn1_NOVALUE, :asn1_NOVALUE,
+       [
+         {:Extension, @basic_constraints_oid, false, {:BasicConstraints, false, :asn1_NOVALUE}},
+         {:Extension, @subject_alt_name_oid, false, [dNSName: String.to_charlist(hostname)]}
+       ]}
+
+    {:ok, {:public_key.pkix_sign(tbs_certificate, private_key), private_key}}
+  rescue
+    error -> {:error, {:certificate_generation, error}}
+  end
+
+  defp serial, do: :crypto.strong_rand_bytes(16) |> :binary.decode_unsigned()
+
   @doc "Verifies that a DER certificate is valid for a DNS name or IP SAN."
   @spec verify_certificate(binary(), binary()) :: :ok | {:error, term()}
   def verify_certificate(certificate_der, hostname),

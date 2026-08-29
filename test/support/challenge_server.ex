@@ -31,6 +31,14 @@ defmodule Derpex.Test.ChallengeServer do
   @doc false
   def delete_challenge(server, path), do: GenServer.call(server, {:delete_challenge, path})
 
+  @doc false
+  def http_response(server, path) do
+    case GenServer.call(server, {:lookup, path}) do
+      nil -> :not_found
+      body -> {:ok, body}
+    end
+  end
+
   @impl true
   def init(_options) do
     {:ok, listen} =

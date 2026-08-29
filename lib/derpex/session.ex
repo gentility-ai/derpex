@@ -64,6 +64,7 @@ defmodule Derpex.Session do
         http_parser: Parser.new(Keyword.get(options, :http_parser, [])),
         http_options:
           Keyword.take(options, [
+            :acme_challenges,
             :bootstrap_dns,
             :remote_address,
             :home_page,

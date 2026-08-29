@@ -49,7 +49,11 @@ defmodule Derpex.Certificates.IPManager do
   @maximum_retry_delay_ms 30 * 60_000
   @renew_interval_ms 60 * 60_000
 
-  @type certificate :: %{certificate_der: binary(), private_key: tuple()}
+  @type certificate :: %{
+          :certificate_der => binary(),
+          :private_key => tuple(),
+          optional(:chain) => [binary()]
+        }
   @type issuer :: (binary(), binary() -> {:ok, certificate()} | {:error, term()})
   @type next_provider :: (binary() -> {:ok, term()} | {:error, term()})
   @type certs_keys :: %{cert: [binary()], key: {atom(), binary()}}
@@ -94,6 +98,19 @@ defmodule Derpex.Certificates.IPManager do
   @spec delete_challenge(GenServer.server(), binary()) :: :ok
   def delete_challenge(manager, path), do: GenServer.call(manager, {:delete_challenge, path})
 
+  @doc """
+  Publishes this manager's certificate for one subject into a listener snapshot.
+
+  A listen socket binds one certificate and cannot be told about a renewal, so
+  the listener reads the current one per connection out of `:persistent_term`.
+  The listener supervisor calls this once, after the manager has started and
+  before the socket is opened.
+  """
+  @spec publish_to(GenServer.server(), term(), binary(), binary()) :: :ok
+  def publish_to(manager, snapshot_key, subject, meta_certificate) do
+    GenServer.call(manager, {:publish_to, snapshot_key, subject, meta_certificate}, :infinity)
+  end
+
   @doc "Returns a challenge response, not-found, or fallback decision."
   @spec http_response(GenServer.server(), binary()) ::
           {:ok, binary()} | :not_found | :fallback
@@ -102,6 +119,19 @@ defmodule Derpex.Certificates.IPManager do
   @doc "The ACME profile required for short-lived IP certificates."
   @spec profile() :: binary()
   def profile, do: @short_lived_profile
+
+  # The shortlived profile is a requirement of IP address certificates, not of
+  # certificates in general, so a DNS hostname is ordered without one.
+  defp profile_for(subject) do
+    case :inet.parse_address(String.to_charlist(subject)) do
+      {:ok, _address} -> @short_lived_profile
+      {:error, _reason} -> nil
+    end
+  end
+
+  defp hostnames(names) do
+    Enum.map(List.wrap(names), &String.downcase(&1, :ascii))
+  end
 
   @doc """
   Issues a persistent self-signed certificate for `ip`.
@@ -150,6 +180,8 @@ defmodule Derpex.Certificates.IPManager do
       directory: directory,
       issuer: issuer,
       next_provider: Keyword.get(options, :next_provider),
+      hostnames: hostnames(Keyword.get(options, :hostnames, [])),
+      snapshot: Keyword.get(options, :snapshot),
       renew_interval_ms: Keyword.get(options, :renew_interval_ms, @renew_interval_ms),
       entries: %{},
       flights: %{},
@@ -166,6 +198,18 @@ defmodule Derpex.Certificates.IPManager do
 
   def handle_call({:certs_keys, local_ip, server_name}, from, state) do
     answer(state, local_ip, server_name, from, :certs_keys)
+  end
+
+  def handle_call({:publish_to, key, subject, meta_certificate}, _from, state) do
+    subject = String.downcase(subject, :ascii)
+    state = %{state | snapshot: {key, subject, meta_certificate}}
+
+    case Map.fetch(state.entries, subject) do
+      {:ok, entry} -> publish_snapshot(state, subject, entry)
+      :error -> :ok
+    end
+
+    {:reply, :ok, state}
   end
 
   def handle_call({:put_challenge, path, response}, _from, state) do
@@ -287,11 +331,16 @@ defmodule Derpex.Certificates.IPManager do
           {deferred, {:error, reason}}
       end
 
+    # The entry is committed before anyone is told about it: a caller that is
+    # released first could otherwise observe the manager without the
+    # certificate it was just handed.
+    state = put_entry(state, ip, entry)
+
     Enum.each(flight.waiters, fn {from, projection} ->
       GenServer.reply(from, reply(reply, projection))
     end)
 
-    put_entry(state, ip, entry)
+    state
   end
 
   defp reply({:error, reason}, _projection), do: {:error, reason}
@@ -311,31 +360,63 @@ defmodule Derpex.Certificates.IPManager do
     )
   end
 
-  defp resolve(state, local_ip, server_name) do
-    case parse_ip(local_ip) do
-      {:ok, local_address} ->
-        route_server_name(state, local_address, server_name)
-
-      :error ->
-        {:error, :unable_to_determine_local_ip, state}
+  defp resolve(state, local, server_name) do
+    case parse_ip(local) do
+      {:ok, local_address} -> route_server_name(state, local_address, server_name)
+      :error -> route_hostname(state, local, server_name)
     end
   end
 
   defp route_server_name(state, local_address, "") do
-    certificate_for_ip(state, canonical(local_address))
+    certificate_for_subject(state, canonical(local_address))
   end
 
   defp route_server_name(state, local_address, server_name) do
     case parse_ip(server_name) do
       {:ok, ^local_address} ->
-        certificate_for_ip(state, canonical(local_address))
+        certificate_for_subject(state, canonical(local_address))
 
       {:ok, _different_address} ->
         {:error, {:sni_ip_mismatch, server_name, canonical(local_address)}, state}
 
       :error ->
-        next_certificate(state, server_name)
+        hostname_certificate(state, server_name)
     end
+  end
+
+  # A listener bound for a DNS hostname rather than a bare address: the
+  # certificate is ordered for the name it was configured with, and a hello
+  # naming anything else is refused rather than answered with it.
+  defp route_hostname(state, hostname, "") do
+    if configured?(state, hostname) do
+      certificate_for_subject(state, String.downcase(hostname, :ascii))
+    else
+      {:error, :unable_to_determine_local_ip, state}
+    end
+  end
+
+  defp route_hostname(state, hostname, server_name) do
+    if configured?(state, hostname) and matches?(hostname, server_name) do
+      certificate_for_subject(state, String.downcase(hostname, :ascii))
+    else
+      hostname_certificate(state, server_name)
+    end
+  end
+
+  defp hostname_certificate(state, server_name) do
+    if configured?(state, server_name) do
+      certificate_for_subject(state, String.downcase(server_name, :ascii))
+    else
+      next_certificate(state, server_name)
+    end
+  end
+
+  defp configured?(state, hostname) do
+    String.downcase(hostname, :ascii) in state.hostnames
+  end
+
+  defp matches?(hostname, server_name) do
+    String.downcase(hostname, :ascii) == String.downcase(server_name, :ascii)
   end
 
   defp next_certificate(%{next_provider: nil} = state, server_name) do
@@ -352,7 +433,7 @@ defmodule Derpex.Certificates.IPManager do
   # Upstream `certForIP`: serve an unexpired certificate, join an issuance
   # already running, refuse while a failed one is still backing off, and
   # otherwise start one.
-  defp certificate_for_ip(state, ip) do
+  defp certificate_for_subject(state, ip) do
     entry = Map.get(state.entries, ip, new_entry())
 
     cond do
@@ -410,11 +491,11 @@ defmodule Derpex.Certificates.IPManager do
   end
 
   defp issue(directory, issuer, ip) do
-    case issuer.(ip, @short_lived_profile) do
+    case issuer.(ip, profile_for(ip)) do
       {:ok, %{certificate_der: certificate_der, private_key: private_key} = certificate} ->
         with :ok <- Manual.verify_certificate(certificate_der, ip),
              {:ok, entry} <- valid_entry(certificate),
-             :ok <- write_cached(directory, ip, certificate_der, private_key) do
+             :ok <- write_cached(directory, ip, chain(certificate), private_key) do
           {:ok, entry}
         else
           {:error, reason} -> {:error, {:issuance, reason}}
@@ -426,20 +507,45 @@ defmodule Derpex.Certificates.IPManager do
   end
 
   defp put_entry(state, ip, entry) do
+    publish_snapshot(state, ip, entry)
     %{state | entries: Map.put(state.entries, ip, entry)}
+  end
+
+  # A listen socket binds one certificate and cannot be told about a renewal,
+  # so the listener reads the current one per connection out of a
+  # `:persistent_term` snapshot — the same mechanism a rotated file-backed
+  # certificate uses. Without this a renewed certificate would reach clients
+  # that send SNI and never reach those that do not.
+  defp publish_snapshot(%{snapshot: nil}, _ip, _entry), do: :ok
+
+  defp publish_snapshot(%{snapshot: {key, subject, meta_certificate}}, ip, entry) do
+    if ip == subject and not is_nil(entry.tls) do
+      :persistent_term.put(key, [
+        %{
+          cert: Certificates.append_meta_certificate(entry.tls.cert, meta_certificate),
+          key: entry.tls.key
+        }
+      ])
+    end
+
+    :ok
   end
 
   defp load_cached(directory, ip) do
     {certificate_path, key_path} = certificate_paths(directory, ip)
 
-    with [{:Certificate, certificate_der, :not_encrypted} | _rest] <-
-           certificate_path |> File.read!() |> :public_key.pem_decode(),
+    with [certificate_der | _intermediates] = chain <-
+           certificate_path |> File.read!() |> chain_from_pem(),
          [key_entry | _rest] <- key_path |> File.read!() |> :public_key.pem_decode(),
          private_key <- :public_key.pem_entry_decode(key_entry),
          true <- Certificates.private_key_matches?(certificate_der, private_key),
          :ok <- Manual.verify_certificate(certificate_der, ip),
          {:ok, entry} <-
-           valid_entry(%{certificate_der: certificate_der, private_key: private_key}),
+           valid_entry(%{
+             certificate_der: certificate_der,
+             chain: chain,
+             private_key: private_key
+           }),
          false <- needs_renewal?(entry) do
       {:ok, entry}
     else
@@ -447,6 +553,13 @@ defmodule Derpex.Certificates.IPManager do
     end
   rescue
     _error -> {:error, :cache_miss}
+  end
+
+  defp chain_from_pem(pem) do
+    Enum.flat_map(:public_key.pem_decode(pem), fn
+      {:Certificate, der, :not_encrypted} -> [der]
+      _other -> []
+    end)
   end
 
   # `Derpex.Clock` is the only time source: renewal and expiry are observable
@@ -473,10 +586,16 @@ defmodule Derpex.Certificates.IPManager do
     end
   end
 
-  defp certs_keys_entry(%{certificate_der: certificate_der, private_key: private_key}) do
+  # A certificate authority returns the leaf followed by the intermediates a
+  # client needs to build a path, so the whole chain is what gets served and
+  # cached. A self-signed issuer returns a leaf and nothing else.
+  defp certs_keys_entry(%{private_key: private_key} = certificate) do
     type = elem(private_key, 0)
-    %{cert: [certificate_der], key: {type, :public_key.der_encode(type, private_key)}}
+    %{cert: chain(certificate), key: {type, :public_key.der_encode(type, private_key)}}
   end
+
+  defp chain(%{chain: [_leaf | _rest] = chain}), do: chain
+  defp chain(%{certificate_der: certificate_der}), do: [certificate_der]
 
   defp valid_now?(entry) do
     now = Clock.system_time(:second)
@@ -526,9 +645,14 @@ defmodule Derpex.Certificates.IPManager do
     DateTime.to_unix(datetime)
   end
 
-  defp write_cached(directory, ip, certificate_der, private_key) do
+  defp write_cached(directory, ip, chain, private_key) do
     {certificate_path, key_path} = certificate_paths(directory, ip)
-    certificate_pem = :public_key.pem_encode([{:Certificate, certificate_der, :not_encrypted}])
+
+    certificate_pem =
+      chain
+      |> Enum.map(&{:Certificate, &1, :not_encrypted})
+      |> :public_key.pem_encode()
+
     key_type = elem(private_key, 0)
 
     key_pem =

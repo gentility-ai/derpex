@@ -7,7 +7,9 @@ defmodule Derpex.HTTP1Test do
 
   alias Derpex.HTTP1
   alias Derpex.HTTP1.Request
+  alias Derpex.Test.ChallengeServer
 
+  @challenge_path "/.well-known/acme-challenge/tok"
   @server_public :binary.copy(<<0xAB>>, 32)
   @operations_token "0123456789abcdef0123456789abcdef"
 
@@ -371,6 +373,45 @@ defmodule Derpex.HTTP1Test do
   test "serves the upstream robots exclusion body" do
     assert {:response, response} = HTTP1.route(request("GET", "/robots.txt"), @server_public)
     assert IO.iodata_to_binary(response) =~ "User-agent: *\nDisallow: /\n"
+  end
+
+  describe "HTTP-01 challenge route" do
+    setup do
+      store = start_supervised!(ChallengeServer)
+      :ok = ChallengeServer.put_challenge(store, @challenge_path, "tok.thumbprint")
+      {:ok, options: [acme_challenges: {ChallengeServer, store}]}
+    end
+
+    test "serves a published key authorization as plain text", context do
+      assert {:response, response} =
+               HTTP1.route(request("GET", @challenge_path), @server_public, context.options)
+
+      response = IO.iodata_to_binary(response)
+      assert response =~ "HTTP/1.1 200 OK\r\n"
+      assert response =~ "Content-Type: text/plain\r\n"
+      assert String.ends_with?(response, "\r\n\r\ntok.thumbprint")
+    end
+
+    test "answers an unknown token with the same 404 any unknown path gets", context do
+      unknown = "/.well-known/acme-challenge/other"
+
+      assert {:response, response} =
+               HTTP1.route(request("GET", unknown), @server_public, context.options)
+
+      assert IO.iodata_to_binary(response) =~ "HTTP/1.1 404 Not Found\r\n"
+    end
+
+    test "refuses a method other than GET", context do
+      assert {:response, response} =
+               HTTP1.route(request("POST", @challenge_path), @server_public, context.options)
+
+      assert IO.iodata_to_binary(response) =~ "HTTP/1.1 405 Method Not Allowed\r\n"
+    end
+  end
+
+  test "the challenge path is not special without a challenge source" do
+    assert {:response, response} = HTTP1.route(request("GET", @challenge_path), @server_public)
+    assert IO.iodata_to_binary(response) =~ "HTTP/1.1 404 Not Found\r\n"
   end
 
   defp request(method, path, headers \\ []) do

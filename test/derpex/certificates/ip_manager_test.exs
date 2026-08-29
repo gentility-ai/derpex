@@ -208,6 +208,132 @@ defmodule Derpex.Certificates.IPManagerTest do
     refute reissued.certificate_der == cached.certificate_der
   end
 
+  test "serves and caches the whole chain an issuer returns" do
+    directory =
+      Path.join(System.tmp_dir!(), "derpex-ipcert-chain-#{System.unique_integer([:positive])}")
+
+    on_exit(fn -> File.rm_rf!(directory) end)
+    {:ok, {intermediate, _key}} = Manual.generate_ip("198.51.100.1")
+
+    issuer = fn ip, profile ->
+      with {:ok, leaf} <- IPManager.self_signed_issuer(ip, profile) do
+        {:ok, Map.put(leaf, :chain, [leaf.certificate_der, intermediate])}
+      end
+    end
+
+    manager = start_supervised!({IPManager, directory: directory, issuer: issuer})
+
+    assert {:ok, %{cert: [leaf, ^intermediate, "meta"]}} =
+             IPManager.certs_keys(manager, "203.0.113.7", "", "meta")
+
+    # A restart reads the same chain back off disk rather than reissuing.
+    :ok = stop_supervised(IPManager)
+    File.write!(Path.join(directory, "marker"), "")
+
+    reader =
+      start_supervised!(
+        Supervisor.child_spec(
+          {IPManager,
+           directory: directory, issuer: fn _ip, _profile -> {:error, :unexpected} end},
+          id: :chain_reader
+        )
+      )
+
+    assert {:ok, %{cert: [^leaf, ^intermediate, "meta"]}} =
+             IPManager.certs_keys(reader, "203.0.113.7", "", "meta")
+  end
+
+  test "orders a configured DNS hostname without the shortlived profile" do
+    directory =
+      Path.join(System.tmp_dir!(), "derpex-ipcert-host-#{System.unique_integer([:positive])}")
+
+    on_exit(fn -> File.rm_rf!(directory) end)
+    calls = start_supervised!({Agent, fn -> [] end})
+
+    issuer = fn subject, profile ->
+      Agent.update(calls, &[{subject, profile} | &1])
+      {:ok, {der, key}} = generate_dns(subject)
+      {:ok, %{certificate_der: der, private_key: key}}
+    end
+
+    manager =
+      start_supervised!(
+        {IPManager, directory: directory, issuer: issuer, hostnames: ["Derp.Example.COM"]}
+      )
+
+    assert {:ok, certificate} = IPManager.certificate(manager, "derp.example.com")
+    assert Agent.get(calls, &Enum.reverse/1) == [{"derp.example.com", nil}]
+    assert :ok = Manual.verify_certificate(certificate.certificate_der, "derp.example.com")
+
+    # SNI naming the same host, in any case, is the same entry.
+    assert IPManager.certificate(manager, "derp.example.com", "DERP.example.com") ==
+             {:ok, certificate}
+
+    # Anything else is refused rather than answered with this certificate.
+    assert {:error, {:no_certificate_for_hostname, "other.example.com"}} =
+             IPManager.certificate(manager, "derp.example.com", "other.example.com")
+
+    assert length(Agent.get(calls, & &1)) == 1
+  end
+
+  test "publishes the bound subject's certificate into the listener snapshot" do
+    directory =
+      Path.join(System.tmp_dir!(), "derpex-ipcert-snap-#{System.unique_integer([:positive])}")
+
+    on_exit(fn -> File.rm_rf!(directory) end)
+    key = {__MODULE__, :snapshot, System.unique_integer([:positive])}
+    on_exit(fn -> :persistent_term.erase(key) end)
+
+    manager =
+      start_supervised!(
+        {IPManager, directory: directory, issuer: &IPManager.self_signed_issuer/2}
+      )
+
+    # Nothing is published until the manager holds a certificate.
+    assert :ok = IPManager.publish_to(manager, key, "203.0.113.7", "meta")
+    assert :persistent_term.get(key, :missing) == :missing
+
+    assert {:ok, certificate} = IPManager.certificate(manager, "203.0.113.7")
+    assert [%{cert: [leaf, "meta"], key: {_type, _der}}] = :persistent_term.get(key)
+    assert leaf == certificate.certificate_der
+
+    # Another address is not this listener's certificate and must not replace it.
+    assert {:ok, _other} = IPManager.certificate(manager, "203.0.113.9")
+    assert [%{cert: [^leaf, "meta"]}] = :persistent_term.get(key)
+  end
+
+  # A minimal DNS-SAN certificate, standing in for one an authority would sign.
+  defp generate_dns(hostname) do
+    key = :public_key.generate_key({:rsa, 2_048, 65_537})
+    public_key = {:RSAPublicKey, elem(key, 2), elem(key, 3)}
+    now = System.system_time(:second)
+
+    name =
+      {:rdnSequence,
+       [[{:AttributeTypeAndValue, {2, 5, 4, 3}, {:utf8String, String.to_charlist(hostname)}}]]}
+
+    tbs =
+      {:OTPTBSCertificate, :v3, 7,
+       {:SignatureAlgorithm, {1, 2, 840, 113_549, 1, 1, 11}, {:asn1_OPENTYPE, <<5, 0>>}}, name,
+       {:Validity, utc(now - 60), utc(now + 30 * 24 * 3_600)}, name,
+       {:OTPSubjectPublicKeyInfo, {:PublicKeyAlgorithm, {1, 2, 840, 113_549, 1, 1, 1}, :NULL},
+        public_key}, :asn1_NOVALUE, :asn1_NOVALUE,
+       [
+         {:Extension, {2, 5, 29, 19}, false, {:BasicConstraints, false, :asn1_NOVALUE}},
+         {:Extension, {2, 5, 29, 17}, false, [dNSName: String.to_charlist(hostname)]}
+       ]}
+
+    {:ok, {:public_key.pkix_sign(tbs, key), key}}
+  end
+
+  defp utc(unix_seconds) do
+    {:utcTime,
+     unix_seconds
+     |> DateTime.from_unix!()
+     |> Calendar.strftime("%y%m%d%H%M%SZ")
+     |> String.to_charlist()}
+  end
+
   defp file_mode(path) do
     {:ok, stat} = File.stat(path)
     Bitwise.band(stat.mode, 0o777)

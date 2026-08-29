@@ -10,9 +10,12 @@ defmodule Derpex.ListenerSupervisor do
 
   use Supervisor
 
+  require Logger
+
   alias Derpex.Admission.Gentility
   alias Derpex.Certificates
   alias Derpex.Certificates.IPManager
+  alias Derpex.Certificates.Manual
   alias Derpex.Certificates.Reloader
   alias Derpex.Crypto
   alias Derpex.Listener.Handler
@@ -151,14 +154,19 @@ defmodule Derpex.ListenerSupervisor do
   # from the same manager.
   defp configure_tls(options, server_public_key, {manager, hostname}) do
     unless Keyword.get(options, :transport_module) == ThousandIsland.Transports.SSL do
-      raise "DERPEX_IP_CERT_ISSUER=self requires a TLS listener"
+      raise "a managed certificate requires a TLS listener"
     end
+
+    snapshot_key = {__MODULE__, :certificate_snapshot, make_ref()}
 
     transport_options =
       options
       |> Keyword.get(:transport_options, [])
       |> drop_transport_options([:certfile, :keyfile, :certs_keys, :sni_fun])
-      |> Kernel.++(managed_certificate_options(manager, hostname, server_public_key))
+      |> Kernel.++(
+        managed_certificate_options(manager, hostname, server_public_key, snapshot_key)
+      )
+      |> put_transport_option(Transports.SSL.snapshot_option(), snapshot_key)
 
     Keyword.put(options, :transport_options, transport_options)
   end
@@ -187,18 +195,51 @@ defmodule Derpex.ListenerSupervisor do
   # once here and shared by the bound options and every SNI answer. Generating
   # an RSA key pair per hello would cost more than the DERP handshake it
   # advertises.
-  defp managed_certificate_options(manager, hostname, server_public_key) do
+  #
+  # `:ssl.listen/2` needs a certificate before the first connection exists, so
+  # the manager is asked for one and, when it cannot supply one — a certificate
+  # authority that is unreachable at boot — the listener still binds with a
+  # self-signed certificate for the same name. What clients actually receive is
+  # the snapshot the manager publishes on every issuance and renewal, which
+  # `Derpex.Listener.Transports.SSL` reads per connection, so an obtained or
+  # renewed certificate reaches hellos with and without SNI alike.
+  defp managed_certificate_options(manager, hostname, server_public_key, snapshot_key) do
     meta_certificate = MetaCertificate.generate(server_public_key)
+    :ok = IPManager.publish_to(manager, snapshot_key, hostname, meta_certificate)
 
+    [
+      certs_keys: [bootstrap_certificate(manager, hostname, meta_certificate)],
+      sni_fun: IPManager.sni_fun(manager, hostname, meta_certificate)
+    ]
+  end
+
+  defp bootstrap_certificate(manager, hostname, meta_certificate) do
     case IPManager.certs_keys(manager, hostname, "", meta_certificate) do
       {:ok, certs_keys} ->
-        [
-          certs_keys: [certs_keys],
-          sni_fun: IPManager.sni_fun(manager, hostname, meta_certificate)
-        ]
+        certs_keys
 
       {:error, reason} ->
-        raise "could not issue an IP certificate for #{hostname}: #{inspect(reason)}"
+        Logger.warning(
+          "DERP listener could not obtain a certificate for #{hostname} at boot " <>
+            "(#{inspect(reason)}); binding a self-signed certificate until one arrives"
+        )
+
+        self_signed_certificate(hostname, meta_certificate)
+    end
+  end
+
+  defp self_signed_certificate(hostname, meta_certificate) do
+    case Manual.generate_self_signed(hostname) do
+      {:ok, {certificate_der, private_key}} ->
+        type = elem(private_key, 0)
+
+        %{
+          cert: Certificates.append_meta_certificate([certificate_der], meta_certificate),
+          key: {type, :public_key.der_encode(type, private_key)}
+        }
+
+      {:error, reason} ->
+        raise "could not bind a certificate for #{hostname}: #{inspect(reason)}"
     end
   end
 

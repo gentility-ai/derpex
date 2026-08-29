@@ -22,6 +22,8 @@ defmodule Derpex.HTTP1 do
   @host_punctuation ~c"!$%&'()*+,-.:;=[]_~"
 
   @doc "Routes a parsed request without consuming bytes read past its headers."
+  @acme_challenge_prefix "/.well-known/acme-challenge/"
+
   @spec route(Request.t(), binary(), keyword()) ::
           {:upgrade, :derp | :websocket, nil | iodata(), map()}
           | {:stream, :debug_traffic, iodata(), keyword()}
@@ -100,6 +102,13 @@ defmodule Derpex.HTTP1 do
 
   defp route_path("/debug/", request, _server_public_key, options),
     do: debug_protected(request, options, &debug_index/0)
+
+  # The certificate authority validating an HTTP-01 challenge connects to the
+  # plaintext port at the address being validated and reads this path. It is
+  # answered before any other route so a challenge cannot be shadowed, and it
+  # exists only while a certificate is being ordered.
+  defp route_path(@acme_challenge_prefix <> _token = path, request, _server_public_key, options),
+    do: acme_challenge(path, request, options)
 
   defp route_path("/robots.txt", request, _server_public_key, _options), do: robots(request)
 
@@ -275,6 +284,28 @@ defmodule Derpex.HTTP1 do
         {:response, Response.encode(500, [{"Content-Type", "text/plain"}], reason <> "\n")}
     end
   end
+
+  # `:acme_challenges` names a `{module, server}` exporting `http_response/2`,
+  # which `Derpex.Certificates.IPManager` does. Without one configured the path
+  # is not special and falls through to the same 404 any unknown path gets.
+  defp acme_challenge(path, request, options) do
+    case Keyword.get(options, :acme_challenges) do
+      {module, server} -> acme_response(module.http_response(server, path), request)
+      _not_configured -> not_found()
+    end
+  end
+
+  defp acme_response(_response, %Request{method: method}) when method != "GET",
+    do: method_not_allowed()
+
+  defp acme_response({:ok, body}, _request) do
+    {:response, Response.encode(200, [{"Content-Type", "text/plain"}], body)}
+  end
+
+  defp acme_response(_absent, _request), do: not_found()
+
+  defp not_found, do: {:response, Response.encode(404, [], "404 page not found
+")}
 
   defp robots(%Request{method: "GET"}) do
     {:response,

@@ -56,7 +56,22 @@ defmodule Derpex.ACME.Client do
   @spec issuer(GenServer.server()) ::
           (binary(), binary() -> {:ok, certificate()} | {:error, term()})
   def issuer(client) do
-    fn ip, profile -> issue(client, {:ip, ip}, profile) end
+    fn subject, profile -> issue(client, identify(subject), profile) end
+  end
+
+  @doc """
+  Classifies a certificate manager's subject as an ACME identifier.
+
+  RFC 8555 identifier types are `dns` and `ip`, and which one an order carries
+  decides how the authority validates it, so it is read from the subject rather
+  than configured.
+  """
+  @spec identify(binary()) :: subject()
+  def identify(subject) do
+    case :inet.parse_address(String.to_charlist(subject)) do
+      {:ok, _address} -> {:ip, subject}
+      {:error, _reason} -> {:dns, subject}
+    end
   end
 
   @doc "Orders one certificate, fulfilling every authorization it requires."
