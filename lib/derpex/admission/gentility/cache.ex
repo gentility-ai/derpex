@@ -23,16 +23,24 @@ defmodule Derpex.Admission.Gentility.Cache do
   def store(nil, _leases, _revocations), do: :ok
 
   def store(path, leases, revocations) when is_binary(path) do
-    data = [
+    write(path, encode(leases, revocations))
+  end
+
+  @doc "Encodes the durable snapshot. Callers build this before handing off the write."
+  @spec encode([binary()], [binary()]) :: iodata()
+  def encode(leases, revocations) do
+    [
       @magic,
       <<@version::16, length(leases)::32>>,
       records(leases),
       <<length(revocations)::32>>,
       records(revocations)
     ]
-
-    Derpex.AtomicFile.write(path, data)
   end
+
+  @doc "Writes an encoded snapshot atomically."
+  @spec write(Path.t(), iodata()) :: :ok | {:error, term()}
+  def write(path, data) when is_binary(path), do: Derpex.AtomicFile.write(path, data)
 
   defp decode(
          <<@magic, @version::16, lease_count::32, rest::binary>>,

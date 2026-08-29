@@ -20,11 +20,14 @@ defmodule Derpex.Admission.Gentility do
 
   use GenServer
 
+  require Logger
+
   @behaviour Derpex.Admission
 
   alias Derpex.Admission.Gentility.Budgets
   alias Derpex.Admission.Gentility.ByteBudget
   alias Derpex.Admission.Gentility.Cache
+  alias Derpex.Admission.Gentility.CacheWriter
   alias Derpex.Admission.Gentility.Contract
   alias Derpex.Admission.Gentility.Lease
   alias Derpex.Admission.Gentility.Revocation
@@ -43,6 +46,9 @@ defmodule Derpex.Admission.Gentility do
   @default_max_byte_delay_ms 30_000
   @default_budget_prune_ms 30_000
   @default_cache_persist_ms 5_000
+  @cache_write_timeout_ms 2_000
+  @budget_prune_chunk 1_000
+  @reverify_chunk 1_000
   defmodule Policy do
     @moduledoc "An immutable, lock-free admission handle obtained from a running controller."
 
@@ -236,18 +242,20 @@ defmodule Derpex.Admission.Gentility do
   def handle_call(:policy, _from, state), do: {:reply, state.policy, state}
 
   def handle_call(:stats, _from, state) do
+    budgets = Budgets.stats(state.budgets)
+
     reply = %{
       cache_entries: map_size(state.leases),
       revocations: map_size(state.revocations),
       active_connections: map_size(state.claims),
-      active_nodes: map_size(state.node_connections),
-      active_organizations: map_size(state.organization_connections),
+      active_nodes: map_size(state.node_claims),
+      active_organizations: map_size(state.organization_claims),
       active_requests: :atomics.get(state.policy.gate, 1),
       max_cache_entries: state.max_cache_entries,
       max_revocations: state.max_revocations,
       cache_full: state.cache_full,
-      budget_nodes: Budgets.stats(state.budgets).nodes,
-      budget_organizations: Budgets.stats(state.budgets).organizations,
+      budget_nodes: budgets.nodes,
+      budget_organizations: budgets.organizations,
       load_error: state.load_error,
       persist_error: state.persist_error
     }
@@ -295,9 +303,7 @@ defmodule Derpex.Admission.Gentility do
   def handle_call({:update_verification_keys, keys}, _from, state) do
     case validate_verification_keys(keys) do
       :ok ->
-        state = reverify_records(%{state | verification_keys: keys})
-        state = persist_now(state)
-        {:reply, :ok, state |> purge_expired() |> reschedule_expiry()}
+        {:reply, :ok, start_reverify(%{state | verification_keys: keys})}
 
       {:error, _reason} = error ->
         {:reply, error, state}
@@ -313,18 +319,31 @@ defmodule Derpex.Admission.Gentility do
   def handle_info({__MODULE__, :expire, _stale}, state), do: {:noreply, state}
 
   def handle_info({__MODULE__, :prune_budgets, token}, %{budget_prune_token: token} = state) do
-    :ok = Budgets.prune(state.budgets)
-    state = %{state | budget_prune_timer: nil, budget_prune_token: nil}
-    {:noreply, schedule_budget_prune(state)}
+    {:noreply, step_budget_prune(%{state | budget_prune_timer: nil}, :start)}
   end
 
   def handle_info({__MODULE__, :prune_budgets, _stale}, state), do: {:noreply, state}
+
+  def handle_info(
+        {__MODULE__, :prune_budgets_step, token},
+        %{budget_prune_token: token} = state
+      ) do
+    {:noreply, step_budget_prune(state, state.budget_prune_cursor)}
+  end
+
+  def handle_info({__MODULE__, :prune_budgets_step, _stale}, state), do: {:noreply, state}
 
   def handle_info({__MODULE__, :persist_cache, token}, %{cache_persist_token: token} = state) do
     {:noreply, flush_cache(%{state | cache_persist_timer: nil, cache_persist_token: nil})}
   end
 
   def handle_info({__MODULE__, :persist_cache, _stale}, state), do: {:noreply, state}
+
+  def handle_info({__MODULE__, :reverify, token}, %{reverify: %{token: token}} = state) do
+    {:noreply, reverify_chunk(state)}
+  end
+
+  def handle_info({__MODULE__, :reverify, _stale}, state), do: {:noreply, state}
 
   def handle_info({:DOWN, monitor, :process, connection, _reason}, state) do
     case state.claims[connection] do
@@ -333,13 +352,22 @@ defmodule Derpex.Admission.Gentility do
     end
   end
 
-  # The usage worker is linked, so its exit still takes the controller down.
-  # Trapping exits only converts that signal into a message.
+  def handle_info({CacheWriter, :write_result, :ok}, state) do
+    {:noreply, %{state | persist_error: nil}}
+  end
+
+  def handle_info({CacheWriter, :write_result, {:error, reason}}, state) do
+    Logger.warning("gentility admission cache write failed: #{inspect(reason)}")
+    {:noreply, mark_cache_dirty(%{state | persist_error: reason})}
+  end
+
+  # The usage worker and the cache writer are linked, so their exits still take
+  # the controller down. Trapping exits only converts the signal into a message.
   def handle_info({:EXIT, pid, reason}, state) do
-    if state.usage && state.usage.server == pid do
-      {:stop, reason, state}
-    else
-      {:noreply, state}
+    cond do
+      state.usage && state.usage.server == pid -> {:stop, reason, state}
+      state.cache_writer == pid -> {:stop, reason, state}
+      true -> unexpected_exit(state, pid, reason)
     end
   end
 
@@ -347,8 +375,9 @@ defmodule Derpex.Admission.Gentility do
   def terminate(_reason, state) do
     cancel_expiry(state)
     cancel_budget_prune(state)
-    _flushed = flush_cache(state)
+    _flushed = flush_cache(state, :sync)
     UsageWorker.stop(state.usage)
+    CacheWriter.stop(state.cache_writer)
     :ok
   end
 
@@ -379,7 +408,10 @@ defmodule Derpex.Admission.Gentility do
     verification_keys = Keyword.fetch!(options, :verification_keys)
     clock = Keyword.get(options, :clock, Clock)
 
+    cache_path = Keyword.get(options, :cache_path)
+
     with :ok <- validate_verification_keys(verification_keys),
+         {:ok, cache_writer} <- initial_cache_writer(cache_path),
          {:ok, usage} <- initial_usage(Keyword.get(options, :usage), clock) do
       budgets = Budgets.new()
 
@@ -399,7 +431,7 @@ defmodule Derpex.Admission.Gentility do
        %{
          policy: policy,
          verification_keys: verification_keys,
-         cache_path: Keyword.get(options, :cache_path),
+         cache_path: cache_path,
          max_cache_entries: max_cache_entries,
          max_revocations: max_revocations,
          max_lease_ms: max_lease_ms,
@@ -414,17 +446,21 @@ defmodule Derpex.Admission.Gentility do
          by_expiry: :gb_trees.empty(),
          unclaimed: :gb_trees.empty(),
          revocations: %{},
+         revocations_by_time: :gb_trees.empty(),
          claims: %{},
-         node_connections: %{},
-         organization_connections: %{},
+         node_claims: %{},
+         organization_claims: %{},
          budgets: budgets,
          budget_prune_ms: budget_prune_ms,
          budget_prune_timer: nil,
          budget_prune_token: nil,
+         budget_prune_cursor: :start,
          cache_persist_ms: cache_persist_ms,
          cache_persist_timer: nil,
          cache_persist_token: nil,
          cache_dirty: false,
+         cache_writer: cache_writer,
+         reverify: nil,
          closing_connections: MapSet.new(),
          cache_full: 0,
          sequence: 0,
@@ -586,7 +622,7 @@ defmodule Derpex.Admission.Gentility do
       state
       |> drop_lease_entry(lease.node_key)
       |> put_lease_entry(lease.node_key, entry)
-      |> Map.update!(:revocations, &Map.delete(&1, lease.node_key))
+      |> drop_revocation_entry(lease.node_key)
 
     candidate =
       if revised_budgets?(candidate, lease, node_revision, organization_revision) do
@@ -660,7 +696,7 @@ defmodule Derpex.Admission.Gentility do
 
   defp expiry_key(node_key, entry), do: {entry.lease.expires_at_ms, node_key}
 
-  defp claimed?(state, node_key), do: Map.get(state.node_connections, node_key, 0) > 0
+  defp claimed?(state, node_key), do: Map.has_key?(state.node_claims, node_key)
 
   defp stale_lease?(nil, _lease), do: false
 
@@ -732,15 +768,44 @@ defmodule Derpex.Admission.Gentility do
       revoked_at_ms: revocation.revoked_at_ms
     }
 
-    revocations =
-      put_bounded_revocation(
-        state.revocations,
-        revocation.node_key,
-        entry,
-        state.max_revocations
-      )
+    {put_revocation_entry(state, revocation.node_key, entry), close?}
+  end
 
-    {%{state | revocations: revocations}, close?}
+  # Revocations are bounded by revocation time: the oldest record is the one
+  # Gentility is soonest to prune, and every lease it could still deny has
+  # expired by then. The order is indexed so that reaching the bound costs a
+  # tree lookup rather than a scan.
+  defp put_revocation_entry(state, node_key, entry) do
+    state = drop_revocation_entry(state, node_key)
+
+    state = %{
+      state
+      | revocations: Map.put(state.revocations, node_key, entry),
+        revocations_by_time:
+          :gb_trees.enter({entry.revoked_at_ms, node_key}, true, state.revocations_by_time)
+    }
+
+    if map_size(state.revocations) <= state.max_revocations do
+      state
+    else
+      {{_revoked_at_ms, oldest}, _present} = :gb_trees.smallest(state.revocations_by_time)
+      drop_revocation_entry(state, oldest)
+    end
+  end
+
+  defp drop_revocation_entry(state, node_key) do
+    case Map.pop(state.revocations, node_key) do
+      {nil, _revocations} ->
+        state
+
+      {entry, revocations} ->
+        %{
+          state
+          | revocations: revocations,
+            revocations_by_time:
+              :gb_trees.delete_any({entry.revoked_at_ms, node_key}, state.revocations_by_time)
+        }
+    end
   end
 
   defp verify_revocations(wires, keys, maximum) when length(wires) <= maximum do
@@ -816,9 +881,9 @@ defmodule Derpex.Admission.Gentility do
       state = %{
         state
         | claims: Map.put(state.claims, connection, claim),
-          node_connections: increment(state.node_connections, node_key),
-          organization_connections:
-            increment(state.organization_connections, lease.organization_id),
+          node_claims: index_claim(state.node_claims, node_key, sequence, connection),
+          organization_claims:
+            index_claim(state.organization_claims, lease.organization_id, sequence, connection),
           budgets: Budgets.add_claim(state.budgets, claim, now_microsecond(state)),
           sequence: sequence
       }
@@ -869,8 +934,8 @@ defmodule Derpex.Admission.Gentility do
     organization_limit =
       Budgets.connection_limit(state.budgets, :organization, lease.organization_id)
 
-    node_count = Map.get(state.node_connections, lease.node_key, 0)
-    organization_count = Map.get(state.organization_connections, lease.organization_id, 0)
+    node_count = claim_count(state.node_claims, lease.node_key)
+    organization_count = claim_count(state.organization_claims, lease.organization_id)
 
     cond do
       node_count >= node_limit -> {:error, :node_connection_limit}
@@ -890,9 +955,15 @@ defmodule Derpex.Admission.Gentility do
         state = %{
           state
           | claims: claims,
-            node_connections: decrement(state.node_connections, claim.node_key),
-            organization_connections:
-              decrement(state.organization_connections, claim.organization_id),
+            node_claims:
+              unindex_claim(state.node_claims, claim.node_key, claim.sequence, connection),
+            organization_claims:
+              unindex_claim(
+                state.organization_claims,
+                claim.organization_id,
+                claim.sequence,
+                connection
+              ),
             budgets: Budgets.remove_claim(state.budgets, claim, now_microsecond(state)),
             closing_connections: MapSet.delete(state.closing_connections, connection)
         }
@@ -903,12 +974,36 @@ defmodule Derpex.Admission.Gentility do
     end
   end
 
-  defp increment(counts, key), do: Map.update(counts, key, 1, &(&1 + 1))
+  # Claims are indexed by node and by organization, ordered by claim sequence, so
+  # counting an identity's connections and finding its newest ones costs what the
+  # answer costs rather than what the census costs.
+  defp index_claim(index, identity, sequence, connection) do
+    Map.update(
+      index,
+      identity,
+      :gb_sets.singleton({sequence, connection}),
+      &:gb_sets.add({sequence, connection}, &1)
+    )
+  end
 
-  defp decrement(counts, key) do
-    case Map.get(counts, key, 0) do
-      count when count <= 1 -> Map.delete(counts, key)
-      count -> Map.put(counts, key, count - 1)
+  defp unindex_claim(index, identity, sequence, connection) do
+    case Map.get(index, identity) do
+      nil ->
+        index
+
+      claims ->
+        claims = :gb_sets.delete_any({sequence, connection}, claims)
+
+        if :gb_sets.is_empty(claims),
+          do: Map.delete(index, identity),
+          else: Map.put(index, identity, claims)
+    end
+  end
+
+  defp claim_count(index, identity) do
+    case Map.get(index, identity) do
+      nil -> 0
+      claims -> :gb_sets.size(claims)
     end
   end
 
@@ -925,39 +1020,43 @@ defmodule Derpex.Admission.Gentility do
   end
 
   defp over_limit_connections(state, node_key, organization_id) do
-    node_count = Map.get(state.node_connections, node_key, 0)
-    node_limit = Budgets.connection_limit(state.budgets, :node, node_key)
-
     node_excess =
       newest_claims(
-        state,
-        fn claim -> claim.node_key == node_key end,
-        max(node_count - node_limit, 0)
+        state.node_claims,
+        node_key,
+        claim_count(state.node_claims, node_key) -
+          Budgets.connection_limit(state.budgets, :node, node_key)
       )
-
-    organization_count = Map.get(state.organization_connections, organization_id, 0)
-
-    organization_limit =
-      Budgets.connection_limit(state.budgets, :organization, organization_id)
 
     organization_excess =
       newest_claims(
-        state,
-        fn claim -> claim.organization_id == organization_id end,
-        max(organization_count - organization_limit, 0)
+        state.organization_claims,
+        organization_id,
+        claim_count(state.organization_claims, organization_id) -
+          Budgets.connection_limit(state.budgets, :organization, organization_id)
       )
 
     Enum.uniq(node_excess ++ organization_excess)
   end
 
-  defp newest_claims(_state, _filter, 0), do: []
+  defp newest_claims(index, identity, count) when count > 0 do
+    case Map.get(index, identity) do
+      nil -> []
+      claims -> take_newest(claims, count, [])
+    end
+  end
 
-  defp newest_claims(state, filter, count) do
-    state.claims
-    |> Enum.filter(fn {_connection, claim} -> filter.(claim) end)
-    |> Enum.sort_by(fn {_connection, claim} -> claim.sequence end, :desc)
-    |> Enum.take(count)
-    |> Enum.map(&elem(&1, 0))
+  defp newest_claims(_index, _identity, _count), do: []
+
+  defp take_newest(_claims, 0, taken), do: Enum.reverse(taken)
+
+  defp take_newest(claims, count, taken) do
+    if :gb_sets.is_empty(claims) do
+      Enum.reverse(taken)
+    else
+      {{_sequence, connection}, claims} = :gb_sets.take_largest(claims)
+      take_newest(claims, count - 1, [connection | taken])
+    end
   end
 
   defp load_cache(state) do
@@ -990,30 +1089,78 @@ defmodule Derpex.Admission.Gentility do
     |> put_lease_entry(lease.node_key, %{wire: wire, lease: lease})
   end
 
-  defp reverify_records(state) do
-    invalid_keys =
-      state.leases
-      |> Enum.reject(fn {_key, entry} ->
-        match?({:ok, _lease}, verify_lease(state, entry.wire))
-      end)
-      |> Enum.map(&elem(&1, 0))
+  # Re-verifying every cached record against a rotated keyring is one Ed25519
+  # verification per record, so the sweep runs in bounded chunks between
+  # messages. Records still waiting their turn are dropped as the sweep reaches
+  # them, which is why a rotation sheds admissions over a brief window instead
+  # of atomically.
+  defp start_reverify(state) do
+    token = make_ref()
+    send(self(), {__MODULE__, :reverify, token})
 
-    state =
-      Enum.reduce(invalid_keys, state, fn key, state ->
-        state = drop_lease_entry(state, key)
-        close_peer(state, key)
+    %{
+      state
+      | reverify: %{
+          token: token,
+          leases: Map.keys(state.leases),
+          revocations: Map.keys(state.revocations)
+        }
+    }
+  end
+
+  defp reverify_chunk(%{reverify: %{leases: [], revocations: []}} = state) do
+    %{state | reverify: nil}
+    |> persist_now()
+    |> purge_expired()
+    |> reschedule_expiry()
+  end
+
+  defp reverify_chunk(%{reverify: %{leases: []}} = state) do
+    {chunk, rest} = Enum.split(state.reverify.revocations, @reverify_chunk)
+    state = Enum.reduce(chunk, state, &reverify_revocation/2)
+    continue_reverify(put_in(state.reverify.revocations, rest))
+  end
+
+  defp reverify_chunk(state) do
+    {chunk, rest} = Enum.split(state.reverify.leases, @reverify_chunk)
+    state = Enum.reduce(chunk, state, &reverify_lease/2)
+    continue_reverify(put_in(state.reverify.leases, rest))
+  end
+
+  defp continue_reverify(state) do
+    send(self(), {__MODULE__, :reverify, state.reverify.token})
+    state
+  end
+
+  defp reverify_lease(node_key, state) do
+    case state.leases[node_key] do
+      nil ->
         state
-      end)
 
-    revocations =
-      Map.filter(state.revocations, fn {_key, entry} ->
-        match?(
-          {:ok, _revocation},
-          Contract.verify_revocation(entry.wire, state.verification_keys)
-        )
-      end)
+      entry ->
+        case verify_lease(state, entry.wire) do
+          {:ok, _lease} ->
+            state
 
-    %{state | revocations: revocations}
+          {:error, _retired_or_expired} ->
+            state = drop_lease_entry(state, node_key)
+            close_peer(state, node_key)
+            state
+        end
+    end
+  end
+
+  defp reverify_revocation(node_key, state) do
+    case state.revocations[node_key] do
+      nil ->
+        state
+
+      entry ->
+        case Contract.verify_revocation(entry.wire, state.verification_keys) do
+          {:ok, _revocation} -> state
+          {:error, _retired} -> drop_revocation_entry(state, node_key)
+        end
+    end
   end
 
   # Expiry order is maintained incrementally, so purging walks only the leases
@@ -1086,6 +1233,19 @@ defmodule Derpex.Admission.Gentility do
     %{state | expiry_timer: nil, expiry_token: nil}
   end
 
+  # A sweep advances one bounded chunk per message, so reclaiming a large table
+  # never holds the controller for the length of the table.
+  defp step_budget_prune(state, cursor) do
+    case Budgets.prune_step(state.budgets, cursor, @budget_prune_chunk) do
+      :done ->
+        schedule_budget_prune(%{state | budget_prune_cursor: :start})
+
+      {:cont, continuation} ->
+        send(self(), {__MODULE__, :prune_budgets_step, state.budget_prune_token})
+        %{state | budget_prune_cursor: continuation}
+    end
+  end
+
   # Token-bucket rows outlive the lease or claim that created them until this
   # timer reclaims them, so no admission pays for the sweep.
   defp schedule_budget_prune(state) do
@@ -1131,14 +1291,16 @@ defmodule Derpex.Admission.Gentility do
     %{state | cache_dirty: true, cache_persist_timer: timer, cache_persist_token: token}
   end
 
-  defp persist_now(state), do: state |> Map.put(:cache_dirty, true) |> flush_cache()
+  defp persist_now(state), do: state |> Map.put(:cache_dirty, true) |> flush_cache(:sync)
 
-  defp flush_cache(%{cache_dirty: false} = state), do: state
+  defp flush_cache(state, mode \\ :async)
 
-  defp flush_cache(state) do
+  defp flush_cache(%{cache_dirty: false} = state, _mode), do: state
+
+  defp flush_cache(state, mode) do
     state = cancel_cache_persist(state)
 
-    case persist(state) do
+    case persist(state, mode) do
       :ok -> %{state | cache_dirty: false, persist_error: nil}
       {:error, reason} -> mark_cache_dirty(%{state | persist_error: reason})
     end
@@ -1151,9 +1313,17 @@ defmodule Derpex.Admission.Gentility do
     %{state | cache_persist_timer: nil, cache_persist_token: nil}
   end
 
-  defp persist(%{cache_path: nil}), do: :ok
+  # The snapshot is encoded here so that what reaches disk is one consistent
+  # view of controller state; only the write itself leaves the process.
+  defp persist(%{cache_writer: nil}, _mode), do: :ok
 
-  defp persist(state) do
+  defp persist(state, :async), do: CacheWriter.write(state.cache_writer, cache_snapshot(state))
+
+  defp persist(state, :sync) do
+    CacheWriter.write_sync(state.cache_writer, cache_snapshot(state), @cache_write_timeout_ms)
+  end
+
+  defp cache_snapshot(state) do
     leases =
       state.leases |> Enum.sort_by(&elem(&1, 0)) |> Enum.map(fn {_key, entry} -> entry.wire end)
 
@@ -1162,29 +1332,29 @@ defmodule Derpex.Admission.Gentility do
       |> Enum.sort_by(&elem(&1, 0))
       |> Enum.map(fn {_key, entry} -> entry.wire end)
 
-    Cache.store(state.cache_path, leases, revocations)
-  end
-
-  # Revocations are bounded by revocation time: the oldest record is the one
-  # Gentility is soonest to prune, and every lease it could still deny has
-  # expired by then.
-  defp put_bounded_revocation(entries, key, entry, maximum) do
-    entries = Map.put(entries, key, entry)
-
-    if map_size(entries) <= maximum do
-      entries
-    else
-      {evicted_key, _evicted} =
-        Enum.min_by(entries, fn {_key, value} -> value.revoked_at_ms end)
-
-      Map.delete(entries, evicted_key)
-    end
+    Cache.encode(leases, revocations)
   end
 
   defp close_peer(state, key) do
     _connection_count = state.close_peer.(key)
     :ok
   end
+
+  defp unexpected_exit(state, pid, reason) do
+    Logger.warning(
+      "gentility admission controller ignoring exit from #{inspect(pid)}: #{inspect(reason)}"
+    )
+
+    {:noreply, state}
+  end
+
+  defp initial_cache_writer(nil), do: {:ok, nil}
+
+  defp initial_cache_writer(path) when is_binary(path) do
+    CacheWriter.start_link(path: path, owner: self())
+  end
+
+  defp initial_cache_writer(_path), do: {:error, :invalid_cache_path}
 
   defp initial_usage(nil, _clock), do: {:ok, nil}
 

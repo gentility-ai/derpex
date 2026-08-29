@@ -526,6 +526,44 @@ defmodule Derpex.Admission.GentilityTest do
     Enum.each(connections, &Process.exit(&1, :kill))
   end
 
+  @tag :tmp_dir
+  @tag timeout: 600_000
+  test "authorizes in constant time while the cache is durable", %{tmp_dir: tmp_dir} do
+    entries = if System.get_env("DERPEX_SLOW_TESTS") == "1", do: 100_000, else: 10_000
+    now = System.system_time(:millisecond)
+
+    controller =
+      start_supervised!(
+        {Gentility,
+         [
+           authority: fn request -> {:ok, perf_lease(request.node_key, now)} end,
+           verification_keys: %{@signing_key_id => @public_key},
+           clock: Derpex.Clock.System,
+           max_lease_ms: 900_000,
+           max_future_skew_ms: 30_000,
+           max_cache_entries: entries,
+           cache_path: Path.join(tmp_dir, "admission.cache"),
+           cache_persist_ms: 100
+         ]}
+      )
+
+    policy = Gentility.policy(controller)
+
+    samples =
+      Enum.map(1..entries, fn index ->
+        request = request(<<index::256>>)
+        {microseconds, result} = :timer.tc(fn -> Gentility.authorize(request, policy) end)
+        assert {:ok, _context} = result
+        microseconds
+      end)
+
+    assert Gentility.stats(controller).cache_entries == entries
+    authorize_p99 = percentile(samples, 99)
+
+    assert authorize_p99 < 1_500,
+           "authorize p99 was #{authorize_p99} us over #{entries} admissions with a cache_path"
+  end
+
   test "reclaims byte-budget rows on the prune timer, not on the admission path" do
     node_key = node_key(37)
 

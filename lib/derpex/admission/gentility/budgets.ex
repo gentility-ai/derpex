@@ -134,25 +134,41 @@ defmodule Derpex.Admission.Gentility.Budgets do
     end
   end
 
-  @doc "Deletes token-bucket rows no longer backed by a lease or a live claim."
-  @spec prune(t()) :: :ok
-  def prune(%__MODULE__{} = budgets) do
-    retained =
-      Enum.reduce([:node, :organization], MapSet.new(), fn scope, retained ->
-        budgets
-        |> scope_map(scope)
-        |> Enum.reduce(retained, fn {identity, _entry}, retained ->
-          MapSet.put(retained, {scope, identity})
-        end)
-      end)
+  @doc """
+  Reclaims one bounded step of token-bucket rows no longer backed by an allocation.
 
-    ByteBudget.prune(budgets.table, retained)
+  Retention is decided per row against the live allocation maps, so a sweep
+  neither materializes the retained set nor walks the whole table at once.
+  """
+  @spec prune_step(t(), :start | term(), pos_integer()) :: :done | {:cont, term()}
+  def prune_step(%__MODULE__{} = budgets, cursor, limit) do
+    selected =
+      if cursor == :start,
+        do: ByteBudget.keys(budgets.table, limit),
+        else: ByteBudget.next_keys(cursor)
+
+    case selected do
+      :done ->
+        :done
+
+      {keys, continuation} ->
+        Enum.each(keys, &delete_unbacked(budgets, &1))
+        {:cont, continuation}
+    end
   end
 
   @doc "Returns bounded allocation counts for health checks and assertions."
   @spec stats(t()) :: %{nodes: non_neg_integer(), organizations: non_neg_integer()}
   def stats(%__MODULE__{} = budgets) do
     %{nodes: map_size(budgets.node), organizations: map_size(budgets.organization)}
+  end
+
+  defp delete_unbacked(budgets, {scope, identity} = key) do
+    if budgets |> scope_map(scope) |> Map.has_key?(identity) do
+      :ok
+    else
+      ByteBudget.delete(budgets.table, key)
+    end
   end
 
   defp update(budgets, scope, budget, transform, now_microsecond) do
