@@ -5,6 +5,13 @@ defmodule Derpex.AcceptLimiter do
   Per-IP token buckets are retained in a fixed-size least-recently-used set.
   Concurrent connection claims are monitored so abrupt handler exits cannot
   leak capacity.
+
+  The tracking set is a memory bound, not an admission bound. When every
+  tracked IP holds a live connection there is nothing to evict, so a new source
+  is admitted *untracked*: it consumes the shared accept token but no per-IP
+  bucket, no per-IP connection slot, and no monitor. Each such admission
+  increments `:ip_untracked`, so the loss of per-IP enforcement is visible in
+  the operational counters rather than turning into a self-inflicted outage.
   """
 
   use GenServer
@@ -36,11 +43,7 @@ defmodule Derpex.AcceptLimiter do
   @doc "Claims one pre-authentication connection slot for the calling process."
   @spec claim(GenServer.server() | nil, :inet.ip_address()) ::
           :ok
-          | {:error,
-             :accept_rate_limited
-             | :ip_rate_limited
-             | :ip_connection_limited
-             | :ip_tracking_limited}
+          | {:error, :accept_rate_limited | :ip_rate_limited | :ip_connection_limited}
   def claim(server \\ __MODULE__, source_ip)
 
   def claim(nil, _source_ip), do: :ok
@@ -164,9 +167,13 @@ defmodule Derpex.AcceptLimiter do
         {:ok, entry, remove_evictable(state, entry)}
 
       :error ->
-        with {:ok, state} <- ensure_tracking_capacity(state) do
-          entry = %{bucket: new_bucket(state.per_ip), connections: 0, lru_key: nil}
-          {:ok, entry, state}
+        case ensure_tracking_capacity(state) do
+          {:ok, state} ->
+            entry = %{bucket: new_bucket(state.per_ip), connections: 0, lru_key: nil}
+            {:ok, entry, state}
+
+          {:untracked, state} ->
+            {:ok, nil, count(state, :ip_untracked)}
         end
     end
   end
@@ -176,7 +183,7 @@ defmodule Derpex.AcceptLimiter do
 
   defp ensure_tracking_capacity(%{evictable: evictable} = state) do
     if :gb_trees.is_empty(evictable) do
-      {:error, :ip_tracking_limited}
+      {:untracked, state}
     else
       {_lru_key, source_ip, evictable} = :gb_trees.take_smallest(evictable)
       {:ok, %{state | entries: Map.delete(state.entries, source_ip), evictable: evictable}}
@@ -190,6 +197,7 @@ defmodule Derpex.AcceptLimiter do
     {allowed?, %{entry | bucket: bucket}}
   end
 
+  defp connection_available?(nil, _maximum), do: true
   defp connection_available?(_entry, nil), do: true
   defp connection_available?(entry, maximum), do: entry.connections < maximum
 
@@ -210,6 +218,8 @@ defmodule Derpex.AcceptLimiter do
     {entry, state} = touch_entry(state, source_ip, entry, now)
     add_evictable(state, source_ip, entry)
   end
+
+  defp maybe_monitor_claim(state, _source_ip, _pid, nil), do: state
 
   defp maybe_monitor_claim(%{per_ip_connections: nil} = state, source_ip, _pid, entry) do
     add_evictable(state, source_ip, entry)
@@ -288,7 +298,8 @@ defmodule Derpex.AcceptLimiter do
         accept_rate_limited: 0,
         ip_rate_limited: 0,
         ip_connection_limited: 0,
-        ip_tracking_limited: 0
+        ip_tracking_limited: 0,
+        ip_untracked: 0
       }
     }
   end

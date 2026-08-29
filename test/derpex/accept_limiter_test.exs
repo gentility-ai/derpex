@@ -52,9 +52,34 @@ defmodule Derpex.AcceptLimiterTest do
              ip_connection_limited: 0,
              ip_rate_limited: 1,
              ip_tracking_limited: 0,
+             ip_untracked: 0,
              max_tracked_ips: 2,
              tracked_ips: 2
            }
+  end
+
+  test "admits a new source untracked once every tracked IP holds a connection" do
+    limiter =
+      start_supervised!(
+        {AcceptLimiter, name: nil, config: [per_ip_connections: 1, max_tracked_ips: 2]}
+      )
+
+    first = start_claimant(limiter, {203, 0, 113, 1})
+    assert_receive {:claim_result, ^first, :ok}
+
+    second = start_claimant(limiter, {203, 0, 113, 2})
+    assert_receive {:claim_result, ^second, :ok}
+
+    third = start_claimant(limiter, {203, 0, 113, 3})
+    assert_receive {:claim_result, ^third, :ok}
+
+    stats = AcceptLimiter.stats(limiter)
+    assert stats.allowed == 3
+    assert stats.ip_untracked == 1
+    assert stats.ip_tracking_limited == 0
+    assert stats.tracked_ips == 2
+
+    Enum.each([first, second, third], &send(&1, :release))
   end
 
   test "caps concurrent connections and repairs slots after abrupt exits" do
@@ -75,7 +100,9 @@ defmodule Derpex.AcceptLimiterTest do
     assert AcceptLimiter.stats(limiter).active_connections == 2
 
     overflow = start_claimant(limiter, {192, 0, 2, 12})
-    assert_receive {:claim_result, ^overflow, {:error, :ip_tracking_limited}}
+    assert_receive {:claim_result, ^overflow, :ok}
+    assert AcceptLimiter.stats(limiter).ip_untracked == 1
+    assert AcceptLimiter.stats(limiter).active_connections == 2
     send(overflow, :stop)
 
     Process.exit(first, :kill)
