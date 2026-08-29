@@ -449,6 +449,55 @@ defmodule Derpex.Mesh.ClientTest do
     assert forwarded <= 64
   end
 
+  test "a hundred reconnects leave no forwarding ring table behind" do
+    parent = self()
+    {_public_key, private_key} = Crypto.generate_keypair()
+    mesh_key = :crypto.strong_rand_bytes(32)
+
+    {:ok, listener} =
+      :gen_tcp.listen(0, [:binary, packet: :raw, active: false, reuseaddr: true])
+
+    {:ok, {_ip, unavailable_port}} = :inet.sockname(listener)
+    :gen_tcp.close(listener)
+
+    event_handler = fn
+      {:connect_error, _reason} -> send(parent, :connect_error)
+      _other -> :ok
+    end
+
+    client =
+      start_supervised!(
+        {Client,
+         url: "http://127.0.0.1:#{unavailable_port}/derp",
+         private_key: Secret.wrap(private_key),
+         mesh_key: Secret.wrap(mesh_key),
+         connect_timeout: 100,
+         reconnect_interval: 1,
+         event_handler: event_handler}
+      )
+
+    assert_receive :connect_error, 5_000
+    {baseline_tables, baseline_owned} = table_census(client)
+    assert baseline_owned == 1
+
+    Enum.each(1..100, fn _reconnect -> assert_receive :connect_error, 5_000 end)
+
+    {final_tables, final_owned} = table_census(client)
+    assert final_owned == 1
+    assert final_tables - baseline_tables == 0
+  end
+
+  defp table_census(client) do
+    :ok = :sys.suspend(client)
+
+    try do
+      tables = :ets.all()
+      {length(tables), Enum.count(tables, &(:ets.info(&1, :owner) == client))}
+    after
+      :ok = :sys.resume(client)
+    end
+  end
+
   defp await_queued_messages(client, wanted) do
     {:message_queue_len, queued} = Process.info(client, :message_queue_len)
 

@@ -193,7 +193,7 @@ defmodule Derpex.Mesh.Client do
     close_socket(state.socket)
     cancel_reconnect(state.reconnect_timer)
     _state = cancel_recv_deadline(state)
-    close_ring(state.ring)
+    delete_ring(state.ring)
     :ok
   end
 
@@ -398,7 +398,7 @@ defmodule Derpex.Mesh.Client do
     close_socket(state.socket)
     state = cancel_recv_deadline(state)
     state = withdraw_remote_peers(state)
-    close_ring(state.ring)
+    delete_ring(state.ring)
 
     state = %{
       state
@@ -472,14 +472,8 @@ defmodule Derpex.Mesh.Client do
     Ring.new(state.queue_capacity, notifier: self(), wake_message: @wake_message)
   end
 
-  defp close_ring(nil), do: :ok
-
-  defp close_ring(%Ring{} = ring) do
-    _result = Ring.close(ring)
-    :ok
-  rescue
-    ArgumentError -> :ok
-  end
+  defp delete_ring(nil), do: :ok
+  defp delete_ring(%Ring{} = ring), do: Ring.delete(ring)
 
   defp open_socket(%{proxy: nil} = state) do
     endpoint = state.endpoint

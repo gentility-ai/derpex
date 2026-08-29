@@ -172,6 +172,23 @@ defmodule Derpex.Outbox.Ring do
     end
   end
 
+  @doc """
+  Closes the ring and drops its ETS table. Idempotent.
+
+  A ring whose owner outlives it — the mesh client rebuilds one per reconnect —
+  must be deleted rather than merely closed, because the table is reclaimed
+  only when its owner dies. Producers that raced the deletion see the same
+  `ArgumentError` they already handle for a closed ring.
+  """
+  @spec delete(t()) :: :ok
+  def delete(%__MODULE__{} = ring) do
+    _closed = close(ring)
+    true = :ets.delete(ring.table)
+    :ok
+  rescue
+    ArgumentError -> :ok
+  end
+
   defp enqueue_locked(ring, item, lock_token) do
     if atomic_get(ring, @closed) == 1 do
       record_drop(ring, item, :gone_disconnected)
