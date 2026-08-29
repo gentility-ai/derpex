@@ -13,6 +13,7 @@ defmodule Derpex.Writer do
   alias Derpex.Frame.Body
   alias Derpex.Metrics
   alias Derpex.Outbox.Ring
+  alias Derpex.Router
   alias Derpex.SocketOptions
   alias Derpex.WebSocket.Frame, as: WebSocketFrame
 
@@ -88,6 +89,7 @@ defmodule Derpex.Writer do
        rings: nil,
        retry_timer: nil,
        packet_cursor: 0,
+       noted_sources: MapSet.new(),
        sender_cardinality: Cardinality.new()
      }}
   end
@@ -154,8 +156,7 @@ defmodule Derpex.Writer do
              :ok <- send_data(state, frame) do
           record_queue_duration(state.metrics, message, queue_age_microseconds)
           record_send(state.metrics, message)
-          maybe_note_send(state, message)
-          drain(state)
+          drain(note_reverse_path(state, message))
         else
           {:error, reason} ->
             :ok = Metrics.add(state.metrics, :write_errors, 1)
@@ -246,14 +247,27 @@ defmodule Derpex.Writer do
   defp weaker_of(:busy, _other), do: :busy
   defp weaker_of(_outcome, other), do: other
 
-  defp maybe_note_send(_state, {:recv_packet, <<0::256>>, _packet}), do: :ok
+  # Go's sawSrc, with one difference: a source is forgotten again when its
+  # peer-gone frame is written, so a peer that leaves and returns is owed a
+  # second peer-gone. Go never re-arms, which it can afford because its watcher
+  # set dies with the connection.
+  defp note_reverse_path(state, {:recv_packet, <<0::256>>, _packet}), do: state
 
-  defp maybe_note_send(state, {:recv_packet, source, _packet}) do
-    :ok = Cardinality.insert(state.sender_cardinality, source)
-    Derpex.Router.note_send(source, state.owner, state.rings.lifecycle)
+  defp note_reverse_path(state, {:recv_packet, source, _packet}) do
+    if MapSet.member?(state.noted_sources, source) do
+      state
+    else
+      :ok = Cardinality.insert(state.sender_cardinality, source)
+      :ok = Router.note_send(source, state.owner, state.rings.lifecycle)
+      %{state | noted_sources: MapSet.put(state.noted_sources, source)}
+    end
   end
 
-  defp maybe_note_send(_state, _message), do: :ok
+  defp note_reverse_path(state, {:peer_gone, key, _reason}) do
+    %{state | noted_sources: MapSet.delete(state.noted_sources, key)}
+  end
+
+  defp note_reverse_path(state, _message), do: state
 
   defp record_send(metrics, {:recv_packet, _source, packet}) do
     :ok = Metrics.add(metrics, :packets_sent, 1)

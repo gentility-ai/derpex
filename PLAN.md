@@ -102,6 +102,13 @@ so they are not implemented by accident:
   payload is under 200 bytes and the frame is read before the peer is
   authenticated. A conforming client is never affected; an oversize frame is
   closed at its header instead of after its body.
+- Go's `sawSrc` set records, per connection, which sources it has relayed a
+  packet from, so a `peerGone` is owed only once. It never forgets a source,
+  which it can afford because the set dies with the connection. DERPEX forgets
+  a source when it writes that source's `peer_gone` frame, so a peer that
+  leaves and comes back is owed a second `peer_gone`. A conforming client is
+  never affected: it receives a frame Go would have withheld, describing a
+  disconnect that really happened.
 - Section 3.3 requires that a sender is never suspended by a destination's
   queue. DERPEX suspends one for up to about four milliseconds when that
   destination's outbox ring lock is held for that long, because Go's channel

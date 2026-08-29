@@ -340,6 +340,49 @@ defmodule Derpex.WriterTest do
     assert Writer.write_control(writer, "server-info", mesh_timeout + 1_000) == :ok
   end
 
+  test "a source is noted once until it goes away and comes back" do
+    {:ok, writer} =
+      Writer.start_link(
+        owner: self(),
+        transport: ControlledTransport,
+        socket: {self(), :noted, :open}
+      )
+
+    rings = rings(writer)
+    source = :crypto.strong_rand_bytes(32)
+
+    enqueue_until_accepted(rings.ordinary, {:recv_packet, source, <<1::32>>})
+    assert_receive {:write_finished, :noted, _first}
+    assert reverse_paths_for(source) == 1
+
+    # The router has claimed this reverse path, the way dispatching a peer-gone
+    # frame does. A writer that noted every packet would put it straight back.
+    Router.ReversePaths.take(source)
+
+    for sequence <- 2..1_000 do
+      enqueue_until_accepted(rings.ordinary, {:recv_packet, source, <<sequence::32>>})
+      assert_receive {:write_finished, :noted, _frame}
+    end
+
+    assert reverse_paths_for(source) == 0
+
+    # Writing a peer-gone frame re-arms the source: if that peer comes back,
+    # this destination is owed another peer-gone. Go's sawSrc never re-arms,
+    # which it can afford because its watcher set dies with the connection.
+    enqueue_until_accepted(rings.lifecycle, {:peer_gone, source, 0x00})
+    assert_receive {:write_finished, :noted, _peer_gone}
+
+    enqueue_until_accepted(rings.ordinary, {:recv_packet, source, "again"})
+    assert_receive {:write_finished, :noted, _again}
+    assert reverse_paths_for(source) == 1
+  end
+
+  defp reverse_paths_for(source) do
+    Derpex.Router.ReversePaths.BySource
+    |> :ets.select([{{{source, :"$1"}, :_}, [], [:"$1"]}])
+    |> length()
+  end
+
   test "a saturated ordinary ring cannot starve the pong and disco rings" do
     {:ok, writer} =
       Writer.start_link(

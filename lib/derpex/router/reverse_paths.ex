@@ -17,9 +17,11 @@ defmodule Derpex.Router.ReversePaths do
   The tables are created by, and owned by, the `Derpex.Router` process.
 
   Cost: recording a path is two `ordered_set` inserts, roughly +0.5 us over the
-  single insert this replaced. The writer currently calls `note/3` for every
-  relayed packet, so review B8 (note once per `{destination, source}` pair) is
-  the intended mitigation; until it lands the second insert is paid per packet.
+  single insert this replaced, and the writer pays it once per
+  `{destination, source}` pair rather than once per packet: it remembers which
+  sources it has already noted and calls `note/3` only on first sight. Only the
+  source index carries the lifecycle ring; the connection index stores bare
+  keys.
   """
 
   alias Derpex.Outbox.Ring
@@ -53,7 +55,10 @@ defmodule Derpex.Router.ReversePaths do
   def note(<<source::binary-size(32)>>, connection, %Ring{} = lifecycle)
       when is_pid(connection) do
     true = :ets.insert(@by_source, {{source, connection}, lifecycle})
-    true = :ets.insert(@by_connection, {{connection, source}, lifecycle})
+    # The connection index only answers "which sources does this connection
+    # hold", and its rows are read for their key alone, so it carries no copy
+    # of the ring.
+    true = :ets.insert(@by_connection, {{connection, source}})
     :ok
   rescue
     ArgumentError -> :ok
@@ -88,7 +93,7 @@ defmodule Derpex.Router.ReversePaths do
   @spec forget_connection(pid()) :: :ok
   def forget_connection(connection) when is_pid(connection) do
     @by_connection
-    |> :ets.select([{{{connection, :"$1"}, :_}, [], [:"$1"]}])
+    |> :ets.select([{{{connection, :"$1"}}, [], [:"$1"]}])
     |> Enum.each(fn source ->
       true = :ets.delete(@by_connection, {connection, source})
       true = :ets.delete(@by_source, {source, connection})
