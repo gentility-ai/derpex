@@ -13,6 +13,10 @@ defmodule Derpex.Admission.Gentility.UsageContract do
   @u32_max 0xFFFF_FFFF
   @u64_max 0xFFFF_FFFF_FFFF_FFFF
 
+  @doc "Returns the largest number of sender-attribution entries one batch may carry."
+  @spec max_entries() :: pos_integer()
+  def max_entries, do: @max_entries
+
   @doc "Encodes a sorted canonical batch and returns its SHA-256 idempotency key."
   @spec encode(UsageBatch.t()) :: {:ok, {<<_::256>>, binary()}} | {:error, term()}
   def encode(%UsageBatch{} = batch) do

@@ -71,6 +71,16 @@ rejected with `cache_full` and the counter behind
 means the cache bound is below the instance's working set: raise
 `DERPEX_GENTILITY_MAX_CACHE_ENTRIES` or reduce the nodes homed on the instance.
 
+## Usage export
+
+Each fixed window is exported as one or more batches of at most 10 000 sender
+attributions; a busier window simply produces more batches with the same
+window bounds. A batch the contract cannot encode is logged, counted in
+`derpex_gentility_usage_dropped_rows`, and its rows are deleted, because a
+window that can never be encoded would otherwise block the spool and shed every
+relayed packet behind it. Any increase in that counter is an accounting loss
+and must alert.
+
 ## Milestone 0 launch inputs
 
 The following values must be jointly fixed before Milestone 0 exits:

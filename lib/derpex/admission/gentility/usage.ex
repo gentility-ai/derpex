@@ -3,6 +3,7 @@ defmodule Derpex.Admission.Gentility.Usage do
 
   alias Derpex.Admission.Gentility.UsageBatch
   alias Derpex.Admission.Gentility.UsageBatch.Entry
+  alias Derpex.Admission.Gentility.UsageContract
 
   @type outcome :: :accepted | :dropped
 
@@ -36,10 +37,29 @@ defmodule Derpex.Admission.Gentility.Usage do
     ArgumentError -> {:error, :usage_unavailable}
   end
 
-  @doc "Snapshots the oldest complete window without deleting it."
-  @spec oldest_closed(:ets.tid(), pos_integer(), binary(), non_neg_integer(), integer()) ::
-          nil | {UsageBatch.t(), [tuple()]}
-  def oldest_closed(table, window_ms, instance_id, region_id, now_ms) do
+  @doc """
+  Snapshots up to `max_entries` rows of the oldest complete window without deleting them.
+
+  A window with more sender attributions than one contract batch may carry is
+  drained across successive calls, so no window can grow past the point where
+  it can be exported.
+  """
+  @spec oldest_closed(
+          :ets.tid(),
+          pos_integer(),
+          binary(),
+          non_neg_integer(),
+          integer(),
+          pos_integer()
+        ) :: nil | {UsageBatch.t(), [tuple()]}
+  def oldest_closed(
+        table,
+        window_ms,
+        instance_id,
+        region_id,
+        now_ms,
+        max_entries \\ UsageContract.max_entries()
+      ) do
     current_window = div(now_ms, window_ms) * window_ms
 
     case oldest_window(table, current_window) do
@@ -47,7 +67,11 @@ defmodule Derpex.Admission.Gentility.Usage do
         nil
 
       window_start ->
-        rows = :ets.match_object(table, {{window_start, :_, :_, :_, :_}, :_, :_, :_, :_})
+        rows =
+          table
+          |> :ets.match_object({{window_start, :_, :_, :_, :_}, :_, :_, :_, :_})
+          |> Enum.sort_by(&row_identity/1)
+          |> Enum.take(max_entries)
 
         batch = %UsageBatch{
           instance_id: instance_id,
@@ -96,6 +120,12 @@ defmodule Derpex.Admission.Gentility.Usage do
     %{entries: length(rows), windows: length(windows)}
   rescue
     ArgumentError -> %{entries: 0, windows: 0}
+  end
+
+  defp row_identity(
+         {{_window, node_id, organization_id, owner_kind, deployment_id}, _ap, _ab, _dp, _db}
+       ) do
+    {organization_id, node_id, owner_kind, deployment_id}
   end
 
   defp increments(:accepted, bytes), do: [{2, 1}, {3, bytes}]

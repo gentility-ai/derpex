@@ -664,6 +664,89 @@ defmodule Derpex.Admission.GentilityTest do
   end
 
   @tag :tmp_dir
+  test "spools an oversized usage window as several contract-sized batches", %{tmp_dir: tmp_dir} do
+    parent = self()
+    entries = UsageContract.max_entries() + 1
+
+    exporter = fn id, wire ->
+      send(parent, {:usage_export, id, wire})
+      :ok
+    end
+
+    controller =
+      start_controller(
+        authority: fn _request -> {:error, :unavailable} end,
+        usage: usage_options(tmp_dir, exporter)
+      )
+
+    policy = Gentility.policy(controller)
+
+    for index <- 1..entries do
+      assert Gentility.record_usage(usage_context("node_#{index}"), 10, :accepted, policy) == :ok
+    end
+
+    Manual.advance(100)
+
+    assert_receive {:usage_export, first_id, first_wire}, 5_000
+    assert_receive {:usage_export, second_id, second_wire}, 5_000
+    assert first_id != second_id
+
+    assert {:ok, first} = UsageContract.decode(first_wire, first_id)
+    assert {:ok, second} = UsageContract.decode(second_wire, second_id)
+    assert length(first.entries) == UsageContract.max_entries()
+    assert length(second.entries) == 1
+    assert first.window_start_ms == second.window_start_ms
+
+    identities =
+      (first.entries ++ second.entries) |> Enum.map(& &1.node_id) |> Enum.uniq() |> length()
+
+    assert identities == entries
+
+    eventually(fn -> Gentility.stats(controller).usage.spool_batches == 0 end)
+    refute Gentility.stats(controller).usage.blocked?
+    assert Gentility.stats(controller).usage.dropped_rows == 0
+  end
+
+  @tag :tmp_dir
+  test "drops an un-encodable usage window instead of blocking the relay", %{tmp_dir: tmp_dir} do
+    parent = self()
+
+    exporter = fn id, wire ->
+      send(parent, {:usage_export, id, wire})
+      :ok
+    end
+
+    controller =
+      start_controller(
+        authority: fn _request -> {:error, :unavailable} end,
+        usage: usage_options(tmp_dir, exporter)
+      )
+
+    policy = Gentility.policy(controller)
+    assert Gentility.record_usage(usage_context("node_ok"), 10, :accepted, policy) == :ok
+    assert Gentility.record_usage(usage_context(<<0xFF>>), 10, :accepted, policy) == :ok
+
+    log =
+      ExUnit.CaptureLog.capture_log(fn ->
+        Manual.advance(100)
+        eventually(fn -> Gentility.stats(controller).usage.dropped_rows == 2 end)
+      end)
+
+    assert log =~ "usage batch"
+    refute_receive {:usage_export, _id, _wire}, 50
+    refute Gentility.stats(controller).usage.blocked?
+    assert Gentility.stats(controller).usage.aggregate_entries == 0
+
+    assert Gentility.record_usage(usage_context("node_ok"), 10, :accepted, policy) == :ok
+    Manual.advance(100)
+    assert_receive {:usage_export, id, wire}, 5_000
+    assert {:ok, batch} = UsageContract.decode(wire, id)
+    assert [entry] = batch.entries
+    assert entry.node_id == "node_ok"
+    assert Gentility.stats(controller).usage.dropped_rows == 2
+  end
+
+  @tag :tmp_dir
   test "a stalled usage worker cannot delay revocation or controller telemetry", %{
     tmp_dir: tmp_dir
   } do
@@ -756,6 +839,18 @@ defmodule Derpex.Admission.GentilityTest do
   end
 
   defp node_key(byte), do: :binary.copy(<<byte>>, 32)
+
+  defp usage_context(node_id) do
+    %{
+      gentility: %{
+        node_key: node_key(0),
+        node_id: node_id,
+        organization_id: "org_01",
+        owner_kind: "deployment",
+        deployment_id: "dep_01"
+      }
+    }
+  end
 
   defp usage_options(tmp_dir, exporter, extra \\ []) do
     Keyword.merge(

@@ -9,6 +9,8 @@ defmodule Derpex.Admission.Gentility.UsageWorker do
 
   use GenServer
 
+  require Logger
+
   alias Derpex.Admission.Gentility.Usage
   alias Derpex.Admission.Gentility.UsageContract
   alias Derpex.Admission.Gentility.UsageSpool
@@ -204,7 +206,8 @@ defmodule Derpex.Admission.Gentility.UsageWorker do
          timer: nil,
          timer_token: nil,
          export: nil,
-         last_error: nil
+         last_error: nil,
+         dropped_rows: 0
        }}
     end
   end
@@ -221,7 +224,8 @@ defmodule Derpex.Admission.Gentility.UsageWorker do
            state.window_ms,
            state.instance_id,
            state.region_id,
-           now
+           now,
+           UsageContract.max_entries()
          ) do
       nil -> state
       {batch, rows} -> commit_batch(state, batch, rows)
@@ -229,16 +233,36 @@ defmodule Derpex.Admission.Gentility.UsageWorker do
   end
 
   defp commit_batch(state, batch, rows) do
-    with {:ok, encoded} <- UsageContract.encode(batch),
-         {:ok, spool} <- UsageSpool.put(state.spool, encoded) do
-      :ok = Usage.delete_rows(state.table, rows)
-      :atomics.put(state.blocked, 1, 0)
-      rotate_usage(%{state | spool: spool, last_error: nil})
-    else
+    case UsageContract.encode(batch) do
+      {:ok, encoded} -> spool_batch(state, encoded, rows)
+      {:error, reason} -> drop_batch(state, batch, rows, reason)
+    end
+  end
+
+  defp spool_batch(state, encoded, rows) do
+    case UsageSpool.put(state.spool, encoded) do
+      {:ok, spool} ->
+        :ok = Usage.delete_rows(state.table, rows)
+        :atomics.put(state.blocked, 1, 0)
+        rotate_usage(%{state | spool: spool, last_error: nil})
+
       {:error, reason} ->
         :atomics.put(state.blocked, 1, 1)
         %{state | last_error: reason}
     end
+  end
+
+  # A batch the contract cannot encode would otherwise be retried forever and
+  # block every packet behind the billing ledger. Account for the loss, drop
+  # the rows, and keep draining the window.
+  defp drop_batch(state, batch, rows, reason) do
+    Logger.warning(
+      "gentility usage batch dropped: #{inspect(reason)} " <>
+        "(window #{batch.window_start_ms}, #{length(rows)} rows)"
+    )
+
+    :ok = Usage.delete_rows(state.table, rows)
+    rotate_usage(%{state | dropped_rows: state.dropped_rows + length(rows)})
   end
 
   defp start_export(%{export: export} = state) when not is_nil(export), do: state
@@ -358,6 +382,7 @@ defmodule Derpex.Admission.Gentility.UsageWorker do
       spool_batches: spool.batches,
       spool_bytes: spool.bytes,
       exporting?: not is_nil(state.export),
+      dropped_rows: state.dropped_rows,
       last_error: state.last_error
     }
 
@@ -371,6 +396,7 @@ defmodule Derpex.Admission.Gentility.UsageWorker do
       spool_batches: 0,
       spool_bytes: 0,
       exporting?: false,
+      dropped_rows: 0,
       last_error: :usage_unavailable
     }
   end

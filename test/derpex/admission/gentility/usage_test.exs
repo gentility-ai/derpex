@@ -28,6 +28,37 @@ defmodule Derpex.Admission.Gentility.UsageTest do
     assert Usage.stats(table) == %{entries: 1, windows: 1}
   end
 
+  test "chunks a window into batches of at most the requested entry count" do
+    table = Usage.new()
+
+    for index <- 1..5 do
+      assert Usage.record(table, 1_000, context("node-#{index}"), 10, :accepted, 1_500) == :ok
+    end
+
+    assert {batch, rows} = Usage.oldest_closed(table, 1_000, "derpex-1", 17, 2_000, 2)
+    assert length(batch.entries) == 2
+    assert length(rows) == 2
+    assert Usage.delete_rows(table, rows) == :ok
+
+    assert {second, second_rows} = Usage.oldest_closed(table, 1_000, "derpex-1", 17, 2_000, 2)
+    assert length(second.entries) == 2
+    assert second.window_start_ms == batch.window_start_ms
+    assert Usage.delete_rows(table, second_rows) == :ok
+
+    assert {last, last_rows} = Usage.oldest_closed(table, 1_000, "derpex-1", 17, 2_000, 2)
+    assert length(last.entries) == 1
+    assert Usage.delete_rows(table, last_rows) == :ok
+    assert Usage.oldest_closed(table, 1_000, "derpex-1", 17, 2_000, 2) == nil
+
+    identities =
+      [batch, second, last]
+      |> Enum.flat_map(& &1.entries)
+      |> Enum.map(& &1.node_id)
+      |> Enum.sort()
+
+    assert identities == Enum.sort(Enum.map(1..5, &"node-#{&1}"))
+  end
+
   test "concurrent packet-path updates do not lose counters" do
     table = Usage.new()
     context = context("node-a")

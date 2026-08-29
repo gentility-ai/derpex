@@ -298,7 +298,8 @@ defmodule Derpex.Operations do
       aggregate_entries: "derpex_gentility_usage_aggregate_entries",
       aggregate_windows: "derpex_gentility_usage_aggregate_windows",
       blocked?: "derpex_gentility_usage_blocked",
-      exporting?: "derpex_gentility_usage_exporting"
+      exporting?: "derpex_gentility_usage_exporting",
+      dropped_rows: "derpex_gentility_usage_dropped_rows"
     }
 
     merge_values(metrics, usage, names)
