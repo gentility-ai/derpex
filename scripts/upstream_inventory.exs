@@ -150,8 +150,6 @@ defmodule Derpex.UpstreamInventory do
       "unchanged official mesh client verifies watcher app-name propagation",
     {"prober/derp_test.go", "TestRunDerpProbeNodePair"} =>
       "upstream 100 MB transfer and 30-packet in-flight bound run through DERPEX with unchanged official clients",
-    {"prober/derp_test.go", "TestDerpProber"} =>
-      "ported dynamic region filtering, probe inventory, and add/remove reconciliation in test/derpex/prober_test.exs",
     {"prober/derp_test.go", "Test_packetsForSize"} =>
       "ported exact packet counts, total sizes, per-call randomness, and large-payload caching in test/derpex/prober_test.exs",
     {"derp/derp_test.go", "TestValidAppName"} =>
