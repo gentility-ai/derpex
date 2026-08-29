@@ -15,12 +15,32 @@ The native crate is built from source for prerelease versions:
 ```sh
 mix deps.get
 mix quality
+mix test
 mix artifact.check
 ```
+
+`mix quality` is the fast pre-commit gate: formatting, warnings-as-errors
+compilation, Credo, `rustfmt`, and Clippy. It runs no tests, so `mix test` is a
+separate step.
 
 `mix artifact.check` assembles the production OTP release, removes Rustler's
 build-time project templates, rejects Go/Rust source or toolchain files, and
 boots the packaged crypto NIF through the release executable.
+
+The release-blocking aliases are:
+
+```text
+mix test         # unit and property tests
+mix test.system  # test/system: TLS, signals, external services
+mix test.diff    # the Go-versus-DERPEX differential oracle
+mix test.interop # official Go and Rust clients against DERPEX
+mix test.all     # every tagged gate, via --include go_interop --include rust_interop
+mix release.check # mix quality + mix test.all + mix artifact.check
+```
+
+`mix test.all` and `mix test.interop` need `DERPEX_TAILSCALE_DIR` and
+`DERPEX_TAILSCALE_RS_DIR` pointing at the pinned sibling checkouts; both
+accept relative paths.
 
 Go, Rust, and the pinned upstream repositories are conformance-test inputs
 only. Separate CI jobs exercise the unchanged Go clients, two real `tsnet`
@@ -46,6 +66,12 @@ DERPEX_TAILSCALE_RS_DIR=../tailscale-rs DERPEX_RUST_INTEROP=1 \
 
 With `DERPEX_TAILSCALE_DIR` set, `mix test.diff` runs just the normalized
 semantic comparison against the pinned Go server.
+
+Releases cannot skip any of that. `.github/workflows/release.yml` calls the
+whole CI workflow as a reusable workflow in a job named `gate`, and every job
+that builds, packages, or publishes an artifact declares `needs: [gate, ...]`.
+A red quality, unit, Go interop, Rust interop, or runtime-boundary job blocks
+the tag from producing a NIF archive, a GitHub release, or a runtime image.
 
 The `tsnet` smoke advertises DERPEX from Tailscale's own in-memory test control
 server, pins DERPEX's raw-IP TLS certificate, forces the two nodes off direct
