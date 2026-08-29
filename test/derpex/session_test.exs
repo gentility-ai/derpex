@@ -29,6 +29,7 @@ defmodule Derpex.SessionTest do
              {:set_timeout, :handshake, 10_000},
              {:authenticated, ^client_public, ^client_info, false},
              {:send, _server_info},
+             {:register, ^client_public, ^client_info, false},
              {:cancel_timeout, :handshake},
              {:set_timeout, :keep_alive, keep_alive_interval}
            ] = actions

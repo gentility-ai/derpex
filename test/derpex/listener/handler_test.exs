@@ -649,6 +649,79 @@ defmodule Derpex.Listener.HandlerTest do
     assert_eventually(fn -> Manual.pending_timer_count() == 0 end)
   end
 
+  test "server_info reaches a client before any packet queued for it" do
+    {server_public, server_private} = Crypto.generate_keypair()
+    {sender_public, sender_private} = Crypto.generate_keypair()
+    {recipient_public, recipient_private} = Crypto.generate_keypair()
+    parent = self()
+
+    # Registration publishes the recipient's rings; blocking here holds the
+    # handler at exactly that point while the sender floods the new route.
+    event_handler = fn
+      {:authenticated, ^recipient_public, _info} = event ->
+        send(parent, {:registering, self()})
+
+        receive do
+          :flooded -> :ok
+        after
+          2_000 -> :ok
+        end
+
+        send(parent, event)
+        :ok
+
+      event ->
+        send(parent, event)
+        :ok
+    end
+
+    {:ok, server} =
+      ThousandIsland.start_link(
+        port: 0,
+        transport_options: [ip: {127, 0, 0, 1}],
+        num_acceptors: 1,
+        handler_module: Handler,
+        handler_options: [
+          server_private_key: Secret.wrap(server_private),
+          server_public_key: server_public,
+          event_handler: event_handler
+        ]
+      )
+
+    stop_server_on_exit(server)
+    {:ok, {_ip, port}} = ThousandIsland.listener_info(server)
+
+    sender = connect_and_send_info(port, server_public, sender_private, %ClientInfo{version: 2})
+    assert_receive {:authenticated, ^sender_public, _sender_info}, 2_000
+    assert {:ok, <<_type, length::unsigned-big-32>>} = :gen_tcp.recv(sender, 5, 2_000)
+    assert {:ok, _server_info} = :gen_tcp.recv(sender, length, 2_000)
+
+    recipient =
+      connect_and_send_info(port, server_public, recipient_private, %ClientInfo{version: 2})
+
+    assert_receive {:registering, handler}, 2_000
+
+    packet = IO.iodata_to_binary(Frame.encode(:send_packet, [recipient_public, "flood"]))
+    for _ <- 1..64, do: :ok = :gen_tcp.send(sender, packet)
+    assert_receive {:client_message, {:send_packet, ^recipient_public, "flood"}}, 2_000
+
+    # The flood is in the recipient's rings and its writer is draining them.
+    Process.sleep(50)
+    send(handler, :flooded)
+
+    assert {:ok, <<first_type, first_length::unsigned-big-32>>} =
+             :gen_tcp.recv(recipient, 5, 2_000)
+
+    assert first_type == Frame.type(:server_info)
+    assert {:ok, body} = :gen_tcp.recv(recipient, first_length, 2_000)
+
+    assert Handshake.decode_server_info(body, recipient_private, server_public) ==
+             {:ok, %Derpex.ServerInfo{version: 2}}
+
+    :gen_tcp.close(sender)
+    :gen_tcp.close(recipient)
+  end
+
   defp stop_server_on_exit(server) do
     on_exit(fn ->
       if Process.alive?(server), do: Process.exit(server, :shutdown)

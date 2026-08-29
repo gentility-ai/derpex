@@ -372,10 +372,19 @@ defmodule Derpex.Listener.Handler do
 
     case admit(state, key, info, can_mesh) do
       {:ok, {admission_context, request}} ->
-        claim_and_register(socket, state, key, info, can_mesh, request, admission_context)
+        claim(state, request, admission_context)
 
       {:error, reason} ->
         {:error, {:admission, reason}, state}
+    end
+  end
+
+  # Registering publishes this connection's rings, so its writer starts sending
+  # the moment it happens. Go starts its send loop only after writing server
+  # info, and this action runs after that write for the same reason.
+  defp execute_action(socket, state, {:register, key, info, can_mesh}) do
+    with {:ok, state} <- register_authenticated(state, key, info, can_mesh) do
+      {:ok, maybe_start_tcp_rtt(socket, state)}
     end
   end
 
@@ -672,16 +681,10 @@ defmodule Derpex.Listener.Handler do
     end
   end
 
-  defp claim_and_register(socket, state, key, info, can_mesh, request, admission_context) do
+  defp claim(state, request, admission_context) do
     case Admission.claim(state.admission_policy, request, admission_context, self()) do
-      {:ok, admission_context} ->
-        with {:ok, state} <-
-               register_authenticated(state, key, info, can_mesh, admission_context) do
-          {:ok, maybe_start_tcp_rtt(socket, state)}
-        end
-
-      {:error, reason} ->
-        {:error, {:admission, reason}, state}
+      {:ok, admission_context} -> {:ok, %{state | admission_context: admission_context}}
+      {:error, reason} -> {:error, {:admission, reason}, state}
     end
   end
 
@@ -711,7 +714,7 @@ defmodule Derpex.Listener.Handler do
     end
   end
 
-  defp register_authenticated(state, key, info, can_mesh, admission_context) do
+  defp register_authenticated(state, key, info, can_mesh) do
     presence = presence(state, info, can_mesh)
     state = subscribe_to_rate_config(state, can_mesh)
 
@@ -732,7 +735,6 @@ defmodule Derpex.Listener.Handler do
     |> Map.put(:client_public_key, key)
     |> Map.put(:client_info, info)
     |> Map.put(:can_mesh, can_mesh)
-    |> Map.put(:admission_context, admission_context)
     |> dispatch_event({:authenticated, key, info})
   end
 
