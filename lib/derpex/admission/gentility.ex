@@ -1150,7 +1150,8 @@ defmodule Derpex.Admission.Gentility do
           sequence: sequence
       }
 
-      {:reply, {:ok, context}, hold_claimed_lease(state, node_key)}
+      state = state |> hold_claimed_lease(node_key) |> reschedule_renewal()
+      {:reply, {:ok, context}, state}
     else
       {:error, _reason} = error -> {:reply, error, state}
     end
@@ -1165,8 +1166,36 @@ defmodule Derpex.Admission.Gentility do
 
       entry ->
         key = expiry_key(node_key, entry)
-        %{state | unclaimed: :gb_trees.delete_any(key, state.unclaimed)}
+        state = %{state | unclaimed: :gb_trees.delete_any(key, state.unclaimed)}
+        arm_renewal(state, node_key, entry)
     end
+  end
+
+  # Renewal follows the connection, not the admission: a lease admitted while
+  # nobody was connected was passed over for renewal, and claiming it later is
+  # what makes it worth renewing. An idle lease claimed after its renewal time
+  # is renewed at once rather than left to expire under the connection.
+  defp arm_renewal(state, node_key, entry) do
+    cond do
+      renewing?(state, node_key) ->
+        state
+
+      :gb_trees.is_defined(renewal_key(node_key, entry), state.by_renewal) ->
+        state
+
+      true ->
+        entry = %{entry | renew_at_ms: max(entry.renew_at_ms, now_ms(state))}
+
+        %{
+          state
+          | leases: Map.put(state.leases, node_key, entry),
+            by_renewal: :gb_trees.enter(renewal_key(node_key, entry), true, state.by_renewal)
+        }
+    end
+  end
+
+  defp renewing?(state, node_key) do
+    Enum.any?(state.renewals, fn {_pid, renewal} -> renewal.node_key == node_key end)
   end
 
   defp release_claimed_lease(state, node_key) do
@@ -1637,6 +1666,7 @@ defmodule Derpex.Admission.Gentility do
   # the lease still has life in it; once it does not, the lease simply expires.
   defp requeue_renewal(state, node_key, entry) do
     retry_at_ms = now_ms(state) + state.renewal_retry_ms
+    by_renewal = :gb_trees.delete_any(renewal_key(node_key, entry), state.by_renewal)
 
     if retry_at_ms < entry.close_at_ms do
       entry = %{entry | renew_at_ms: retry_at_ms}
@@ -1644,10 +1674,10 @@ defmodule Derpex.Admission.Gentility do
       %{
         state
         | leases: Map.put(state.leases, node_key, entry),
-          by_renewal: :gb_trees.enter(renewal_key(node_key, entry), true, state.by_renewal)
+          by_renewal: :gb_trees.enter(renewal_key(node_key, entry), true, by_renewal)
       }
     else
-      state
+      %{state | by_renewal: by_renewal}
     end
   end
 
@@ -1662,9 +1692,19 @@ defmodule Derpex.Admission.Gentility do
       {{renew_at_ms, _node_key}, _present} = :gb_trees.smallest(state.by_renewal)
       delay = max(renew_at_ms - now_ms(state), 0)
       token = make_ref()
-      timer = state.clock.send_after(self(), {__MODULE__, :renew, token}, delay)
-      %{state | renewal_timer: timer, renewal_token: token}
+      %{state | renewal_timer: renewal_timer(state, token, delay), renewal_token: token}
     end
+  end
+
+  # A renewal already due is dispatched as a message rather than a zero-delay
+  # timer, which is also what lets a chunked sweep continue on the next message.
+  defp renewal_timer(_state, token, 0) do
+    send(self(), {__MODULE__, :renew, token})
+    nil
+  end
+
+  defp renewal_timer(state, token, delay) do
+    state.clock.send_after(self(), {__MODULE__, :renew, token}, delay)
   end
 
   defp cancel_renewal(%{renewal_timer: nil} = state), do: state

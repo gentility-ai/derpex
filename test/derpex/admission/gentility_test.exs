@@ -505,6 +505,67 @@ defmodule Derpex.Admission.GentilityTest do
     Process.exit(connection, :kill)
   end
 
+  test "claiming a cached lease past its renewal time renews it at once" do
+    parent = self()
+    node_key = node_key(61)
+    {:ok, authority} = Agent.start_link(fn -> :serve end)
+
+    renewed = signed_lease(node_key, issued_at_ms: 9_500, expires_at_ms: 19_500)
+
+    controller =
+      start_controller(
+        authority: fn request ->
+          cond do
+            request.metadata[:renewal] ->
+              send(parent, {:renewing, request.node_key})
+              {:ok, renewed}
+
+            Agent.get(authority, & &1) == :serve ->
+              Agent.update(authority, fn _state -> :outage end)
+              {:ok, signed_lease(request.node_key, issued_at_ms: 1_000, expires_at_ms: 11_000)}
+
+            true ->
+              {:error, :unavailable}
+          end
+        end,
+        max_lease_ms: 10_000,
+        close_peer: fn key -> send(parent, {:closed, key}) end
+      )
+
+    policy = Gentility.policy(controller)
+    assert {:ok, _context} = Gentility.authorize(request(node_key), policy)
+
+    # Nobody is connected when the renewal time passes, so the lease is passed
+    # over.
+    Manual.advance(8_500)
+    refute_receive {:renewing, ^node_key}
+
+    # The node reconnects and is served from cache; claiming it is what makes
+    # the lease worth renewing.
+    assert {:ok, %{gentility: %{source: :cached}} = context} =
+             Gentility.authorize(request(node_key), policy)
+
+    [connection] = connections(1)
+    assert {:ok, ^context} = Gentility.claim(request(node_key), context, connection, policy)
+
+    assert_receive {:renewing, ^node_key}, 2_000
+
+    eventually(fn ->
+      match?(
+        {:ok, %{gentility: %{lease_expires_at_ms: 19_500}}},
+        Gentility.authorize(request(node_key), policy)
+      )
+    end)
+
+    # The original lease would have closed here.
+    Manual.advance(2_000)
+    refute_receive {:closed, ^node_key}
+    assert Gentility.stats(controller).cache_entries == 1
+    assert Process.alive?(connection)
+
+    Process.exit(connection, :kill)
+  end
+
   test "an idle lease is never renewed and simply expires" do
     parent = self()
     node_key = node_key(42)
