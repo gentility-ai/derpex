@@ -392,6 +392,31 @@ defmodule Derpex.HTTP1Test do
       assert String.ends_with?(response, "\r\n\r\ntok.thumbprint")
     end
 
+    test "keeps a key authorization out of every cache", context do
+      assert {:response, response} =
+               HTTP1.route(request("GET", @challenge_path), @server_public, context.options)
+
+      assert IO.iodata_to_binary(response) =~ "Cache-Control: no-store\r\n"
+    end
+
+    test "refuses a token outside the base64url alphabet without a lookup", context do
+      malformed = [
+        "/.well-known/acme-challenge/../../etc/passwd",
+        "/.well-known/acme-challenge/tok%2e%2e",
+        "/.well-known/acme-challenge/tok/nested",
+        "/.well-known/acme-challenge/",
+        "/.well-known/acme-challenge/" <> String.duplicate("t", 129)
+      ]
+
+      for path <- malformed do
+        assert {:response, response} =
+                 HTTP1.route(request("GET", path), @server_public, context.options)
+
+        assert IO.iodata_to_binary(response) =~ "HTTP/1.1 404 Not Found\r\n",
+               "#{path} was not refused"
+      end
+    end
+
     test "answers an unknown token with the same 404 any unknown path gets", context do
       unknown = "/.well-known/acme-challenge/other"
 

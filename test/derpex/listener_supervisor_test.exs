@@ -125,11 +125,11 @@ defmodule Derpex.ListenerSupervisorTest do
     end
   end
 
-  # The chain DERPEX serves is `[leaf, metacertificate]`, which is upstream's
-  # TLS fast-start design rather than a real certificate path, so an OTP client
-  # refuses it and the end-to-end handshake belongs to the Go interoperability
-  # gate. What this asserts is that OTP accepts the certificate and key the
-  # manager issued when the listen socket is opened.
+  # A self-signed placeholder is a single certificate with no path to build, so
+  # an OTP client refuses it however the chain is verified. What this asserts is
+  # that OTP accepts the certificate and key when the listen socket is opened;
+  # a handshake against a chain an authority signed is asserted end to end in
+  # test/derpex/certificates/acme_boot_test.exs.
   test "OTP opens a listen socket with the self-issued certificate and key" do
     {_server_public, server_private} = Crypto.generate_keypair()
 

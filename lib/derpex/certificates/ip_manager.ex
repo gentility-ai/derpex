@@ -22,11 +22,15 @@ defmodule Derpex.Certificates.IPManager do
   again until that deadline; a certificate already in hand keeps being served
   throughout.
 
-  The only issuer DERPEX ships is `self_signed_issuer/2`, reachable through
-  `DERPEX_IP_CERT_ISSUER=self`. The ACME issuer this manager was modelled on
-  is pending; PLAN.md section 2.3 records that. `:next_provider` exists for the
-  same reason and has no production caller: delegating a DNS name needs the
-  hostname provider that only an ACME client can supply.
+  Two issuers exist. `Derpex.ACME.Client` orders from a certificate authority
+  and is what `DERPEX_CERT_MODE=letsencrypt` and `gcp` use; `self_signed_issuer/2`
+  issues locally and is what `DERPEX_IP_CERT_ISSUER=self` uses.
+
+  `:next_provider` is the seam upstream uses to hand a DNS hello to a separate
+  autocert manager. DERPEX has no second provider to delegate to, because this
+  manager orders hostname certificates itself when it is configured with
+  `:hostnames`, so the option has no production caller and exists for the
+  delegation test alone.
   """
 
   use GenServer
@@ -199,9 +203,9 @@ defmodule Derpex.Certificates.IPManager do
   @doc """
   Issues a persistent self-signed certificate for `ip`.
 
-  This is the only issuer DERPEX ships. It contacts no certificate authority,
-  so `DERPEX_IP_CERT_ISSUER=self` never depends on the ACME client that
-  PLAN.md section 2.3 records as pending.
+  It contacts no certificate authority, so `DERPEX_IP_CERT_ISSUER=self` works
+  on a relay that no authority can reach — and, because it is instant, it is
+  also what a listener binds as a placeholder while a real order is running.
   """
   @spec self_signed_issuer(binary(), binary()) :: {:ok, certificate()} | {:error, term()}
   def self_signed_issuer(ip, _profile) do

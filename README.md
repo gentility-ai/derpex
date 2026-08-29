@@ -149,6 +149,12 @@ point the client at a fake authority.
 The account key is created once at `DERPEX_CERT_DIR/acme-account.key` with mode
 `0600` and reused for every order.
 
+The plaintext listener exists to answer challenges, not to serve the relay: it
+answers `/.well-known/acme-challenge/*` and the unauthenticated probes, sends
+any other `GET` or `HEAD` to the same target over HTTPS, and answers anything
+else with `400 Use HTTPS`. A cleartext DERP upgrade is offered only when
+`DERPEX_CLEAR_HTTP=1` is set, so a client cannot be talked down onto port 80.
+
 `DERPEX_IP_CERT_ISSUER=self` needs no certificate authority at all: with
 `DERPEX_CERT_DIR=/var/lib/derpex/certs` and `DERPEX_CERT_HOSTNAME` set to a bare
 IP address, the relay issues and caches a persistent self-signed certificate for

@@ -104,6 +104,17 @@ Two consequences are worth stating rather than discovering:
   `Derpex.Listener.Transports.SSL` reads it per connection. A renewed
   certificate therefore reaches hellos with and without SNI alike.
 
+One inventory row stays open. `TestIPCertManagerNextProvider` covers upstream's
+delegation of a DNS hello from the IP certificate manager to a separate
+autocert manager. DERPEX has no second provider to delegate to — one manager
+orders both IP and hostname certificates — so the `:next_provider` seam has no
+production caller and the row is recorded as `pending` rather than claimed.
+
+The plaintext listener `DERPEX_HTTP_PORT` opens is restricted to what Go's
+`tsweb.Port80Handler` serves: the challenge path and the unauthenticated
+probes, with everything else redirected to HTTPS and no DERP upgrade in
+cleartext unless `DERPEX_CLEAR_HTTP=1`.
+
 `DERPEX_IP_CERT_ISSUER=self` remains as a local alternative: persistent
 self-signed per-IP certificates that contact no certificate authority.
 

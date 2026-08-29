@@ -379,16 +379,30 @@ defmodule Derpex.Test.FakeACME do
   defp issue(state, csr_base64) when is_binary(csr_base64) do
     with {:ok, csr_der} <- Base.url_decode64(csr_base64, padding: false),
          {:ok, {public_key, names}} <- parse_request(csr_der),
-         1 <- length(names) do
-      {:ok, sign_leaf(state, public_key, hd(names))}
+         {:ok, name} <- single_name(state, names) do
+      {:ok, sign_leaf(state, public_key, name)}
     else
-      count when is_integer(count) -> {:error, {:subject_alt_names, count}}
       :error -> {:error, :invalid_base64}
       {:error, reason} -> {:error, reason}
     end
   end
 
   defp issue(_state, other), do: {:error, {:invalid_csr, other}}
+
+  # Upstream asserts `len(csr.IPAddresses) == 1` for an IP order. The same
+  # count is required here, and of the kind the order actually asked for: a
+  # request naming anything else is not the certificate that was ordered.
+  defp single_name(state, names) do
+    expected =
+      if state.identifier && state.identifier.type == "ip", do: :iPAddress, else: :dNSName
+
+    matching = for {kind, _value} = name <- names, kind == expected, do: name
+
+    case {matching, names} do
+      {[name], [_only]} -> {:ok, name}
+      {_matching, _names} -> {:error, {:subject_alt_names, expected, names}}
+    end
+  end
 
   defp parse_request(csr_der) do
     {:CertificationRequest, info, _algorithm, signature} =
