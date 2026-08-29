@@ -274,6 +274,10 @@ defmodule Derpex.Outbox.LifecycleQueue do
   @spec room_for?(t(), pos_integer()) :: boolean()
   def room_for?(%__MODULE__{} = queue, count), do: size(queue) + count <= queue.soft_cap
 
+  @doc "True once the queue has been closed. One atomic read, no lock."
+  @spec closed?(t()) :: boolean()
+  def closed?(%__MODULE__{} = queue), do: atomic_get(queue, @closed) == 1
+
   @doc "Returns the queue table's memory footprint in machine words."
   @spec memory_words(t()) :: non_neg_integer()
   def memory_words(%__MODULE__{} = queue), do: :ets.info(queue.table, :memory)

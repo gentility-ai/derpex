@@ -152,6 +152,16 @@ so they are not implemented by accident:
   leaves and comes back is owed a second `peer_gone`. A conforming client is
   never affected: it receives a frame Go would have withheld, describing a
   disconnect that really happened.
+- Section 3.3 requires that every timeout, keepalive and limiter read time
+  through `Derpex.Clock`. Two places read the real clock directly: the outbox
+  lock's acquisition deadline (`Derpex.Outbox.Lock`) and the writer's
+  last-resort retry timer (`Derpex.Writer`). Both are internal contention
+  backoffs rather than protocol timing, and both must keep running under a
+  test that swaps in `Derpex.Clock.Manual` globally - a frozen clock would turn
+  the lock's bounded spin into an unbounded one and would leave a contended
+  writer waiting for a timer that never fires. The protocol deadlines those
+  tests exist to control - handshake, keepalive, drain, rate limiting - all
+  still go through `Derpex.Clock`.
 - Section 3.3 requires that a sender is never suspended by a destination's
   queue. DERPEX suspends one for up to about four milliseconds when that
   destination's outbox ring lock is held for that long, because Go's channel

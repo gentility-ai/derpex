@@ -341,6 +341,51 @@ defmodule Derpex.WriterTest do
     assert Writer.write_control(writer, "server-info", mesh_timeout + 1_000) == :ok
   end
 
+  test "a reverse path is recorded before the packet is written" do
+    {:ok, writer} =
+      Writer.start_link(
+        owner: self(),
+        transport: ControlledTransport,
+        socket: {self(), :blocking, :blocked}
+      )
+
+    rings = rings(writer)
+    source = :crypto.strong_rand_bytes(32)
+    on_exit(fn -> Router.ReversePaths.take(source) end)
+
+    enqueue_until_accepted(rings.ordinary, {:recv_packet, source, "in flight"})
+    assert_receive {:write_blocked, :blocking, ^writer, _frame}
+
+    # The write has not returned, and the source may already be gone: Go
+    # records its watcher before writing for exactly this reason.
+    assert reverse_paths_for(source) == 1
+    assert [{connection, _lifecycle}] = Router.ReversePaths.take(source)
+    assert connection == self()
+
+    send(writer, :unblock_write)
+  end
+
+  test "a writer that stops takes its reverse paths with it" do
+    {:ok, writer} =
+      Writer.start_link(
+        owner: self(),
+        transport: ControlledTransport,
+        socket: {self(), :orphan, :open}
+      )
+
+    rings = rings(writer)
+    source = :crypto.strong_rand_bytes(32)
+
+    enqueue_until_accepted(rings.ordinary, {:recv_packet, source, "packet"})
+    assert_receive {:write_finished, :orphan, _frame}
+    assert reverse_paths_for(source) == 1
+
+    # The queue dies with the connection, so a row still pointing at it would
+    # be a peer-gone frame published into a table that no longer exists.
+    :ok = GenServer.stop(writer)
+    assert reverse_paths_for(source) == 0
+  end
+
   test "a source is noted once until it goes away and comes back" do
     {:ok, writer} =
       Writer.start_link(

@@ -16,6 +16,15 @@ defmodule Derpex.Router.ReversePaths do
 
   The tables are created by, and owned by, the `Derpex.Router` process.
 
+  `note/3` and `take/1` run in different processes - a destination's writer and
+  the router - and are not serialised against each other. A note that lands
+  after its source's `take/1` has already run records a path for a peer that
+  has just left; nothing will take it, and it is removed when the destination's
+  writer stops, which bounds it to that connection's lifetime. A note for a
+  destination whose queue is already closed is refused outright and counted as
+  `derp_reverse_path_late_notes`, so the window is visible rather than assumed
+  to be empty.
+
   Cost: recording a path is two `ordered_set` inserts, roughly +0.5 us over the
   single insert this replaced, and the writer pays it once per
   `{destination, source}` pair rather than once per packet: it remembers which
@@ -26,6 +35,7 @@ defmodule Derpex.Router.ReversePaths do
 
   require Derpex.Outbox
 
+  alias Derpex.Metrics
   alias Derpex.Outbox
 
   @by_source __MODULE__.BySource
@@ -56,14 +66,22 @@ defmodule Derpex.Router.ReversePaths do
   @spec note(binary(), pid(), Outbox.t()) :: :ok
   def note(<<source::binary-size(32)>>, connection, lifecycle)
       when is_pid(connection) and Outbox.is_outbox(lifecycle) do
+    if Outbox.closed?(lifecycle) do
+      Metrics.add(Metrics.default_handle(), :reverse_path_late_notes, 1)
+    else
+      note_open(source, connection, lifecycle)
+    end
+  rescue
+    ArgumentError -> :ok
+  end
+
+  defp note_open(source, connection, lifecycle) do
     true = :ets.insert(@by_source, {{source, connection}, lifecycle})
     # The connection index only answers "which sources does this connection
     # hold", and its rows are read for their key alone, so it carries no copy
     # of the ring.
     true = :ets.insert(@by_connection, {{connection, source}})
     :ok
-  rescue
-    ArgumentError -> :ok
   end
 
   @doc """

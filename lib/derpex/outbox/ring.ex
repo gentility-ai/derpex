@@ -179,6 +179,10 @@ defmodule Derpex.Outbox.Ring do
     end
   end
 
+  @doc "True once the ring has been closed. One atomic read, no lock."
+  @spec closed?(t()) :: boolean()
+  def closed?(%__MODULE__{} = ring), do: atomic_get(ring, @closed) == 1
+
   @doc "Returns the ring table's memory footprint in machine words."
   @spec memory_words(t()) :: non_neg_integer()
   def memory_words(%__MODULE__{} = ring), do: :ets.info(ring.table, :memory)

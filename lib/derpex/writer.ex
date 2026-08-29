@@ -16,12 +16,16 @@ defmodule Derpex.Writer do
   alias Derpex.Outbox.LifecycleQueue
   alias Derpex.Outbox.Ring
   alias Derpex.Router
+  alias Derpex.Router.ReversePaths
   alias Derpex.SocketOptions
   alias Derpex.WebSocket.Frame, as: WebSocketFrame
 
   @wake_message :derpex_outbox_ready
   @retry_message :derpex_outbox_retry
   @retry_interval_ms 5
+  # Frames per wakeup. A writer that drains a full queue in one pass answers no
+  # control write and no pong until it is done, so it gives the mailbox a turn.
+  @max_drain_per_wake 64
   @websocket_chunk_size 16 * 1_024
   @packet_classes [:lifecycle, :ordinary, :disco, :pong]
 
@@ -144,6 +148,17 @@ defmodule Derpex.Writer do
     {:stop, {:owner_down, reason}, state}
   end
 
+  # The writer is the last part of a connection to stop, so it is the last
+  # thing that can record a reverse path for it. Forgetting them here means a
+  # note made during teardown cannot outlive the queue it points at.
+  @impl true
+  def terminate(_reason, %{owner: owner}) do
+    ReversePaths.forget_connection(owner)
+    :ok
+  end
+
+  def terminate(_reason, _state), do: :ok
+
   defp drain_or_stop(state) do
     case state |> cancel_retry() |> drain() do
       {:ok, state} -> {:noreply, state}
@@ -151,7 +166,14 @@ defmodule Derpex.Writer do
     end
   end
 
-  defp drain(state) do
+  defp drain(state), do: drain(state, @max_drain_per_wake)
+
+  defp drain(state, 0) do
+    send(self(), @wake_message)
+    {:ok, state}
+  end
+
+  defp drain(state, budget) do
     case take_next(state) do
       {{:ok, message, queue_age_microseconds}, state} ->
         # Go counts a pong and a peer-gone frame as it hands them to the
@@ -159,11 +181,16 @@ defmodule Derpex.Writer do
         # counters are incremented on the same side of the socket call here.
         record_dispatch(state.metrics, message)
 
+        # And the reverse path is recorded before the write, as Go records its
+        # watcher before writing: a source that leaves while this write is in
+        # flight still owes this destination a peer-gone frame.
+        state = note_reverse_path(state, message)
+
         with {:ok, frame} <- Body.encode_server(message),
              :ok <- send_data(state, frame) do
           record_queue_duration(state.metrics, message, queue_age_microseconds)
           record_send(state.metrics, message)
-          drain(note_reverse_path(state, message))
+          drain(state, budget - 1)
         else
           {:error, reason} ->
             :ok = Metrics.add(state.metrics, :write_errors, 1)

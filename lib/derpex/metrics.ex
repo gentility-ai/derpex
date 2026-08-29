@@ -33,7 +33,8 @@ defmodule Derpex.Metrics do
     :ring_producer_naps,
     :lifecycle_queue_overflows,
     :lifecycle_contention,
-    :paced_read_overruns
+    :paced_read_overruns,
+    :reverse_path_late_notes
   ]
 
   @drop_reasons [

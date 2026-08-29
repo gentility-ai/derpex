@@ -46,6 +46,11 @@ defmodule Derpex.Outbox do
   def delete(%Ring{} = ring), do: Ring.delete(ring)
   def delete(%LifecycleQueue{} = queue), do: LifecycleQueue.delete(queue)
 
+  @doc "True once the structure has been closed."
+  @spec closed?(t()) :: boolean()
+  def closed?(%Ring{} = ring), do: Ring.closed?(ring)
+  def closed?(%LifecycleQueue{} = queue), do: LifecycleQueue.closed?(queue)
+
   @doc "Returns the structure's counters."
   @spec stats(t()) :: map() | :busy
   def stats(%Ring{} = ring), do: Ring.stats(ring)
