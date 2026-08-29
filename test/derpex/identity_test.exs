@@ -17,6 +17,12 @@ defmodule Derpex.IdentityTest do
 
     assert {:ok, stat} = File.stat(path)
     assert Bitwise.band(stat.mode, 0o777) == 0o600
+
+    directory = Path.dirname(path)
+    assert {:ok, directory_stat} = File.stat(directory)
+    assert Bitwise.band(directory_stat.mode, 0o777) == 0o700
+    assert Enum.filter(File.ls!(directory), &String.contains?(&1, ".tmp.")) == []
+    assert Enum.filter(File.ls!(directory), &String.ends_with?(&1, ".lock")) == []
   end
 
   @tag :tmp_dir

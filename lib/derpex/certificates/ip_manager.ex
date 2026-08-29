@@ -7,10 +7,13 @@ defmodule Derpex.Certificates.IPManager do
 
   use GenServer
 
+  alias Derpex.AtomicFile
   alias Derpex.Certificates.Manual
 
   @short_lived_profile "shortlived"
   @challenge_prefix "/.well-known/acme-challenge/"
+  @certificate_mode 0o644
+  @key_mode 0o600
 
   @type certificate :: %{certificate_der: binary(), private_key: tuple()}
   @type issuer :: (binary(), binary() -> {:ok, certificate()} | {:error, term()})
@@ -50,7 +53,7 @@ defmodule Derpex.Certificates.IPManager do
   def init(options) do
     directory = Keyword.fetch!(options, :directory)
     issuer = Keyword.fetch!(options, :issuer)
-    :ok = File.mkdir_p(directory)
+    :ok = AtomicFile.ensure_directory(directory)
 
     {:ok,
      %{
@@ -196,10 +199,8 @@ defmodule Derpex.Certificates.IPManager do
       |> List.wrap()
       |> :public_key.pem_encode()
 
-    with :ok <- File.write(certificate_path, certificate_pem),
-         :ok <- File.chmod(certificate_path, 0o644),
-         :ok <- File.write(key_path, key_pem) do
-      File.chmod(key_path, 0o600)
+    with :ok <- AtomicFile.write(certificate_path, certificate_pem, mode: @certificate_mode) do
+      AtomicFile.write(key_path, key_pem, mode: @key_mode)
     end
   end
 
