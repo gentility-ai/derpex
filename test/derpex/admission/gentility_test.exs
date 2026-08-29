@@ -152,6 +152,132 @@ defmodule Derpex.Admission.GentilityTest do
              {:error, :unknown_record_type}
   end
 
+  test "counts every authorization outcome and rate-limits the outage warning" do
+    node_key = node_key(43)
+    {:ok, authority} = Agent.start_link(fn -> {:ok, signed_lease(node_key)} end)
+
+    controller =
+      start_controller(
+        authority: fn _request -> Agent.get(authority, & &1) end,
+        log_interval_ms: 60_000
+      )
+
+    policy = Gentility.policy(controller)
+
+    log =
+      ExUnit.CaptureLog.capture_log(fn ->
+        assert {:ok, %{gentility: %{source: :live}}} =
+                 Gentility.authorize(request(node_key), policy)
+
+        Agent.update(authority, fn _response -> {:error, :unavailable} end)
+
+        for _attempt <- 1..3 do
+          assert {:ok, %{gentility: %{source: :cached}}} =
+                   Gentility.authorize(request(node_key), policy)
+        end
+
+        assert Gentility.authorize(request(node_key(44)), policy) == {:error, :no_cached_lease}
+      end)
+
+    assert log =~ "authority unavailable"
+    assert length(String.split(log, "authority unavailable")) == 2
+
+    counts = Gentility.stats(controller).authorize_counts
+    assert counts[{:live, :ok}] == 1
+    assert counts[{:cached, :ok}] == 3
+    assert counts[{:denied, :no_cached_lease}] == 1
+  end
+
+  test "counts closed peers by cause and reports the nearest lease expiry" do
+    node_key = node_key(45)
+
+    controller =
+      start_controller(
+        authority: fn request -> {:ok, signed_lease(request.node_key)} end,
+        close_peer: fn _key -> 0 end
+      )
+
+    policy = Gentility.policy(controller)
+    assert {:ok, _context} = Gentility.authorize(request(node_key), policy)
+
+    stats = Gentility.stats(controller)
+    assert stats.nearest_lease_expiry_seconds == 1
+    refute stats.cache_load_error
+    refute stats.cache_persist_error
+
+    log =
+      ExUnit.CaptureLog.capture_log(fn ->
+        assert Gentility.revoke(controller, signed_revocation(node_key, 10)) == {:ok, :applied}
+      end)
+
+    assert log =~ "revocation applied"
+    stats = Gentility.stats(controller)
+    assert stats.close_peer_counts == %{revocation: 1}
+    assert stats.nearest_lease_expiry_seconds == nil
+
+    assert {:ok, _context} = Gentility.authorize(request(node_key(46)), policy)
+    Manual.advance(1_000)
+    eventually(fn -> Gentility.stats(controller).close_peer_counts[:expiry] == 1 end)
+  end
+
+  test "counts admission shed by the concurrency gate without a controller call" do
+    parent = self()
+
+    authority = fn _request ->
+      send(parent, {:authority_started, self()})
+      receive do: (:release -> {:ok, signed_lease(node_key(47))})
+    end
+
+    controller = start_controller(authority: authority, max_concurrent_requests: 1)
+    policy = Gentility.policy(controller)
+    first = Task.async(fn -> Gentility.authorize(request(node_key(47)), policy) end)
+    assert_receive {:authority_started, authority_process}
+
+    assert Gentility.authorize(request(node_key(48)), policy) == {:error, :admission_overloaded}
+
+    send(authority_process, :release)
+    assert {:ok, _context} = Task.await(first)
+
+    counts = Gentility.stats(controller).authorize_counts
+    assert counts[{:denied, :overloaded}] == 1
+  end
+
+  test "exports fixed-cardinality admission metrics through operations" do
+    node_key = node_key(49)
+
+    start_supervised!(
+      {Gentility,
+       [
+         name: Gentility,
+         authority: fn request -> {:ok, signed_lease(request.node_key)} end,
+         verification_keys: %{@signing_key_id => @public_key},
+         clock: Manual,
+         max_lease_ms: 1_000,
+         max_future_skew_ms: 0,
+         expiry_jitter: fn _lifetime_ms -> 0 end
+       ]}
+    )
+
+    assert {:ok, _context} = Gentility.authorize(request(node_key), Gentility.policy(Gentility))
+
+    text = Derpex.Operations.prometheus()
+
+    assert text =~ ~s(derpex_gentility_authorize_total{outcome="live",reason="ok"} 1)
+    assert text =~ ~s(derpex_gentility_authorize_total{outcome="cached",reason="ok"} 0)
+    assert text =~ ~s(derpex_gentility_authorize_total{outcome="denied",reason="cache_full"} 0)
+    assert text =~ ~s(derpex_gentility_close_peer_total{cause="expiry"} 0)
+    assert text =~ "derpex_gentility_nearest_lease_expiry_seconds 1"
+    assert text =~ "derpex_gentility_cache_load_error 0"
+    assert text =~ "derpex_gentility_cache_persist_error 0"
+
+    series =
+      text
+      |> String.split("\n", trim: true)
+      |> Enum.filter(&String.starts_with?(&1, "derpex_gentility_authorize_total"))
+
+    assert length(series) == length(Gentility.authorize_labels())
+  end
+
   test "renews a claimed lease before expiry without closing its connection" do
     parent = self()
     node_key = node_key(40)

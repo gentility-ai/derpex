@@ -49,6 +49,19 @@ defmodule Derpex.Admission.Gentility do
   @default_renewal_retry_ms 60_000
   @renewal_fraction {4, 5}
   @expiry_jitter_percent 10
+  @default_log_interval_ms 60_000
+  @denial_reasons [
+    :no_cached_lease,
+    :lease_revoked,
+    :cache_full,
+    :stale_lease,
+    :wrong_region,
+    :invalid_record,
+    :overloaded,
+    :unavailable,
+    :other
+  ]
+  @close_peer_causes [:expiry, :revocation, :eviction, :key_rotation]
   @cache_write_timeout_ms 2_000
   @budget_prune_chunk 1_000
   @reverify_chunk 1_000
@@ -59,6 +72,7 @@ defmodule Derpex.Admission.Gentility do
       :server,
       :authority,
       :gate,
+      :counters,
       :max_concurrent_requests,
       :authority_timeout,
       :byte_budgets,
@@ -72,6 +86,7 @@ defmodule Derpex.Admission.Gentility do
             server: GenServer.server(),
             authority: term(),
             gate: :atomics.atomics_ref(),
+            counters: :atomics.atomics_ref(),
             max_concurrent_requests: pos_integer(),
             authority_timeout: pos_integer(),
             byte_budgets: :ets.tid(),
@@ -80,6 +95,9 @@ defmodule Derpex.Admission.Gentility do
             usage: nil | map()
           }
   end
+
+  @overloaded_counter 1
+  @unavailable_counter 2
 
   @type authority ::
           module() | {module(), term()} | (Request.t() -> {:ok, binary()} | {:error, term()})
@@ -98,12 +116,17 @@ defmodule Derpex.Admission.Gentility do
 
   @impl Derpex.Admission
   def authorize(%Request{} = request, %Policy{} = policy) do
-    with :ok <- reserve(policy.gate, policy.max_concurrent_requests) do
-      try do
-        authorize_reserved(request, policy)
-      after
-        :atomics.sub(policy.gate, 1, 1)
-      end
+    case reserve(policy.gate, policy.max_concurrent_requests) do
+      :ok ->
+        try do
+          authorize_reserved(request, policy)
+        after
+          :atomics.sub(policy.gate, 1, 1)
+        end
+
+      {:error, :admission_overloaded} = shed ->
+        :atomics.add(policy.counters, @overloaded_counter, 1)
+        shed
     end
   end
 
@@ -259,6 +282,12 @@ defmodule Derpex.Admission.Gentility do
       cache_full: state.cache_full,
       budget_nodes: budgets.nodes,
       budget_organizations: budgets.organizations,
+      renewals_in_flight: map_size(state.renewals),
+      authorize_counts: caller_counts(state, state.authorize_counts),
+      close_peer_counts: state.close_peer_counts,
+      nearest_lease_expiry_seconds: nearest_lease_expiry_seconds(state),
+      cache_load_error: state.load_error != nil,
+      cache_persist_error: state.persist_error != nil,
       load_error: state.load_error,
       persist_error: state.persist_error
     }
@@ -270,14 +299,14 @@ defmodule Derpex.Admission.Gentility do
     state = purge_expired(state)
 
     case Contract.record_type(wire) do
-      {:ok, :lease} -> accept_live_lease(state, node_key, wire)
-      {:ok, :revocation} -> accept_live_denial(state, node_key, wire)
-      {:error, _reason} = error -> {:reply, error, state}
+      {:ok, :lease} -> counted(accept_live_lease(state, node_key, wire))
+      {:ok, :revocation} -> counted(accept_live_denial(state, node_key, wire))
+      {:error, _reason} = error -> counted({:reply, error, state})
     end
   end
 
   def handle_call({:cached, node_key}, _from, state) do
-    state |> purge_expired() |> cached_decision(node_key)
+    state |> purge_expired() |> cached_decision(node_key) |> counted()
   end
 
   def handle_call({:claim, node_key, context, connection}, _from, state) do
@@ -386,8 +415,14 @@ defmodule Derpex.Admission.Gentility do
   end
 
   def handle_info({CacheWriter, :write_result, {:error, reason}}, state) do
-    Logger.warning("gentility admission cache write failed: #{inspect(reason)}")
-    {:noreply, mark_cache_dirty(%{state | persist_error: reason})}
+    state =
+      log_event(
+        %{state | persist_error: reason},
+        :cache_persist_error,
+        "gentility admission cache write failed: #{inspect(reason)}"
+      )
+
+    {:noreply, mark_cache_dirty(state)}
   end
 
   # The usage worker and the cache writer are linked, so their exits still take
@@ -415,6 +450,7 @@ defmodule Derpex.Admission.Gentility do
     authority = Keyword.fetch!(options, :authority)
     server = Keyword.get(options, :server) || self()
     gate = :atomics.new(1, signed: false)
+    counters = :atomics.new(2, signed: false)
 
     max_concurrent_requests =
       positive_option!(options, :max_concurrent_requests, @default_max_concurrent_requests)
@@ -436,6 +472,7 @@ defmodule Derpex.Admission.Gentility do
       positive_option!(options, :cache_persist_ms, @default_cache_persist_ms)
 
     renewal_retry_ms = positive_option!(options, :renewal_retry_ms, @default_renewal_retry_ms)
+    log_interval_ms = non_negative_option!(options, :log_interval_ms, @default_log_interval_ms)
     expiry_jitter = Keyword.get(options, :expiry_jitter, &default_expiry_jitter/1)
 
     verification_keys = Keyword.fetch!(options, :verification_keys)
@@ -452,6 +489,7 @@ defmodule Derpex.Admission.Gentility do
         server: server,
         authority: authority,
         gate: gate,
+        counters: counters,
         max_concurrent_requests: max_concurrent_requests,
         authority_timeout: authority_timeout,
         byte_budgets: Budgets.table(budgets),
@@ -500,6 +538,10 @@ defmodule Derpex.Admission.Gentility do
          renewal_retry_ms: renewal_retry_ms,
          renewals: %{},
          expiry_jitter: expiry_jitter,
+         authorize_counts: %{},
+         close_peer_counts: %{},
+         log_interval_ms: log_interval_ms,
+         log_at: %{},
          closing_connections: MapSet.new(),
          cache_full: 0,
          sequence: 0,
@@ -515,12 +557,22 @@ defmodule Derpex.Admission.Gentility do
   defp authorize_reserved(request, policy) do
     case invoke_with_timeout(policy.authority, request, policy.authority_timeout) do
       {:ok, {:ok, wire}} when is_binary(wire) ->
-        controller_call(policy.server, {:accept_live, request.node_key, wire})
+        controller_call(policy.server, {:accept_live, request.node_key, wire}, policy)
 
       _authority_failed ->
-        controller_call(policy.server, {:cached, request.node_key})
+        controller_call(policy.server, {:cached, request.node_key}, policy)
     end
   end
+
+  @doc false
+  @spec authorize_labels() :: [{atom(), atom()}]
+  def authorize_labels do
+    [{:live, :ok}, {:cached, :ok}] ++ Enum.map(@denial_reasons, &{:denied, &1})
+  end
+
+  @doc false
+  @spec close_peer_causes() :: [atom()]
+  def close_peer_causes, do: @close_peer_causes
 
   defp invoke_with_timeout(authority, request, timeout) do
     parent = self()
@@ -556,6 +608,17 @@ defmodule Derpex.Admission.Gentility do
     GenServer.call(server, message)
   catch
     :exit, _reason -> {:error, :admission_unavailable}
+  end
+
+  defp controller_call(server, message, %Policy{} = policy) do
+    case controller_call(server, message) do
+      {:error, :admission_unavailable} = unavailable ->
+        :atomics.add(policy.counters, @unavailable_counter, 1)
+        unavailable
+
+      result ->
+        result
+    end
   end
 
   defp reserve(gate, maximum) do
@@ -606,10 +669,67 @@ defmodule Derpex.Admission.Gentility do
     end
   end
 
+  # Every authorization the controller answers is counted under a fixed label
+  # set, so the outcome mix is visible without a per-node series.
+  defp counted({:reply, reply, state}) do
+    {outcome, reason} = authorize_label(reply)
+    {:reply, reply, count_authorize(state, outcome, reason)}
+  end
+
+  defp authorize_label({:ok, %{gentility: %{source: :live}}}), do: {:live, :ok}
+  defp authorize_label({:ok, %{gentility: %{source: :cached}}}), do: {:cached, :ok}
+  defp authorize_label({:error, reason}), do: {:denied, denial_reason(reason)}
+
+  defp denial_reason(reason) when reason in @denial_reasons, do: reason
+  defp denial_reason(:admission_unavailable), do: :unavailable
+  defp denial_reason(:lease_not_cached), do: :no_cached_lease
+  defp denial_reason(:admission_overloaded), do: :overloaded
+  defp denial_reason(reason) when is_atom(reason), do: record_reason(reason)
+  defp denial_reason({:unknown_signing_key, _key_id}), do: :invalid_record
+  defp denial_reason({:invalid_signing_key, _key_id}), do: :invalid_record
+  defp denial_reason({:unsupported_version, _version}), do: :invalid_record
+  defp denial_reason({:invalid_field, _field}), do: :invalid_record
+  defp denial_reason(_reason), do: :other
+
+  defp record_reason(reason) do
+    if reason |> Atom.to_string() |> String.contains?(["lease", "record", "signature", "utf8"]),
+      do: :invalid_record,
+      else: :other
+  end
+
+  defp count_authorize(state, outcome, reason) do
+    counts = Map.update(state.authorize_counts, {outcome, reason}, 1, &(&1 + 1))
+    %{state | authorize_counts: counts}
+  end
+
   defp cached_decision(state, node_key) do
     case state.leases[node_key] do
-      nil -> {:reply, {:error, :no_cached_lease}, reschedule_timers(state)}
-      entry -> {:reply, {:ok, context(entry.lease, :cached)}, reschedule_timers(state)}
+      nil ->
+        {:reply, {:error, :no_cached_lease}, reschedule_timers(state)}
+
+      entry ->
+        state =
+          log_event(
+            state,
+            :serving_cached,
+            "gentility authority unavailable; serving cached admission leases"
+          )
+
+        {:reply, {:ok, context(entry.lease, :cached)}, reschedule_timers(state)}
+    end
+  end
+
+  # Every one of these conditions can repeat per connection attempt, so the log
+  # is rate limited per kind while the counters behind it stay exact.
+  defp log_event(state, event, message) do
+    now = now_ms(state)
+    last = Map.get(state.log_at, event)
+
+    if is_nil(last) or now - last >= state.log_interval_ms do
+      Logger.warning(message)
+      %{state | log_at: Map.put(state.log_at, event, now)}
+    else
+      state
     end
   end
 
@@ -646,8 +766,19 @@ defmodule Derpex.Admission.Gentility do
 
       true ->
         case evictable_lease(state) do
-          nil -> {:reply, {:error, :cache_full}, %{state | cache_full: state.cache_full + 1}}
-          victim -> install_admitted_lease(state, lease, entry, victim)
+          nil ->
+            state =
+              log_event(
+                %{state | cache_full: state.cache_full + 1},
+                :cache_full,
+                "gentility admission cache is full and every lease is in use; " <>
+                  "rejecting a new admission"
+              )
+
+            {:reply, {:error, :cache_full}, state}
+
+          victim ->
+            install_admitted_lease(state, lease, entry, victim)
         end
     end
   end
@@ -678,8 +809,13 @@ defmodule Derpex.Admission.Gentility do
 
   defp evict_lease(state, victim) do
     state = drop_lease_entry(state, victim)
-    close_peer(state, victim)
-    state
+    close_peer(state, victim, :eviction)
+
+    log_event(
+      count_close_peer(state, :eviction),
+      :eviction,
+      "gentility admission cache is full; evicting the soonest-expiring unclaimed lease"
+    )
   end
 
   # Only a changed allocation can put an established connection over its limit:
@@ -789,7 +925,18 @@ defmodule Derpex.Admission.Gentility do
 
       _older_or_missing ->
         {state, close?} = put_revocation(state, wire, revocation)
-        if close?, do: close_peer(state, revocation.node_key)
+
+        state =
+          if close? do
+            close_peer(state, revocation.node_key, :revocation)
+            count_close_peer(state, :revocation)
+          else
+            state
+          end
+
+        state =
+          log_event(state, :revocation, "gentility revocation applied; node closed: #{close?}")
+
         state = persist_now(state) |> reschedule_timers()
         {if(close?, do: :covered, else: :uncovered), state}
     end
@@ -799,7 +946,20 @@ defmodule Derpex.Admission.Gentility do
     {state, applied, stale, close_keys} =
       Enum.reduce(revocations, {state, 0, 0, MapSet.new()}, &reconcile_revocation/2)
 
-    Enum.each(close_keys, &close_peer(state, &1))
+    Enum.each(close_keys, &close_peer(state, &1, :revocation))
+    state = count_close_peer(state, :revocation, MapSet.size(close_keys))
+
+    state =
+      if applied > 0,
+        do:
+          log_event(
+            state,
+            :revocation,
+            "gentility reconciliation applied #{applied} revocations, closing " <>
+              "#{MapSet.size(close_keys)} nodes"
+          ),
+        else: state
+
     state = persist_now(state) |> reschedule_timers()
     {:reply, {:ok, %{applied: applied, stale: stale}}, state}
   end
@@ -1126,8 +1286,16 @@ defmodule Derpex.Admission.Gentility do
 
   defp load_cache(state) do
     case Cache.load(state.cache_path, state.max_cache_entries, state.max_revocations) do
-      {:ok, {lease_wires, revocation_wires}} -> load_records(state, lease_wires, revocation_wires)
-      {:error, reason} -> %{state | load_error: reason}
+      {:ok, {lease_wires, revocation_wires}} ->
+        load_records(state, lease_wires, revocation_wires)
+
+      {:error, reason} ->
+        log_event(
+          %{state | load_error: reason},
+          :cache_load_error,
+          "gentility admission cache could not be loaded: #{inspect(reason)}; " <>
+            "starting with no cached leases"
+        )
     end
   end
 
@@ -1209,8 +1377,14 @@ defmodule Derpex.Admission.Gentility do
 
           {:error, _retired_or_expired} ->
             state = drop_lease_entry(state, node_key)
-            close_peer(state, node_key)
+            close_peer(state, node_key, :key_rotation)
+
             state
+            |> count_close_peer(:key_rotation)
+            |> log_event(
+              :key_rotation,
+              "gentility verification-key rotation is dropping leases signed by a retired key"
+            )
         end
     end
   end
@@ -1269,8 +1443,8 @@ defmodule Derpex.Admission.Gentility do
       entry ->
         if expiry_key(node_key, entry) == key do
           state = drop_lease_entry(state, node_key)
-          close_peer(state, node_key)
-          state
+          close_peer(state, node_key, :expiry)
+          count_close_peer(state, :expiry)
         else
           state
         end
@@ -1554,8 +1728,18 @@ defmodule Derpex.Admission.Gentility do
     state = cancel_cache_persist(state)
 
     case persist(state, mode) do
-      :ok -> %{state | cache_dirty: false, persist_error: nil}
-      {:error, reason} -> mark_cache_dirty(%{state | persist_error: reason})
+      :ok ->
+        %{state | cache_dirty: false, persist_error: nil}
+
+      {:error, reason} ->
+        state =
+          log_event(
+            %{state | persist_error: reason},
+            :cache_persist_error,
+            "gentility admission cache write failed: #{inspect(reason)}"
+          )
+
+        mark_cache_dirty(state)
     end
   end
 
@@ -1588,9 +1772,14 @@ defmodule Derpex.Admission.Gentility do
     Cache.encode(leases, revocations)
   end
 
-  defp close_peer(state, key) do
+  defp close_peer(state, key, cause) when cause in @close_peer_causes do
     _connection_count = state.close_peer.(key)
     :ok
+  end
+
+  defp count_close_peer(state, cause, count \\ 1) do
+    counts = Map.update(state.close_peer_counts, cause, count, &(&1 + count))
+    %{state | close_peer_counts: counts}
   end
 
   defp unexpected_exit(state, pid, reason) do
@@ -1638,6 +1827,30 @@ defmodule Derpex.Admission.Gentility do
     if :atomics.get(usage.blocked, 1) == 0,
       do: :ok,
       else: {:error, :usage_spool_full}
+  end
+
+  # The two shedding outcomes are counted lock-free by the connection process
+  # itself, so an overloaded relay does not pay a message to say so.
+  defp caller_counts(state, counts) do
+    counts
+    |> put_caller_count({:denied, :overloaded}, state.policy.counters, @overloaded_counter)
+    |> put_caller_count({:denied, :unavailable}, state.policy.counters, @unavailable_counter)
+  end
+
+  defp put_caller_count(counts, key, counters, index) do
+    case :atomics.get(counters, index) do
+      0 -> counts
+      value -> Map.update(counts, key, value, &(&1 + value))
+    end
+  end
+
+  defp nearest_lease_expiry_seconds(state) do
+    if :gb_trees.is_empty(state.by_expiry) do
+      nil
+    else
+      {{close_at_ms, _node_key}, _present} = :gb_trees.smallest(state.by_expiry)
+      div(max(close_at_ms - now_ms(state), 0), 1_000)
+    end
   end
 
   defp now_ms(state), do: state.clock.system_time(:millisecond)

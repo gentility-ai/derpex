@@ -315,12 +315,35 @@ defmodule Derpex.Operations do
       active_requests: "derpex_gentility_active_requests",
       max_cache_entries: "derpex_gentility_max_cache_entries",
       max_revocations: "derpex_gentility_max_revocations",
-      cache_full: "derpex_gentility_cache_full"
+      cache_full: "derpex_gentility_cache_full",
+      renewals_in_flight: "derpex_gentility_renewals_in_flight",
+      nearest_lease_expiry_seconds: "derpex_gentility_nearest_lease_expiry_seconds",
+      cache_load_error: "derpex_gentility_cache_load_error",
+      cache_persist_error: "derpex_gentility_cache_persist_error"
     }
 
     metrics
     |> merge_values(values, names)
+    |> merge_authorize_metrics(Map.get(values, :authorize_counts, %{}))
+    |> merge_close_peer_metrics(Map.get(values, :close_peer_counts, %{}))
     |> merge_usage_metrics(usage)
+  end
+
+  # Both label sets are enumerated by the admission controller, so the series
+  # count is fixed and no node, organization, or source identity can reach a
+  # label.
+  defp merge_authorize_metrics(metrics, counts) do
+    Enum.reduce(Gentility.authorize_labels(), metrics, fn {outcome, reason} = label, metrics ->
+      name = ~s(derpex_gentility_authorize_total{outcome="#{outcome}",reason="#{reason}"})
+      Map.put(metrics, name, Map.get(counts, label, 0))
+    end)
+  end
+
+  defp merge_close_peer_metrics(metrics, counts) do
+    Enum.reduce(Gentility.close_peer_causes(), metrics, fn cause, metrics ->
+      name = ~s(derpex_gentility_close_peer_total{cause="#{cause}"})
+      Map.put(metrics, name, Map.get(counts, cause, 0))
+    end)
   end
 
   defp merge_event_metrics(metrics) do

@@ -131,6 +131,33 @@ rejected with `cache_full` and the counter behind
 means the cache bound is below the instance's working set: raise
 `DERPEX_GENTILITY_MAX_CACHE_ENTRIES` or reduce the nodes homed on the instance.
 
+## Admission metrics
+
+Every admission decision the controller answers is counted under a fixed label
+set — no node, organization, or source identity ever reaches a label:
+
+- `derpex_gentility_authorize_total{outcome,reason}` — `outcome` is `live`,
+  `cached`, or `denied`; denials carry one of a fixed reason set
+  (`no_cached_lease`, `lease_revoked`, `cache_full`, `stale_lease`,
+  `wrong_region`, `invalid_record`, `overloaded`, `unavailable`, `other`).
+  A rising `cached` share means Gentility is unreachable and the relay is
+  running on cached leases.
+- `derpex_gentility_close_peer_total{cause}` — `expiry`, `revocation`,
+  `eviction`, or `key_rotation`.
+- `derpex_gentility_nearest_lease_expiry_seconds` — how long until the next
+  cached lease is closed. **Alert on this.** It falling toward zero across the
+  fleet while `authorize_total{outcome="cached"}` climbs is the signature of a
+  Gentility outage that is about to darken the relay. The series is absent when
+  no lease is cached.
+- `derpex_gentility_cache_load_error` / `derpex_gentility_cache_persist_error` —
+  1 while the durable cache could not be read at boot or last failed to write.
+- `derpex_gentility_renewals_in_flight`, `derpex_gentility_cache_full`.
+
+Warnings are rate limited per kind (one per minute per controller) so a
+persistent condition cannot flood the log: authority unavailable and serving
+cached, revocation applied, eviction, cache full, key rotation, and cache
+load/write failures. The counters behind them stay exact regardless.
+
 ## Usage export
 
 Each fixed window is exported as one or more batches with the same window
