@@ -1,8 +1,10 @@
 defmodule Derpex.RouterTest do
   use ExUnit.Case, async: false
 
+  alias Derpex.Metrics
   alias Derpex.Outbox.Ring
   alias Derpex.Router
+  alias Derpex.Router.ReversePaths
 
   test "successful routing looks up ETS and publishes directly to a bounded ring" do
     source = :crypto.strong_rand_bytes(32)
@@ -218,6 +220,205 @@ defmodule Derpex.RouterTest do
     Process.exit(destination_connection, :kill)
   end
 
+  test "forgetting a destination costs its own reverse paths, not the whole table" do
+    sources = for _index <- 1..100, do: :crypto.strong_rand_bytes(32)
+    connections = for _index <- 1..2_000, do: spawn(fn -> Process.sleep(:infinity) end)
+    shared_ring = Ring.new(1)
+
+    on_exit(fn ->
+      Enum.each(connections, &ReversePaths.forget_connection/1)
+      Enum.each(connections, &Process.exit(&1, :kill))
+    end)
+
+    for connection <- connections, source <- sources do
+      assert Router.note_send(source, connection, shared_ring) == :ok
+    end
+
+    [target | _others] = connections
+    target_key = :crypto.strong_rand_bytes(32)
+    assert Router.register(target_key, target, shared_ring) == :ok
+
+    {elapsed, :ok} = :timer.tc(fn -> Router.unregister(target_key, target) end)
+
+    assert elapsed < 2_000,
+           "unregister scanned the whole reverse table: #{elapsed} us"
+  end
+
+  test "clearing one destination's reverse paths leaves the others subscribed" do
+    source = :crypto.strong_rand_bytes(32)
+    first_key = :crypto.strong_rand_bytes(32)
+    second_key = :crypto.strong_rand_bytes(32)
+    source_connection = spawn(fn -> Process.sleep(:infinity) end)
+    first = spawn(fn -> Process.sleep(:infinity) end)
+    second = spawn(fn -> Process.sleep(:infinity) end)
+    first_ring = Ring.new(1)
+    second_ring = Ring.new(1)
+
+    assert Router.register(source, source_connection, Ring.new(1)) == :ok
+    assert Router.register(first_key, first, first_ring) == :ok
+    assert Router.register(second_key, second, second_ring) == :ok
+    assert Router.note_send(source, first, first_ring) == :ok
+    assert Router.note_send(source, second, second_ring) == :ok
+
+    assert Router.unregister(first_key, first) == :ok
+    assert Router.unregister(source, source_connection) == :ok
+
+    assert Ring.take(second_ring) == {:ok, {:peer_gone, source, 0x00}}
+    assert Ring.take(first_ring) == :empty
+
+    assert Router.unregister(second_key, second) == :ok
+    Enum.each([source_connection, first, second], &Process.exit(&1, :kill))
+  end
+
+  test "the last local route leaving while a forwarder remains keeps the peer present" do
+    source = :crypto.strong_rand_bytes(32)
+    destination_key = :crypto.strong_rand_bytes(32)
+    source_connection = spawn(fn -> Process.sleep(:infinity) end)
+    destination = spawn(fn -> Process.sleep(:infinity) end)
+    destination_ring = Ring.new(2)
+    forwarder_ring = Ring.new(2)
+
+    assert Router.register(source, source_connection, Ring.new(1)) == :ok
+    assert Router.register(destination_key, destination, destination_ring) == :ok
+    assert Router.add_forwarder(source, :peer_relay, forwarder_ring) == :ok
+    assert Router.note_send(source, destination, destination_ring) == :ok
+
+    assert Router.unregister(source, source_connection) == :ok
+    assert Ring.take(destination_ring) == :empty
+
+    assert Router.remove_forwarder(source, :peer_relay) == :ok
+    assert Ring.take(destination_ring) == {:ok, {:peer_gone, source, 0x00}}
+
+    assert Router.unregister(destination_key, destination) == :ok
+    Enum.each([source_connection, destination], &Process.exit(&1, :kill))
+  end
+
+  test "the last forwarder leaving with no local route announces the peer as gone" do
+    source = :crypto.strong_rand_bytes(32)
+    destination_key = :crypto.strong_rand_bytes(32)
+    destination = spawn(fn -> Process.sleep(:infinity) end)
+    destination_ring = Ring.new(2)
+    forwarder_ring = Ring.new(2)
+
+    assert Router.register(destination_key, destination, destination_ring) == :ok
+    assert Router.add_forwarder(source, :peer_relay, forwarder_ring) == :ok
+    assert Router.note_send(source, destination, destination_ring) == :ok
+
+    assert Router.remove_forwarder(source, :peer_relay) == :ok
+    assert Ring.take(destination_ring) == {:ok, {:peer_gone, source, 0x00}}
+
+    assert Router.unregister(destination_key, destination) == :ok
+    Process.exit(destination, :kill)
+  end
+
+  test "the last forwarder leaving while a local route remains keeps the peer present" do
+    source = :crypto.strong_rand_bytes(32)
+    destination_key = :crypto.strong_rand_bytes(32)
+    source_connection = spawn(fn -> Process.sleep(:infinity) end)
+    destination = spawn(fn -> Process.sleep(:infinity) end)
+    destination_ring = Ring.new(2)
+    forwarder_ring = Ring.new(2)
+
+    assert Router.register(source, source_connection, Ring.new(1)) == :ok
+    assert Router.register(destination_key, destination, destination_ring) == :ok
+    assert Router.add_forwarder(source, :peer_relay, forwarder_ring) == :ok
+    assert Router.note_send(source, destination, destination_ring) == :ok
+
+    assert Router.remove_forwarder(source, :peer_relay) == :ok
+    assert Ring.take(destination_ring) == :empty
+
+    assert Router.unregister(source, source_connection) == :ok
+    assert Ring.take(destination_ring) == {:ok, {:peer_gone, source, 0x00}}
+
+    assert Router.unregister(destination_key, destination) == :ok
+    Enum.each([source_connection, destination], &Process.exit(&1, :kill))
+  end
+
+  test "removing one of two forwarders keeps the peer present and still routed" do
+    source = :crypto.strong_rand_bytes(32)
+    sender = :crypto.strong_rand_bytes(32)
+    destination_key = :crypto.strong_rand_bytes(32)
+    destination = spawn(fn -> Process.sleep(:infinity) end)
+    destination_ring = Ring.new(2)
+    first = Ring.new(2)
+    second = Ring.new(2)
+
+    assert Router.register(destination_key, destination, destination_ring) == :ok
+    assert Router.add_forwarder(source, :first, first) == :ok
+    assert Router.add_forwarder(source, :second, second) == :ok
+    assert Router.note_send(source, destination, destination_ring) == :ok
+
+    before = Metrics.snapshot()[:remove_forwarder_other]
+    assert Router.remove_forwarder(source, :first) == :ok
+
+    assert Ring.take(destination_ring) == :empty
+    assert Router.forwarder_count(source) == 1
+    assert Metrics.snapshot()[:remove_forwarder_other] == before
+
+    assert_enqueued(Router.route(sender, source, "still routed"))
+    assert Ring.take(second) == {:ok, {:forward_packet, sender, source, "still routed"}}
+    assert Ring.take(first) == :empty
+
+    assert Router.remove_forwarder(source, :second) == :ok
+    assert Ring.take(destination_ring) == {:ok, {:peer_gone, source, 0x00}}
+
+    assert Router.unregister(destination_key, destination) == :ok
+    Process.exit(destination, :kill)
+  end
+
+  test "removing an unregistered forwarder identity leaves the registered path alone" do
+    source = :crypto.strong_rand_bytes(32)
+    sender = :crypto.strong_rand_bytes(32)
+    destination_key = :crypto.strong_rand_bytes(32)
+    destination = spawn(fn -> Process.sleep(:infinity) end)
+    forwarder_process = spawn(fn -> Process.sleep(:infinity) end)
+    destination_ring = Ring.new(2)
+    forwarder_ring = Ring.new(2)
+
+    assert Router.register(destination_key, destination, destination_ring) == :ok
+    assert Router.add_forwarder(source, forwarder_process, forwarder_ring) == :ok
+    assert Router.note_send(source, destination, destination_ring) == :ok
+
+    before = Metrics.snapshot()[:remove_forwarder_other]
+    assert Router.remove_forwarder(source, :never_registered) == :ok
+    assert Router.remove_forwarder(:crypto.strong_rand_bytes(32), :never_registered) == :ok
+
+    assert Ring.take(destination_ring) == :empty
+    assert Router.forwarder_count(source) == 1
+    assert Metrics.snapshot()[:remove_forwarder_other] == before + 2
+
+    assert_enqueued(Router.route(sender, source, "still routed"))
+    assert Ring.take(forwarder_ring) == {:ok, {:forward_packet, sender, source, "still routed"}}
+
+    # The registered identity is still monitored, so its death still evicts it.
+    Process.exit(forwarder_process, :kill)
+    assert_eventually(fn -> Router.forwarder_count(source) == 0 end)
+    assert Ring.take(destination_ring) == {:ok, {:peer_gone, source, 0x00}}
+
+    assert Router.unregister(destination_key, destination) == :ok
+    Process.exit(destination, :kill)
+  end
+
+  test "a crashed last forwarder for a remote-only peer announces it as gone" do
+    source = :crypto.strong_rand_bytes(32)
+    destination_key = :crypto.strong_rand_bytes(32)
+    destination = spawn(fn -> Process.sleep(:infinity) end)
+    forwarder_process = spawn(fn -> Process.sleep(:infinity) end)
+    destination_ring = Ring.new(2)
+    forwarder_ring = Ring.new(2)
+
+    assert Router.register(destination_key, destination, destination_ring) == :ok
+    assert Router.add_forwarder(source, forwarder_process, forwarder_ring) == :ok
+    assert Router.note_send(source, destination, destination_ring) == :ok
+
+    Process.exit(forwarder_process, :kill)
+    assert_eventually(fn -> Router.forwarder_count(source) == 0 end)
+    assert Ring.take(destination_ring) == {:ok, {:peer_gone, source, 0x00}}
+
+    assert Router.unregister(destination_key, destination) == :ok
+    Process.exit(destination, :kill)
+  end
+
   test "the most recently active duplicate receives packets" do
     key = :crypto.strong_rand_bytes(32)
     source = :crypto.strong_rand_bytes(32)
@@ -241,6 +442,41 @@ defmodule Derpex.RouterTest do
     assert Router.unregister(key, second) == :ok
     Process.exit(first, :kill)
     Process.exit(second, :kill)
+  end
+
+  test "a sole connection's activity notes never reach a table" do
+    key = :crypto.strong_rand_bytes(32)
+    ring = Ring.new(1)
+    connection = activity_reporter(self(), key, ring)
+
+    assert_receive {:registered, ^connection}
+    on_exit(fn -> Process.exit(connection, :kill) end)
+
+    assert measure_lookups(connection) == 0
+    assert Router.unregister(key, connection) == :ok
+  end
+
+  test "a connection promoted to a duplicate resumes noting its activity" do
+    key = :crypto.strong_rand_bytes(32)
+    source = :crypto.strong_rand_bytes(32)
+    first_ring = Ring.new(2)
+    second_ring = Ring.new(2)
+    first = activity_reporter(self(), key, first_ring)
+    assert_receive {:registered, ^first}
+
+    second = spawn(fn -> Process.sleep(:infinity) end)
+    on_exit(fn -> Enum.each([first, second], &Process.exit(&1, :kill)) end)
+
+    assert Router.register(key, second, second_ring) == :ok
+    assert Router.route(source, key, "newest") == {:ok, :wake}
+    assert Ring.take(second_ring) == {:ok, {:recv_packet, source, "newest"}}
+
+    assert measure_lookups(first) > 0
+    assert Router.route(source, key, "promoted") == {:ok, :wake}
+    assert Ring.take(first_ring) == {:ok, {:recv_packet, source, "promoted"}}
+
+    assert Router.unregister(key, first) == :ok
+    assert Router.unregister(key, second) == :ok
   end
 
   test "closing a peer asks every duplicate connection to stop" do
@@ -346,6 +582,52 @@ defmodule Derpex.RouterTest do
     assert Process.alive?(Process.whereis(Router))
 
     Process.exit(source_connection, :kill)
+  end
+
+  # Registers from inside the spawned process, the way a listener handler does,
+  # then notes activity 10_000 times on demand so the caller can measure it.
+  defp activity_reporter(parent, key, ring) do
+    spawn(fn ->
+      :ok = Router.register(key, self(), ring)
+      send(parent, {:registered, self()})
+
+      receive do
+        :note_activity -> :ok
+      end
+
+      Enum.each(1..10_000, fn _index ->
+        :ok = Router.note_activity(key, self())
+      end)
+
+      send(parent, {:noted, self()})
+      Process.sleep(:infinity)
+    end)
+  end
+
+  defp measure_lookups(connection) do
+    counter = spawn_link(fn -> count_lookups(0) end)
+    :erlang.trace_pattern({:ets, :lookup, 2}, true, [])
+    :erlang.trace(connection, true, [:call, {:tracer, counter}])
+
+    try do
+      send(connection, :note_activity)
+      assert_receive {:noted, ^connection}, 10_000
+      reference = :erlang.trace_delivered(connection)
+      assert_receive {:trace_delivered, ^connection, ^reference}, 5_000
+      send(counter, {:count, self()})
+      assert_receive {:lookups, count}, 5_000
+      count
+    after
+      :erlang.trace(connection, false, [:call])
+      :erlang.trace_pattern({:ets, :lookup, 2}, false, [])
+    end
+  end
+
+  defp count_lookups(count) do
+    receive do
+      {:trace, _pid, :call, {:ets, :lookup, _arguments}} -> count_lookups(count + 1)
+      {:count, caller} -> send(caller, {:lookups, count})
+    end
   end
 
   defp reporting_connection(parent) do

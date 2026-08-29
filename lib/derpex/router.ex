@@ -11,12 +11,20 @@ defmodule Derpex.Router do
   alias Derpex.Disco
   alias Derpex.Metrics
   alias Derpex.Outbox.Ring
+  alias Derpex.Router.ReversePaths
 
   @table __MODULE__.Routes
-  @reverse_table __MODULE__.ReversePaths
   @registrations_table __MODULE__.Registrations
   @duplicates_table __MODULE__.Duplicates
   @forwarders_table __MODULE__.Forwarders
+
+  # Each registration owns one atomics array: slot 1 orders duplicate
+  # connections by last activity, slot 2 is Go's `sclient.isDup`. A connection
+  # that is not a duplicate can never win a promotion, so it reads slot 2 and
+  # skips the tables entirely.
+  @activity_slot 1
+  @duplicate_slot 2
+  @activity_cache __MODULE__.CachedActivity
 
   @default_presence %{
     ip: <<0::128>>,
@@ -87,10 +95,13 @@ defmodule Derpex.Router do
       )
       when is_pid(connection) and port in 0..65_535 and flags in 0..255 and
              is_binary(app_name) do
-    GenServer.call(
-      __MODULE__,
-      {:register, key, connection, ordinary, disco, lifecycle, presence}
-    )
+    {:ok, activity} =
+      GenServer.call(
+        __MODULE__,
+        {:register, key, connection, ordinary, disco, lifecycle, presence}
+      )
+
+    cache_activity(key, connection, activity)
   end
 
   @doc "Removes a connection only if it is still the active route."
@@ -157,19 +168,44 @@ defmodule Derpex.Router do
   @spec note_send(binary(), pid(), Ring.t()) :: :ok
   def note_send(<<source::binary-size(32)>>, destination_connection, %Ring{} = lifecycle)
       when is_pid(destination_connection) do
-    true = :ets.insert(@reverse_table, {{source, destination_connection}, lifecycle})
-    :ok
-  rescue
-    ArgumentError -> :ok
+    ReversePaths.note(source, destination_connection, lifecycle)
   end
 
-  @doc "Promotes a duplicate connection when it is the latest one to send a frame."
+  @doc """
+  Promotes a duplicate connection when it is the latest one to send a frame.
+
+  Called for every client frame, so the common case must stay off the tables.
+  `register/6` leaves the caller's own activity handle in its process
+  dictionary, which turns the sole-connection case into one atomics read.
+  """
   @spec note_activity(binary(), pid()) :: :ok
   def note_activity(<<key::binary-size(32)>>, connection) when is_pid(connection) do
+    case Process.get(@activity_cache) do
+      {^key, ^connection, activity} -> promote_cached_duplicate(key, connection, activity)
+      _uncached -> promote_duplicate(key, connection)
+    end
+  end
+
+  defp cache_activity(key, connection, activity) do
+    if connection == self() do
+      Process.put(@activity_cache, {key, connection, activity})
+    end
+
+    :ok
+  end
+
+  defp promote_cached_duplicate(key, connection, activity) do
+    case :atomics.get(activity, @duplicate_slot) do
+      0 -> :ok
+      _duplicate -> promote_duplicate(key, connection)
+    end
+  end
+
+  defp promote_duplicate(key, connection) do
     with [{^key}] <- :ets.lookup(@duplicates_table, key),
          [{{^key, ^connection}, ordinary, {disco, lifecycle}, activity}] <-
            :ets.lookup(@registrations_table, {key, connection}) do
-      :atomics.put(activity, 1, activity_sequence())
+      :atomics.put(activity, @activity_slot, activity_sequence())
       true = :ets.insert(@table, {key, connection, ordinary, disco, lifecycle})
     end
 
@@ -219,14 +255,7 @@ defmodule Derpex.Router do
         read_concurrency: true
       ])
 
-    reverse_table =
-      :ets.new(@reverse_table, [
-        :named_table,
-        :set,
-        :public,
-        read_concurrency: true,
-        write_concurrency: true
-      ])
+    :ok = ReversePaths.new()
 
     registrations_table =
       :ets.new(@registrations_table, [
@@ -256,7 +285,6 @@ defmodule Derpex.Router do
     {:ok,
      %{
        table: table,
-       reverse_table: reverse_table,
        registrations_table: registrations_table,
        duplicates_table: duplicates_table,
        forwarders_table: forwarders_table,
@@ -287,8 +315,8 @@ defmodule Derpex.Router do
         state
       ) do
     {monitor, monitors} = ensure_monitor(state.monitors, connection)
-    activity = :atomics.new(1, signed: false)
-    :atomics.put(activity, 1, activity_sequence())
+    activity = :atomics.new(2, signed: false)
+    :atomics.put(activity, @activity_slot, activity_sequence())
 
     previous_entries = Map.get(state.routes, key, [])
 
@@ -327,12 +355,13 @@ defmodule Derpex.Router do
     monitors =
       Map.put(monitors, connection, {monitor, MapSet.put(keys_for(monitors, connection), key)})
 
-    {:reply, :ok, %{state | monitors: monitors, routes: Map.put(state.routes, key, entries)}}
+    {:reply, {:ok, activity},
+     %{state | monitors: monitors, routes: Map.put(state.routes, key, entries)}}
   end
 
   def handle_call({:unregister, key, connection}, _from, state) do
     had_key? = Map.has_key?(state.routes, key)
-    routes = remove_route(state.routes, key, connection)
+    routes = remove_route(state.routes, key, connection, state.forwarders)
     monitors = remove_connection_key(state.monitors, connection, key)
 
     if had_key? and not Map.has_key?(routes, key) do
@@ -396,37 +425,14 @@ defmodule Derpex.Router do
   end
 
   def handle_call({:remove_forwarder, key, identity}, _from, state) do
-    registered? =
-      state.forwarders
-      |> Map.get(key, [])
-      |> Enum.any?(fn {registered_identity, _ring, _sequence} ->
-        registered_identity == identity
-      end)
+    case Map.fetch(state.forwarders, key) do
+      {:ok, registered} ->
+        {:reply, :ok, drop_forwarder(state, key, identity, registered)}
 
-    entries =
-      state.forwarders
-      |> Map.get(key, [])
-      |> Enum.reject(fn {registered_identity, _ring, _sequence} ->
-        registered_identity == identity
-      end)
-
-    publish_preferred_forwarder(key, entries)
-
-    forwarders =
-      if entries == [] do
-        Map.delete(state.forwarders, key)
-      else
-        Map.put(state.forwarders, key, entries)
-      end
-
-    forwarder_monitors =
-      if registered? do
-        remove_forwarder_monitor(state.forwarder_monitors, identity, key)
-      else
-        state.forwarder_monitors
-      end
-
-    {:reply, :ok, %{state | forwarders: forwarders, forwarder_monitors: forwarder_monitors}}
+      :error ->
+        note_remove_forwarder_other()
+        {:reply, :ok, state}
+    end
   end
 
   def handle_call({:forwarder_count, key}, _from, state) do
@@ -449,7 +455,8 @@ defmodule Derpex.Router do
   defp handle_connection_down(state, monitor, connection) do
     case state.monitors[connection] do
       {^monitor, keys} ->
-        {routes, gone_keys} = remove_connection_routes(state.routes, keys, connection)
+        {routes, gone_keys} =
+          remove_connection_routes(state.routes, keys, connection, state.forwarders)
 
         Enum.each(gone_keys, &broadcast(state.watchers, {:peer_gone, &1, 0x00}))
         forget_destination(connection)
@@ -471,7 +478,7 @@ defmodule Derpex.Router do
       {^monitor, keys} ->
         forwarders =
           Enum.reduce(keys, state.forwarders, fn key, forwarders ->
-            remove_dead_forwarder(forwarders, key, identity)
+            remove_dead_forwarder(forwarders, state.routes, key, identity)
           end)
 
         %{
@@ -513,7 +520,35 @@ defmodule Derpex.Router do
 
   defp remove_forwarder_monitor(monitors, _identity, _key), do: monitors
 
-  defp remove_dead_forwarder(forwarders, key, identity) do
+  defp drop_forwarder(state, key, identity, registered) do
+    entries =
+      Enum.reject(registered, fn {registered_identity, _ring, _sequence} ->
+        registered_identity == identity
+      end)
+
+    if length(entries) == length(registered) do
+      note_remove_forwarder_other()
+      state
+    else
+      publish_preferred_forwarder(key, entries)
+
+      %{
+        state
+        | forwarders: store_forwarders(state.forwarders, state.routes, key, entries),
+          forwarder_monitors: remove_forwarder_monitor(state.forwarder_monitors, identity, key)
+      }
+    end
+  end
+
+  # Go's `removePktForwardOther`: a removal naming a forwarder the map never
+  # held. Go counts only the unknown-identity case because an unknown key
+  # returns before its accounting; DERPEX keeps a single list per key, so both
+  # misses are the same bookkeeping drift and both are counted here.
+  defp note_remove_forwarder_other do
+    :ok = Metrics.add(Metrics.default_handle(), :remove_forwarder_other, 1)
+  end
+
+  defp remove_dead_forwarder(forwarders, routes, key, identity) do
     entries =
       forwarders
       |> Map.get(key, [])
@@ -522,12 +557,16 @@ defmodule Derpex.Router do
       end)
 
     publish_preferred_forwarder(key, entries)
+    store_forwarders(forwarders, routes, key, entries)
+  end
 
-    if entries == [] do
-      Map.delete(forwarders, key)
-    else
-      Map.put(forwarders, key, entries)
-    end
+  defp store_forwarders(forwarders, routes, key, []) do
+    note_peer_gone_from_region(key, Map.has_key?(routes, key))
+    Map.delete(forwarders, key)
+  end
+
+  defp store_forwarders(forwarders, _routes, key, entries) do
+    Map.put(forwarders, key, entries)
   end
 
   defp keys_for(monitors, connection) do
@@ -554,10 +593,10 @@ defmodule Derpex.Router do
     end
   end
 
-  defp remove_connection_routes(routes, keys, connection) do
+  defp remove_connection_routes(routes, keys, connection, forwarders) do
     Enum.reduce(keys, {routes, []}, fn key, {routes, gone_keys} ->
       had_key? = Map.has_key?(routes, key)
-      routes = remove_route(routes, key, connection)
+      routes = remove_route(routes, key, connection, forwarders)
 
       if had_key? and not Map.has_key?(routes, key) do
         {routes, [key | gone_keys]}
@@ -567,29 +606,30 @@ defmodule Derpex.Router do
     end)
   end
 
-  defp remove_route(routes, key, connection) do
+  defp remove_route(routes, key, connection, forwarders) do
     true = :ets.delete(@registrations_table, {key, connection})
 
-    entries =
+    {removed, entries} =
       routes
       |> Map.get(key, [])
-      |> Enum.reject(fn {
-                          registered_connection,
-                          _ordinary,
-                          _disco,
-                          _lifecycle,
-                          _activity,
-                          _presence
-                        } ->
+      |> Enum.split_with(fn {
+                              registered_connection,
+                              _ordinary,
+                              _disco,
+                              _lifecycle,
+                              _activity,
+                              _presence
+                            } ->
         registered_connection == connection
       end)
 
+    Enum.each(removed, &mark_duplicate(&1, 0))
     update_duplicate_marker(key, entries)
 
     case entries do
       [] ->
         true = :ets.delete(@table, key)
-        notify_peer_gone(key)
+        note_peer_gone_from_region(key, Map.has_key?(forwarders, key))
         Map.delete(routes, key)
 
       _remaining ->
@@ -611,26 +651,42 @@ defmodule Derpex.Router do
     end
   end
 
+  # Go's `notePeerGoneFromRegionLocked` runs only once the key has left
+  # `clientsMesh` entirely: `unregisterClient` drops the entry only when its
+  # forwarder is nil, and `RemovePacketForwarder` keeps the entry (as nil) while
+  # a local client remains. A peer that still has either path is not gone from
+  # the region, so its reverse paths stay recorded for whichever path leaves last.
+  defp note_peer_gone_from_region(_key, true = _still_reachable?), do: :ok
+  defp note_peer_gone_from_region(key, false = _still_reachable?), do: notify_peer_gone(key)
+
   defp notify_peer_gone(key) do
-    @reverse_table
-    |> :ets.match_object({{key, :_}, :_})
-    |> Enum.each(fn {{^key, _destination_connection}, lifecycle} = entry ->
-      true = :ets.delete_object(@reverse_table, entry)
+    key
+    |> ReversePaths.take()
+    |> Enum.each(fn {_destination_connection, lifecycle} ->
       _enqueue_result = safe_enqueue(lifecycle, {:peer_gone, key, 0x00})
     end)
   end
 
   defp forget_destination(connection) do
-    true = :ets.match_delete(@reverse_table, {{:_, connection}, :_})
-    :ok
+    ReversePaths.forget_connection(connection)
   end
 
   defp update_duplicate_marker(key, entries) do
-    if length(entries) > 1 do
+    duplicate = if length(entries) > 1, do: 1, else: 0
+    Enum.each(entries, &mark_duplicate(&1, duplicate))
+
+    if duplicate == 1 do
       true = :ets.insert(@duplicates_table, {key})
     else
       true = :ets.delete(@duplicates_table, key)
     end
+  end
+
+  defp mark_duplicate(
+         {_connection, _ordinary, _disco, _lifecycle, activity, _presence},
+         duplicate
+       ) do
+    :atomics.put(activity, @duplicate_slot, duplicate)
   end
 
   defp snapshot_presence(routes) do
