@@ -14,13 +14,24 @@ defmodule Derpex.Connection do
   alias Derpex.Frame.Decoder
   alias Derpex.Handshake
   alias Derpex.MeshKey
+  alias Derpex.Secret
   alias Derpex.ServerInfo
 
   @handshake_timeout 10_000
-  @max_client_info_length 256 * 1_024
 
+  # The pinned Go server accepts a client-info frame up to 256 KiB
+  # (`recvClientKey`). Real ClientInfo is under 200 bytes, so DERPEX caps the
+  # pre-authentication frame at 16 KiB. Recorded as a compatibility exception
+  # in PLAN.md Section 2.3.
+  @max_client_info_length 16 * 1_024
+
+  # Go's `recvClientKey` rejects `fl < derp.KeyLen + derp.NonceLen` as "short
+  # client info" before reading the body.
+  @min_client_info_length Frame.key_length() + Frame.nonce_length()
+
+  @derive {Inspect, except: [:private_key, :mesh_key]}
   defstruct [
-    :server_private_key,
+    :private_key,
     :server_info,
     :decoder,
     :phase,
@@ -44,27 +55,32 @@ defmodule Derpex.Connection do
           | {:client_message, Body.client_message()}
 
   @opaque t :: %__MODULE__{
-            server_private_key: binary(),
+            private_key: Secret.t(),
             server_info: ServerInfo.t(),
             decoder: Decoder.t(),
             phase: phase(),
             client_public_key: nil | binary(),
             client_info: nil | ClientInfo.t(),
-            mesh_key: nil | MeshKey.t(),
+            mesh_key: nil | Secret.t(),
             can_mesh: boolean(),
             keep_alive_interval: pos_integer(),
             close_reason: nil | term()
           }
 
-  @doc "Creates a connection and returns its greeting and handshake deadline actions."
-  @spec new(binary(), keyword()) :: {:ok, t(), [action()]} | {:error, atom()}
-  def new(server_private_key, options \\ []) do
+  @doc """
+  Creates a connection and returns its greeting and handshake deadline actions.
+
+  Both `private_key` and the `:mesh_key` option are `Derpex.Secret` references,
+  wrapped once by the caller that read them from configuration or disk.
+  """
+  @spec new(Secret.t(), keyword()) :: {:ok, t(), [action()]} | {:error, atom()}
+  def new(private_key, options \\ []) do
     server_info =
       Keyword.get(options, :server_info, %ServerInfo{version: Handshake.protocol_version()})
 
-    with {:ok, greeting} <- Handshake.server_key_frame(server_private_key) do
+    with {:ok, greeting} <- Handshake.server_key_frame(Secret.reveal(private_key)) do
       state = %__MODULE__{
-        server_private_key: server_private_key,
+        private_key: private_key,
         server_info: server_info,
         decoder: Decoder.new(frame_policy: &handshake_frame_policy/2),
         phase: :awaiting_client_info,
@@ -182,15 +198,17 @@ defmodule Derpex.Connection do
   end
 
   defp authenticate_client_info(state, body) do
+    private_key = Secret.reveal(state.private_key)
+
     with {:ok, client_public_key, client_info} <-
-           Handshake.decode_client_info(body, state.server_private_key),
+           Handshake.decode_client_info(body, private_key),
          {:ok, server_info} <-
            Handshake.server_info_frame(
-             state.server_private_key,
+             private_key,
              client_public_key,
              state.server_info
            ) do
-      can_mesh = MeshKey.trusted?(state.mesh_key, client_info.mesh_key)
+      can_mesh = MeshKey.trusted?(Secret.reveal(state.mesh_key), client_info.mesh_key)
 
       state = %{
         state
@@ -232,18 +250,28 @@ defmodule Derpex.Connection do
 
   defp authorize_client_message(_state, message), do: {:ok, message}
 
+  # Go's `recvClientKey` rejects a first frame whose header type is not
+  # `client_info`, so the body of such a frame is never read. Once the
+  # client-info header is admitted, later headers pipelined into the same chunk
+  # are governed by the authenticated policy with mesh permission still pending.
   defp handshake_frame_policy(type, length) do
     cond do
-      type == Frame.type(:client_info) and length > @max_client_info_length ->
+      type != Frame.type(:client_info) ->
+        {:error, {:unexpected_handshake_frame, type}}
+
+      length > @max_client_info_length ->
         {:error, {:frame_too_large, length, @max_client_info_length}}
 
-      type == Frame.type(:client_info) ->
-        :buffer
+      length < @min_client_info_length ->
+        {:error, {:frame_too_small, length, @min_client_info_length}}
 
       true ->
-        authenticated_frame_policy(type, length, :pending)
+        {:buffer, &pending_frame_policy/2}
     end
   end
+
+  defp pending_frame_policy(type, length),
+    do: authenticated_frame_policy(type, length, :pending)
 
   defp authenticated_frame_policy(type, length, mesh_permission) do
     case Frame.type_name(type) do

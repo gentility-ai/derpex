@@ -7,6 +7,7 @@ defmodule Derpex.Interop.DifferentialTest do
 
   alias Derpex.Crypto
   alias Derpex.Listener.Handler
+  alias Derpex.Secret
 
   test "pinned Go server and DERPEX produce the same normalized semantic trace" do
     upstream =
@@ -16,7 +17,7 @@ defmodule Derpex.Interop.DifferentialTest do
     {actual_commit, 0} = System.cmd("git", ["rev-parse", "HEAD"], cd: upstream)
     assert String.trim(actual_commit) == "1e69418c298b680562a2fecd7020f7f58d17d166"
 
-    {_server_public, server_private} = Crypto.generate_keypair()
+    {server_public, server_private} = Crypto.generate_keypair()
 
     {:ok, server} =
       ThousandIsland.start_link(
@@ -24,7 +25,10 @@ defmodule Derpex.Interop.DifferentialTest do
         transport_options: [ip: {127, 0, 0, 1}],
         num_acceptors: 1,
         handler_module: Handler,
-        handler_options: [server_private_key: server_private]
+        handler_options: [
+          server_private_key: Secret.wrap(server_private),
+          server_public_key: server_public
+        ]
       )
 
     on_exit(fn -> if Process.alive?(server), do: Process.exit(server, :shutdown) end)

@@ -14,6 +14,7 @@ defmodule Derpex.Listener.HandlerTest do
   alias Derpex.Outbox.Ring
   alias Derpex.RateConfig
   alias Derpex.RateController
+  alias Derpex.Secret
 
   defmodule LifecyclePolicy do
     @behaviour Derpex.Admission
@@ -65,7 +66,11 @@ defmodule Derpex.Listener.HandlerTest do
         transport_options: [ip: {127, 0, 0, 1}],
         num_acceptors: 1,
         handler_module: Handler,
-        handler_options: [server_private_key: server_private, event_handler: event_handler]
+        handler_options: [
+          server_private_key: Secret.wrap(server_private),
+          server_public_key: server_public,
+          event_handler: event_handler
+        ]
       )
 
     stop_server_on_exit(server)
@@ -121,7 +126,11 @@ defmodule Derpex.Listener.HandlerTest do
         transport_options: [ip: {127, 0, 0, 1}],
         num_acceptors: 1,
         handler_module: Handler,
-        handler_options: [server_private_key: server_private, event_handler: event_handler]
+        handler_options: [
+          server_private_key: Secret.wrap(server_private),
+          server_public_key: server_public,
+          event_handler: event_handler
+        ]
       )
 
     stop_server_on_exit(server)
@@ -167,8 +176,9 @@ defmodule Derpex.Listener.HandlerTest do
         num_acceptors: 1,
         handler_module: Handler,
         handler_options: [
-          server_private_key: server_private,
-          mesh_key: mesh_key,
+          server_private_key: Secret.wrap(server_private),
+          server_public_key: server_public,
+          mesh_key: Secret.wrap(mesh_key),
           client_verifier: verifier,
           admission: admission,
           disallowed_app_names: ["badapp"]
@@ -225,7 +235,8 @@ defmodule Derpex.Listener.HandlerTest do
         num_acceptors: 1,
         handler_module: Handler,
         handler_options: [
-          server_private_key: server_private,
+          server_private_key: Secret.wrap(server_private),
+          server_public_key: server_public,
           admission: {LifecyclePolicy, self()}
         ]
       )
@@ -290,7 +301,8 @@ defmodule Derpex.Listener.HandlerTest do
         num_acceptors: 1,
         handler_module: Handler,
         handler_options: [
-          server_private_key: server_private,
+          server_private_key: Secret.wrap(server_private),
+          server_public_key: server_public,
           event_handler: event_handler,
           rate_controller: rate_controller
         ]
@@ -342,7 +354,7 @@ defmodule Derpex.Listener.HandlerTest do
 
   test "accept limiting closes excess sockets before HTTP session allocation" do
     limiter = start_supervised!({AcceptLimiter, name: nil, config: {0, 1}})
-    {_server_public, server_private} = Crypto.generate_keypair()
+    {server_public, server_private} = Crypto.generate_keypair()
 
     {:ok, server} =
       ThousandIsland.start_link(
@@ -350,7 +362,11 @@ defmodule Derpex.Listener.HandlerTest do
         transport_options: [ip: {127, 0, 0, 1}],
         num_acceptors: 1,
         handler_module: Handler,
-        handler_options: [server_private_key: server_private, accept_limiter: limiter]
+        handler_options: [
+          server_private_key: Secret.wrap(server_private),
+          server_public_key: server_public,
+          accept_limiter: limiter
+        ]
       )
 
     stop_server_on_exit(server)
@@ -370,7 +386,7 @@ defmodule Derpex.Listener.HandlerTest do
         {AcceptLimiter, name: nil, config: [per_ip_connections: 1, max_tracked_ips: 16]}
       )
 
-    {_server_public, server_private} = Crypto.generate_keypair()
+    {server_public, server_private} = Crypto.generate_keypair()
 
     {:ok, server} =
       ThousandIsland.start_link(
@@ -378,7 +394,11 @@ defmodule Derpex.Listener.HandlerTest do
         transport_options: [ip: {127, 0, 0, 1}],
         num_acceptors: 1,
         handler_module: Handler,
-        handler_options: [server_private_key: server_private, accept_limiter: limiter]
+        handler_options: [
+          server_private_key: Secret.wrap(server_private),
+          server_public_key: server_public,
+          accept_limiter: limiter
+        ]
       )
 
     stop_server_on_exit(server)
@@ -412,7 +432,11 @@ defmodule Derpex.Listener.HandlerTest do
         transport_options: [ip: {127, 0, 0, 1}],
         num_acceptors: 1,
         handler_module: Handler,
-        handler_options: [server_private_key: server_private, drain: drain]
+        handler_options: [
+          server_private_key: Secret.wrap(server_private),
+          server_public_key: server_public,
+          drain: drain
+        ]
       )
 
     stop_server_on_exit(server)
@@ -459,7 +483,10 @@ defmodule Derpex.Listener.HandlerTest do
         transport_options: [ip: {127, 0, 0, 1}],
         num_acceptors: 1,
         handler_module: Handler,
-        handler_options: [server_private_key: server_private]
+        handler_options: [
+          server_private_key: Secret.wrap(server_private),
+          server_public_key: server_public
+        ]
       )
 
     stop_server_on_exit(server)
@@ -516,7 +543,8 @@ defmodule Derpex.Listener.HandlerTest do
         num_acceptors: 1,
         handler_module: Handler,
         handler_options: [
-          server_private_key: server_private,
+          server_private_key: Secret.wrap(server_private),
+          server_public_key: server_public,
           send_queue_depth: 64,
           event_handler: event_handler
         ]
@@ -536,7 +564,7 @@ defmodule Derpex.Listener.HandlerTest do
   end
 
   test "serves authorized traffic diagnostics as a live chunked stream" do
-    {_server_public, server_private} = Crypto.generate_keypair()
+    {server_public, server_private} = Crypto.generate_keypair()
     parent = self()
 
     run_ss = fn ->
@@ -551,7 +579,8 @@ defmodule Derpex.Listener.HandlerTest do
         num_acceptors: 1,
         handler_module: Handler,
         handler_options: [
-          server_private_key: server_private,
+          server_private_key: Secret.wrap(server_private),
+          server_public_key: server_public,
           debug: [traffic: [run_ss: run_ss, interval_ms: 60_000]]
         ]
       )
@@ -592,7 +621,8 @@ defmodule Derpex.Listener.HandlerTest do
         num_acceptors: 1,
         handler_module: Handler,
         handler_options: [
-          server_private_key: server_private,
+          server_private_key: Secret.wrap(server_private),
+          server_public_key: server_public,
           tcp_rtt: [reader: reader, interval_ms: 10_000]
         ]
       )

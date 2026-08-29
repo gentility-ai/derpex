@@ -4,8 +4,9 @@ defmodule Derpex.Mesh.Supervisor do
   use Supervisor
 
   alias Derpex.Mesh.Client
+  alias Derpex.Secret
 
-  @spec start_link({[binary() | keyword()], binary(), binary()}) :: Supervisor.on_start()
+  @spec start_link({[binary() | keyword()], Secret.t(), Secret.t()}) :: Supervisor.on_start()
   def start_link({peers, private_key, mesh_key}) do
     Supervisor.start_link(__MODULE__, {peers, private_key, mesh_key}, name: __MODULE__)
   end

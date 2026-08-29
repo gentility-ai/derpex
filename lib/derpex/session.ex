@@ -10,12 +10,14 @@ defmodule Derpex.Session do
   alias Derpex.Crypto
   alias Derpex.HTTP1
   alias Derpex.HTTP1.Parser
+  alias Derpex.Secret
 
   @http_timeout 10_000
 
+  @derive {Inspect, except: [:private_key]}
   defstruct [
     :phase,
-    :server_private_key,
+    :private_key,
     :server_public_key,
     :http_parser,
     :http_options,
@@ -36,7 +38,7 @@ defmodule Derpex.Session do
 
   @opaque t :: %__MODULE__{
             phase: phase(),
-            server_private_key: binary(),
+            private_key: Secret.t(),
             server_public_key: binary(),
             http_parser: Parser.t(),
             http_options: keyword(),
@@ -46,13 +48,18 @@ defmodule Derpex.Session do
             close_reason: nil | term()
           }
 
-  @doc "Creates a session waiting for one bounded HTTP request head."
-  @spec new(binary(), keyword()) :: {:ok, t(), [action()]} | {:error, atom()}
-  def new(server_private_key, options \\ []) do
-    with {:ok, server_public_key} <- Crypto.public_key(server_private_key) do
+  @doc """
+  Creates a session waiting for one bounded HTTP request head.
+
+  Both `private_key` and the `:mesh_key` option are `Derpex.Secret` references,
+  wrapped once by the caller that read them from configuration or disk.
+  """
+  @spec new(Secret.t(), keyword()) :: {:ok, t(), [action()]} | {:error, atom()}
+  def new(private_key, options \\ []) do
+    with {:ok, server_public_key} <- Crypto.public_key(Secret.reveal(private_key)) do
       state = %__MODULE__{
         phase: :http,
-        server_private_key: server_private_key,
+        private_key: private_key,
         server_public_key: server_public_key,
         http_parser: Parser.new(Keyword.get(options, :http_parser, [])),
         http_options:
@@ -153,7 +160,7 @@ defmodule Derpex.Session do
 
   defp route_http(state, {:upgrade, :websocket, response, metadata}, read_ahead) do
     with {:ok, connection, connection_actions} <-
-           Connection.new(state.server_private_key, state.connection_options) do
+           Connection.new(state.private_key, state.connection_options) do
       state = %{state | phase: :derp, connection: connection, metadata: metadata}
 
       actions =
@@ -166,7 +173,7 @@ defmodule Derpex.Session do
 
   defp route_http(state, {:upgrade, :derp, response, metadata}, read_ahead) do
     with {:ok, connection, connection_actions} <-
-           Connection.new(state.server_private_key, state.connection_options) do
+           Connection.new(state.private_key, state.connection_options) do
       state = %{state | phase: :derp, connection: connection, metadata: metadata}
       actions = [{:cancel_timeout, :http}] ++ maybe_send(response) ++ connection_actions
       receive_read_ahead(state, read_ahead, actions)

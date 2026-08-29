@@ -4,6 +4,7 @@ defmodule Derpex.Mesh.SupervisorTest do
   alias Derpex.Crypto
   alias Derpex.Mesh.Client
   alias Derpex.Mesh.Supervisor, as: MeshSupervisor
+  alias Derpex.Secret
 
   test "starts one independently supervised connection per configured peer" do
     {_public_key, private_key} = Crypto.generate_keypair()
@@ -25,8 +26,8 @@ defmodule Derpex.Mesh.SupervisorTest do
                connect_timeout: 50
              ]
            ],
-           private_key,
-           mesh_key
+           Secret.wrap(private_key),
+           Secret.wrap(mesh_key)
          }}
       )
 

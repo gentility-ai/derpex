@@ -5,6 +5,7 @@ defmodule Derpex.SessionTest do
   alias Derpex.Crypto
   alias Derpex.Frame
   alias Derpex.Handshake
+  alias Derpex.Secret
   alias Derpex.Session
 
   test "orders standard HTTP upgrade, greeting, and pipelined authentication" do
@@ -16,7 +17,7 @@ defmodule Derpex.SessionTest do
     request =
       "GET /derp HTTP/1.1\r\nHost: derp.example\r\nUpgrade: DERP\r\nConnection: Upgrade\r\n\r\n"
 
-    {:ok, session, [{:set_timeout, :http, 10_000}]} = Session.new(server_private)
+    {:ok, session, [{:set_timeout, :http, 10_000}]} = Session.new(Secret.wrap(server_private))
 
     assert {:ok, session, actions} =
              Session.receive_data(session, IO.iodata_to_binary([request, client_frame]))
@@ -51,7 +52,7 @@ defmodule Derpex.SessionTest do
       "GET /derp HTTP/1.1\r\nHost: derp.example\r\n" <>
         "Upgrade: DERP\r\nConnection: Upgrade\r\nDerp-Fast-Start: 1\r\n\r\n"
 
-    {:ok, session, _actions} = Session.new(server_private)
+    {:ok, session, _actions} = Session.new(Secret.wrap(server_private))
 
     assert {:ok, _session, actions} =
              Session.receive_data(session, IO.iodata_to_binary([request, client_frame]))
@@ -63,7 +64,7 @@ defmodule Derpex.SessionTest do
 
   test "serves finite HTTP requests and closes the session" do
     {_server_public, server_private} = Crypto.generate_keypair()
-    {:ok, session, _actions} = Session.new(server_private)
+    {:ok, session, _actions} = Session.new(Secret.wrap(server_private))
 
     assert {:close, session, :http_response, [{:cancel_timeout, :http}, {:send, response}]} =
              Session.receive_data(
@@ -79,7 +80,7 @@ defmodule Derpex.SessionTest do
     {_server_public, server_private} = Crypto.generate_keypair()
 
     {:ok, session, _actions} =
-      Session.new(server_private,
+      Session.new(Secret.wrap(server_private),
         debug: [remote_ip: {127, 0, 0, 1}, traffic: [interval_ms: 25]]
       )
 
@@ -112,7 +113,7 @@ defmodule Derpex.SessionTest do
         "Sec-WebSocket-Key: #{key}\r\n" <>
         "Sec-WebSocket-Protocol: derp\r\n\r\n"
 
-    {:ok, session, _actions} = Session.new(server_private)
+    {:ok, session, _actions} = Session.new(Secret.wrap(server_private))
     assert {:ok, session, actions} = Session.receive_data(session, request)
 
     assert [
@@ -125,5 +126,23 @@ defmodule Derpex.SessionTest do
 
     assert IO.iodata_to_binary(response) =~ "Sec-WebSocket-Protocol: derp"
     assert Session.info(session).phase == :derp
+  end
+
+  test "keeps the server private key and mesh key out of inspected state" do
+    {_server_public, server_private} = Crypto.generate_keypair()
+    mesh_key = :crypto.strong_rand_bytes(32)
+
+    {:ok, session, _actions} =
+      Session.new(Secret.wrap(server_private), mesh_key: Secret.wrap(mesh_key))
+
+    request = "GET /derp HTTP/1.1\r\nUpgrade: DERP\r\nConnection: Upgrade\r\n\r\n"
+    {:ok, session, _actions} = Session.receive_data(session, request)
+
+    rendered = inspect(session, limit: :infinity, structs: false, binaries: :as_binaries)
+
+    refute rendered =~ Base.encode16(server_private)
+    refute rendered =~ inspect(server_private, limit: :infinity, binaries: :as_binaries)
+    refute rendered =~ Base.encode16(mesh_key)
+    refute rendered =~ inspect(mesh_key, limit: :infinity, binaries: :as_binaries)
   end
 end

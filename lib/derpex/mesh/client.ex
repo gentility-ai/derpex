@@ -20,6 +20,7 @@ defmodule Derpex.Mesh.Client do
   alias Derpex.Mesh.ClientAddressTable
   alias Derpex.Outbox.Ring
   alias Derpex.Router
+  alias Derpex.Secret
 
   @wake_message :derpex_mesh_outbox_ready
   @reconnect_message :derpex_mesh_reconnect
@@ -57,11 +58,14 @@ defmodule Derpex.Mesh.Client do
 
   @impl true
   def init(options) do
+    private_key = Keyword.fetch!(options, :private_key)
+    mesh_key = Keyword.fetch!(options, :mesh_key)
+
     with {:ok, endpoint} <- parse_endpoint(Keyword.fetch!(options, :url)),
          {:ok, proxy} <- parse_proxy(Keyword.get(options, :proxy_url)),
-         <<private_key::binary-size(32)>> <- Keyword.fetch!(options, :private_key),
-         <<mesh_key::binary-size(32)>> <- Keyword.fetch!(options, :mesh_key),
-         {:ok, local_public_key} <- Crypto.public_key(private_key) do
+         <<_::binary-size(32)>> <- Secret.reveal(mesh_key),
+         <<revealed_private_key::binary-size(32)>> <- Secret.reveal(private_key),
+         {:ok, local_public_key} <- Crypto.public_key(revealed_private_key) do
       endpoint = %{endpoint | dial_host: Keyword.get(options, :dial_host, endpoint.host)}
 
       state = %{
@@ -226,16 +230,18 @@ defmodule Derpex.Mesh.Client do
   end
 
   defp finish_handshake(state, read_ahead) do
+    private_key = Secret.reveal(state.private_key)
+
     info = %ClientInfo{
       version: Handshake.protocol_version(),
-      mesh_key: state.mesh_key,
+      mesh_key: Secret.reveal(state.mesh_key),
       can_ack_pings: true,
       app_name: "derpex"
     }
 
     with {:ok, client_info} <-
            Handshake.client_info_frame(
-             state.private_key,
+             private_key,
              state.remote_server_key,
              info
            ),
@@ -247,7 +253,7 @@ defmodule Derpex.Mesh.Client do
          {:ok, _server_info} <-
            Handshake.decode_server_info(
              server_info_body,
-             state.private_key,
+             private_key,
              state.remote_server_key
            ) do
       {:ok, %{state | decoder: Decoder.new(max_frame_length: @max_server_frame_bytes)},

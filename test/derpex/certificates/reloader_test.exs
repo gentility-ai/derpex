@@ -5,6 +5,7 @@ defmodule Derpex.Certificates.ReloaderTest do
   alias Derpex.Certificates.Reloader
   alias Derpex.Crypto
   alias Derpex.ListenerSupervisor
+  alias Derpex.Secret
 
   test "atomically retains the last good certificate snapshot" do
     {active, replacement} = certificate_pair_directories()
@@ -59,7 +60,9 @@ defmodule Derpex.Certificates.ReloaderTest do
       ]
     ]
 
-    supervisor = start_supervised!({ListenerSupervisor, {[listener], server_private}})
+    supervisor =
+      start_supervised!({ListenerSupervisor, {[listener], Secret.wrap(server_private)}})
+
     children = Supervisor.which_children(supervisor)
     listener_pid = child_pid(children, ThousandIsland)
     reloader_pid = child_pid(children, Reloader)

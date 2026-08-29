@@ -7,6 +7,7 @@ defmodule Derpex.Interop.GoClientTest do
   alias Derpex.Certificates.Manual
   alias Derpex.Crypto
   alias Derpex.Listener.Handler
+  alias Derpex.Secret
   alias Derpex.ServerInfo
   alias Derpex.STUN
 
@@ -18,7 +19,7 @@ defmodule Derpex.Interop.GoClientTest do
     {expected_commit, 0} = System.cmd("git", ["-C", upstream, "rev-parse", "HEAD"])
     assert String.trim(expected_commit) == "1e69418c298b680562a2fecd7020f7f58d17d166"
 
-    {_server_public, server_private} = Crypto.generate_keypair()
+    {server_public, server_private} = Crypto.generate_keypair()
     parent = self()
 
     event_handler = fn event ->
@@ -32,7 +33,11 @@ defmodule Derpex.Interop.GoClientTest do
         transport_options: [ip: {127, 0, 0, 1}],
         num_acceptors: 1,
         handler_module: Handler,
-        handler_options: [server_private_key: server_private, event_handler: event_handler]
+        handler_options: [
+          server_private_key: Secret.wrap(server_private),
+          server_public_key: server_public,
+          event_handler: event_handler
+        ]
       )
 
     on_exit(fn ->
@@ -56,7 +61,7 @@ defmodule Derpex.Interop.GoClientTest do
 
   test "two unchanged official Go clients relay packet boundaries and peer-gone through DERPEX" do
     upstream = System.fetch_env!("DERPEX_TAILSCALE_DIR")
-    {_server_public, server_private} = Crypto.generate_keypair()
+    {server_public, server_private} = Crypto.generate_keypair()
 
     {:ok, server} =
       ThousandIsland.start_link(
@@ -64,7 +69,10 @@ defmodule Derpex.Interop.GoClientTest do
         transport_options: [ip: {127, 0, 0, 1}],
         num_acceptors: 1,
         handler_module: Handler,
-        handler_options: [server_private_key: server_private]
+        handler_options: [
+          server_private_key: Secret.wrap(server_private),
+          server_public_key: server_public
+        ]
       )
 
     on_exit(fn ->
@@ -89,7 +97,7 @@ defmodule Derpex.Interop.GoClientTest do
 
   test "unchanged official Go client obeys advertised send rate limits" do
     upstream = System.fetch_env!("DERPEX_TAILSCALE_DIR")
-    {_server_public, server_private} = Crypto.generate_keypair()
+    {server_public, server_private} = Crypto.generate_keypair()
 
     server_info = %ServerInfo{
       version: 2,
@@ -103,7 +111,11 @@ defmodule Derpex.Interop.GoClientTest do
         transport_options: [ip: {127, 0, 0, 1}],
         num_acceptors: 1,
         handler_module: Handler,
-        handler_options: [server_private_key: server_private, server_info: server_info]
+        handler_options: [
+          server_private_key: Secret.wrap(server_private),
+          server_public_key: server_public,
+          server_info: server_info
+        ]
       )
 
     on_exit(fn ->
@@ -126,7 +138,7 @@ defmodule Derpex.Interop.GoClientTest do
 
   test "official DERP prober relays its bounded 100 MB transfer" do
     upstream = System.fetch_env!("DERPEX_TAILSCALE_DIR")
-    {_server_public, server_private} = Crypto.generate_keypair()
+    {server_public, server_private} = Crypto.generate_keypair()
 
     {:ok, server} =
       ThousandIsland.start_link(
@@ -134,7 +146,10 @@ defmodule Derpex.Interop.GoClientTest do
         transport_options: [ip: {127, 0, 0, 1}],
         num_acceptors: 1,
         handler_module: Handler,
-        handler_options: [server_private_key: server_private]
+        handler_options: [
+          server_private_key: Secret.wrap(server_private),
+          server_public_key: server_public
+        ]
       )
 
     on_exit(fn ->
@@ -157,7 +172,7 @@ defmodule Derpex.Interop.GoClientTest do
 
   test "duplicate official Go clients use last-writer-active routing" do
     upstream = System.fetch_env!("DERPEX_TAILSCALE_DIR")
-    {_server_public, server_private} = Crypto.generate_keypair()
+    {server_public, server_private} = Crypto.generate_keypair()
 
     {:ok, server} =
       ThousandIsland.start_link(
@@ -165,7 +180,10 @@ defmodule Derpex.Interop.GoClientTest do
         transport_options: [ip: {127, 0, 0, 1}],
         num_acceptors: 1,
         handler_module: Handler,
-        handler_options: [server_private_key: server_private]
+        handler_options: [
+          server_private_key: Secret.wrap(server_private),
+          server_public_key: server_public
+        ]
       )
 
     on_exit(fn ->
@@ -237,7 +255,10 @@ defmodule Derpex.Interop.GoClientTest do
         transport_options: transport_options,
         num_acceptors: 1,
         handler_module: Handler,
-        handler_options: [server_private_key: server_private]
+        handler_options: [
+          server_private_key: Secret.wrap(server_private),
+          server_public_key: server_public
+        ]
       )
 
     on_exit(fn ->
@@ -291,7 +312,10 @@ defmodule Derpex.Interop.GoClientTest do
         transport_options: transport_options,
         num_acceptors: 1,
         handler_module: Handler,
-        handler_options: [server_private_key: server_private]
+        handler_options: [
+          server_private_key: Secret.wrap(server_private),
+          server_public_key: server_public
+        ]
       )
 
     on_exit(fn ->
@@ -314,7 +338,7 @@ defmodule Derpex.Interop.GoClientTest do
 
   test "official low-level client covers unknown and oversize frame edges" do
     upstream = System.fetch_env!("DERPEX_TAILSCALE_DIR")
-    {_server_public, server_private} = Crypto.generate_keypair()
+    {server_public, server_private} = Crypto.generate_keypair()
 
     {:ok, server} =
       ThousandIsland.start_link(
@@ -322,7 +346,10 @@ defmodule Derpex.Interop.GoClientTest do
         transport_options: [ip: {127, 0, 0, 1}],
         num_acceptors: 1,
         handler_module: Handler,
-        handler_options: [server_private_key: server_private]
+        handler_options: [
+          server_private_key: Secret.wrap(server_private),
+          server_public_key: server_public
+        ]
       )
 
     on_exit(fn ->
@@ -347,7 +374,7 @@ defmodule Derpex.Interop.GoClientTest do
 
   test "unchanged official WebSocket client authenticates and pings" do
     upstream = System.fetch_env!("DERPEX_TAILSCALE_DIR")
-    {_server_public, server_private} = Crypto.generate_keypair()
+    {server_public, server_private} = Crypto.generate_keypair()
 
     {:ok, server} =
       ThousandIsland.start_link(
@@ -355,7 +382,10 @@ defmodule Derpex.Interop.GoClientTest do
         transport_options: [ip: {127, 0, 0, 1}],
         num_acceptors: 1,
         handler_module: Handler,
-        handler_options: [server_private_key: server_private]
+        handler_options: [
+          server_private_key: Secret.wrap(server_private),
+          server_public_key: server_public
+        ]
       )
 
     on_exit(fn ->
@@ -419,7 +449,7 @@ defmodule Derpex.Interop.GoClientTest do
 
   test "official mesh watcher observes snapshots and live presence" do
     upstream = System.fetch_env!("DERPEX_TAILSCALE_DIR")
-    {_server_public, server_private} = Crypto.generate_keypair()
+    {server_public, server_private} = Crypto.generate_keypair()
     mesh_key_hex = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
     mesh_key = Base.decode16!(mesh_key_hex, case: :mixed)
 
@@ -429,7 +459,11 @@ defmodule Derpex.Interop.GoClientTest do
         transport_options: [ip: {127, 0, 0, 1}],
         num_acceptors: 1,
         handler_module: Handler,
-        handler_options: [server_private_key: server_private, mesh_key: mesh_key]
+        handler_options: [
+          server_private_key: Secret.wrap(server_private),
+          server_public_key: server_public,
+          mesh_key: Secret.wrap(mesh_key)
+        ]
       )
 
     on_exit(fn ->
@@ -456,7 +490,7 @@ defmodule Derpex.Interop.GoClientTest do
 
   test "official mesh client forwards asserted sources and closes duplicate peers" do
     upstream = System.fetch_env!("DERPEX_TAILSCALE_DIR")
-    {_server_public, server_private} = Crypto.generate_keypair()
+    {server_public, server_private} = Crypto.generate_keypair()
     mesh_key_hex = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
     mesh_key = Base.decode16!(mesh_key_hex, case: :mixed)
 
@@ -466,7 +500,11 @@ defmodule Derpex.Interop.GoClientTest do
         transport_options: [ip: {127, 0, 0, 1}],
         num_acceptors: 1,
         handler_module: Handler,
-        handler_options: [server_private_key: server_private, mesh_key: mesh_key]
+        handler_options: [
+          server_private_key: Secret.wrap(server_private),
+          server_public_key: server_public,
+          mesh_key: Secret.wrap(mesh_key)
+        ]
       )
 
     on_exit(fn ->
@@ -493,7 +531,7 @@ defmodule Derpex.Interop.GoClientTest do
 
   test "official clients observe app-name admission and mesh bypass" do
     upstream = System.fetch_env!("DERPEX_TAILSCALE_DIR")
-    {_server_public, server_private} = Crypto.generate_keypair()
+    {server_public, server_private} = Crypto.generate_keypair()
     mesh_key_hex = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
     mesh_key = Base.decode16!(mesh_key_hex, case: :mixed)
 
@@ -504,8 +542,9 @@ defmodule Derpex.Interop.GoClientTest do
         num_acceptors: 1,
         handler_module: Handler,
         handler_options: [
-          server_private_key: server_private,
-          mesh_key: mesh_key,
+          server_private_key: Secret.wrap(server_private),
+          server_public_key: server_public,
+          mesh_key: Secret.wrap(mesh_key),
           disallowed_app_names: ["badapp", "worseapp"]
         ]
       )

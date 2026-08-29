@@ -8,7 +8,6 @@ defmodule Derpex.Listener.Handler do
   alias Derpex.Admission.Request, as: AdmissionRequest
   alias Derpex.ClientVerifier
   alias Derpex.Clock
-  alias Derpex.Crypto
   alias Derpex.Debug.Traffic
   alias Derpex.Disco
   alias Derpex.Drain
@@ -29,7 +28,8 @@ defmodule Derpex.Listener.Handler do
 
   @impl ThousandIsland.Handler
   def handle_connection(socket, options) do
-    server_private_key = Keyword.fetch!(options, :server_private_key)
+    private_key = Keyword.fetch!(options, :server_private_key)
+    server_public_key = Keyword.fetch!(options, :server_public_key)
     mesh_key = Keyword.get(options, :mesh_key)
     server_info = Keyword.get(options, :server_info)
     admission_policy = Keyword.get(options, :admission)
@@ -61,7 +61,6 @@ defmodule Derpex.Listener.Handler do
       |> SendQueueConfig.validate!()
 
     with :ok <- AcceptLimiter.claim(accept_limiter, elem(remote_address, 0)),
-         {:ok, server_public_key} <- Crypto.public_key(server_private_key),
          {:ok, writer} <-
            Writer.start_link(
              owner: self(),
@@ -96,7 +95,7 @@ defmodule Derpex.Listener.Handler do
            }),
          {:ok, session, actions} <-
            Session.new(
-             server_private_key,
+             private_key,
              [mesh_key: mesh_key, server_info: server_info]
              |> Keyword.merge(
                bootstrap_dns: bootstrap_dns,
