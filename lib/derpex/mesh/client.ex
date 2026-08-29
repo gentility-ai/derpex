@@ -5,6 +5,16 @@ defmodule Derpex.Mesh.Client do
   The client watches one peer server, registers its advertised clients as
   regional routes, and forwards packets through a fixed-capacity ring. A
   broken connection withdraws every learned route before reconnecting.
+
+  Every outbound socket carries a five second send deadline, matching the
+  timer Go arms around `derp.Client.ForwardPacket`. Go closes the underlying
+  `net.Conn` when that timer fires; DERPEX asks the inet driver for the same
+  thing with `send_timeout` plus `send_timeout_close`, on the TCP socket and
+  on the transport under TLS alike, so a stalled peer surfaces as
+  `{:error, :timeout}` and disconnects instead of wedging the client process.
+  A timer owned by this process cannot do the job: it cannot interrupt a
+  `:ssl.send/2` that is already blocked, and `:ssl.close/2` called from a
+  helper deadlocks against that same blocked sender.
   """
 
   use GenServer
@@ -27,6 +37,7 @@ defmodule Derpex.Mesh.Client do
   @default_reconnect_interval 5_000
   @default_connect_timeout 10_000
   @default_queue_capacity 32
+  @default_send_timeout 5_000
   @max_http_head_bytes 1 * 1_024 * 1_024
   @max_server_frame_bytes Frame.max_info_length() + Frame.nonce_length()
 
@@ -80,6 +91,7 @@ defmodule Derpex.Mesh.Client do
           non_negative_option!(options, :reconnect_interval, @default_reconnect_interval),
         connect_timeout: positive_option!(options, :connect_timeout, @default_connect_timeout),
         queue_capacity: positive_option!(options, :queue_capacity, @default_queue_capacity),
+        send_timeout: positive_option!(options, :send_timeout, @default_send_timeout),
         tls_options: Keyword.get(options, :tls_options, []),
         socket: nil,
         decoder: Decoder.new(max_frame_length: @max_server_frame_bytes),
@@ -210,7 +222,7 @@ defmodule Derpex.Mesh.Client do
   end
 
   defp perform_handshake(state) do
-    with :ok <- socket_send(state.socket, upgrade_request(state.endpoint)),
+    with :ok <- socket_send(state, upgrade_request(state.endpoint)),
          {:ok, read_ahead} <- receive_http_upgrade(state.socket, state.connect_timeout),
          {:ok, type, server_key_body, read_ahead} <-
            receive_frame(state.socket, read_ahead, state.connect_timeout),
@@ -246,7 +258,7 @@ defmodule Derpex.Mesh.Client do
              info
            ),
          {:ok, watch} <- Body.encode_client(:watch_connections),
-         :ok <- socket_send(state.socket, [client_info, watch]),
+         :ok <- socket_send(state, [client_info, watch]),
          {:ok, type, server_info_body, read_ahead} <-
            receive_frame(state.socket, read_ahead, state.connect_timeout),
          true <- type == Frame.type(:server_info),
@@ -312,7 +324,7 @@ defmodule Derpex.Mesh.Client do
 
       {:ok, {:ping, payload}} ->
         with {:ok, pong} <- Body.encode_client({:pong, payload}),
-             :ok <- socket_send(state.socket, pong) do
+             :ok <- socket_send(state, pong) do
           {:ok, state}
         end
 
@@ -331,7 +343,7 @@ defmodule Derpex.Mesh.Client do
     case Ring.take(state.ring) do
       {:ok, {:forward_packet, source, destination, packet}} ->
         with {:ok, frame} <- Body.encode_client({:forward_packet, source, destination, packet}),
-             :ok <- socket_send(state.socket, frame) do
+             :ok <- socket_send(state, frame) do
           drain_forwarded_packets(state)
         end
 
@@ -424,7 +436,7 @@ defmodule Derpex.Mesh.Client do
   defp open_socket(%{proxy: nil} = state) do
     endpoint = state.endpoint
     host = String.to_charlist(endpoint.dial_host)
-    tcp_options = [:binary, packet: :raw, active: false, nodelay: true]
+    tcp_options = tcp_options(state)
 
     case endpoint.scheme do
       "http" ->
@@ -443,7 +455,7 @@ defmodule Derpex.Mesh.Client do
 
   defp open_socket(state) do
     proxy = state.proxy
-    tcp_options = [:binary, packet: :raw, active: false, nodelay: true]
+    tcp_options = tcp_options(state)
 
     case :gen_tcp.connect(
            String.to_charlist(proxy.host),
@@ -476,6 +488,17 @@ defmodule Derpex.Mesh.Client do
         :gen_tcp.close(socket)
         error
     end
+  end
+
+  defp tcp_options(state) do
+    [
+      :binary,
+      packet: :raw,
+      active: false,
+      nodelay: true,
+      send_timeout: state.send_timeout,
+      send_timeout_close: true
+    ]
   end
 
   defp wrap_proxy_tls(state, socket) do
@@ -547,6 +570,8 @@ defmodule Derpex.Mesh.Client do
     |> Keyword.put(:packet, :raw)
     |> Keyword.put(:active, false)
     |> Keyword.put(:nodelay, true)
+    |> Keyword.put(:send_timeout, state.send_timeout)
+    |> Keyword.put(:send_timeout_close, true)
   end
 
   defp receive_http_upgrade(socket, timeout),
@@ -666,8 +691,8 @@ defmodule Derpex.Mesh.Client do
     if String.contains?(host, ":"), do: "[#{host}]:#{port}", else: "#{host}:#{port}"
   end
 
-  defp socket_send({:tcp, socket}, data), do: :gen_tcp.send(socket, data)
-  defp socket_send({:ssl, socket}, data), do: :ssl.send(socket, data)
+  defp socket_send(%{socket: {:tcp, socket}}, data), do: :gen_tcp.send(socket, data)
+  defp socket_send(%{socket: {:ssl, socket}}, data), do: :ssl.send(socket, data)
 
   defp socket_recv({:tcp, socket}, timeout), do: :gen_tcp.recv(socket, 0, timeout)
   defp socket_recv({:ssl, socket}, timeout), do: :ssl.recv(socket, 0, timeout)
