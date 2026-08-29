@@ -1096,6 +1096,40 @@ defmodule Derpex.Admission.GentilityTest do
     assert Gentility.reserve_bytes(revised_context, 100, policy) == {:ok, 500_000}
   end
 
+  test "an organization's byte debt paces a quiet sibling instead of closing it" do
+    noisy = node_key(50)
+    quiet = node_key(51)
+
+    controller =
+      start_controller(
+        authority: fn request ->
+          {:ok,
+           signed_lease(request.node_key,
+             node_bytes_per_second: 1_000,
+             node_byte_burst: 1_000,
+             organization_bytes_per_second: 1_000,
+             organization_byte_burst: 1_000
+           )}
+        end,
+        max_byte_delay_ms: 100
+      )
+
+    policy = Gentility.policy(controller)
+    {:ok, noisy_context} = Gentility.authorize(request(noisy), policy)
+    {:ok, quiet_context} = Gentility.authorize(request(quiet), policy)
+
+    # The noisy node spends the whole organization burst.
+    assert Gentility.reserve_bytes(noisy_context, 1_000, policy) == {:ok, 0}
+
+    # Its quiet sibling is paced to the cap, never closed: its own node budget
+    # is untouched, and only per-node debt may close a connection.
+    assert Gentility.reserve_bytes(quiet_context, 500, policy) == {:ok, 100_000}
+
+    # The noisy node's own debt is what closes it.
+    assert Gentility.reserve_bytes(noisy_context, 200, policy) ==
+             {:error, :byte_budget_exhausted}
+  end
+
   test "closes instead of accumulating an unbounded byte-budget delay" do
     node_key = node_key(19)
 

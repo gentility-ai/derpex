@@ -176,11 +176,18 @@ defmodule Derpex.Admission.Gentility do
              bytes,
              now
            ) do
-      delay = max(node_delay, organization_delay)
+      maximum_delay = policy.max_byte_delay_ms * 1_000
 
-      if delay <= policy.max_byte_delay_ms * 1_000,
-        do: {:ok, delay},
-        else: {:error, :byte_budget_exhausted}
+      # Only a node's own debt may close its connection. An organization's debt
+      # paces every sibling instead: one noisy node must not disconnect the
+      # quiet ones it shares an organization with. Pacing is capped so a paced
+      # connection stays responsive; the untaken debt keeps pacing the next
+      # reservation.
+      if node_delay <= maximum_delay do
+        {:ok, min(max(node_delay, organization_delay), maximum_delay)}
+      else
+        {:error, :byte_budget_exhausted}
+      end
     end
   end
 
@@ -855,8 +862,8 @@ defmodule Derpex.Admission.Gentility do
 
   defp default_expiry_jitter(lifetime) do
     case div(lifetime * @expiry_jitter_percent, 100) do
-      0 -> 0
-      window -> :rand.uniform(window + 1) - 1
+      window when window <= 1 -> 0
+      window -> :rand.uniform(window) - 1
     end
   end
 

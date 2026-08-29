@@ -48,7 +48,7 @@ than silently reverting to its default.
 | `DERPEX_GENTILITY_AUTHORITY_TIMEOUT_MS` | `2000` | Deadline for one live authorization call. |
 | `DERPEX_GENTILITY_MAX_LEASE_MS` | `900000` | Longest lease lifetime accepted, and so the worst-case missed-revocation window. |
 | `DERPEX_GENTILITY_MAX_FUTURE_SKEW_MS` | `30000` | Clock skew allowed on a lease issue time. It never extends expiry. |
-| `DERPEX_GENTILITY_MAX_BYTE_DELAY_MS` | `30000` | Pacing delay above which a connection is closed instead of paced. |
+| `DERPEX_GENTILITY_MAX_BYTE_DELAY_MS` | `30000` | Per-node pacing delay above which a connection is closed instead of paced; also the cap on any single pacing wait. |
 | `DERPEX_GENTILITY_CACHE_PERSIST_MS` | `5000` | Longest a newly cached lease may go unwritten to disk. |
 
 Size `DERPEX_GENTILITY_MAX_CACHE_ENTRIES` above the number of distinct nodes an
@@ -79,6 +79,17 @@ Leases are closed a little before they expire — a jitter of up to 10% of the
 lease lifetime, taken out of the lease's own life, never added to it. DERPEX
 therefore never serves an expired lease, and a region's leases do not all fall
 due in the same millisecond and stampede Gentility on reconnection.
+
+### Byte budgets
+
+Node and organization budgets are both token buckets, but they are enforced
+differently. A node that runs up its own debt past
+`DERPEX_GENTILITY_MAX_BYTE_DELAY_MS` is disconnected: it is the only party
+responsible for that debt. An organization's debt only ever paces — one noisy
+node must never disconnect the quiet ones that happen to share its
+organization. Sibling connections are slowed, up to the same cap so a paced
+connection stays responsive, and debt beyond the cap keeps pacing the
+reservations that follow rather than accumulating into a stall.
 
 ### Cache durability
 
