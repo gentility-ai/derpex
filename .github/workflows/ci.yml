@@ -64,8 +64,16 @@ jobs:
       - name: Run Rust tests
         run: cargo test --locked --manifest-path native/derpex_crypto/Cargo.toml --all-targets
 
+      # The thresholds are smoke ceilings for a shared runner, not performance
+      # targets: they fail on an order-of-magnitude regression in packet-path
+      # allocation or latency, and on any queue replacement in a healthy flow.
+      # This is the gate the TestLookupDestHashTrieNoAlloc inventory row cites.
       - name: Smoke relay benchmark harness
-        run: mix bench -- --packets 50 --sizes 64,1200 --slow-packets 200 --slow-delay-ms 50
+        run: >-
+          mix bench -- --packets 50 --sizes 64,1200 --slow-packets 200 --slow-delay-ms 50
+          --fail-on queue_replacements=0
+          --fail-on memory_delta_bytes=33554432
+          --fail-on latency_p99_us=200000
 
   go-interop:
     name: Official Go client interoperability
@@ -110,6 +118,14 @@ jobs:
         run: |
           diff="$(gofmt -d interop/go)"
           test -z "$diff" || { printf '%s\n' "$diff"; exit 1; }
+
+      # The generator refuses to write a row that cites a file this repository
+      # does not have, so regenerating proves both that COVERAGE.md is current
+      # for the pinned commit and that every disposition still has evidence.
+      - name: Regenerate the upstream compatibility inventory
+        run: |
+          elixir scripts/upstream_inventory.exs "$DERPEX_TAILSCALE_DIR" --output interop/COVERAGE.md
+          git diff --exit-code -- interop/COVERAGE.md
 
       - name: Run pinned upstream oracle packages
         working-directory: upstream/tailscale
