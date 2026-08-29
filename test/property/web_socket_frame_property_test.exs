@@ -68,7 +68,15 @@ defmodule Derpex.WebSocket.FramePropertyTest do
   end
 
   property "decodes both canonical extended client-frame lengths" do
-    check all length <- one_of([integer(126..1_000), integer(65_536..66_000)]),
+    # The two-byte marker covers 126 through 65,535 and the eight-byte marker
+    # takes over at 65,536. Sampling only the bottom thousand of the first band
+    # left the marker's own boundary — and everything approaching it — ungenerated.
+    check all length <-
+                one_of([
+                  integer(126..1_000),
+                  integer(1_001..65_535),
+                  integer(65_536..66_000)
+                ]),
               mask <- binary(length: 4),
               seed <- binary(length: 8),
               sizes <- list_of(integer(0..4_096), max_length: 24) do

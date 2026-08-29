@@ -1,6 +1,7 @@
 # DERPEX implementation plan
 
-Status: approved integrated direction, implementation started 2026-08-28
+Status: implementation complete for the pinned baseline pending review
+sign-off, 2026-08-29
 
 DERPEX is an Elixir implementation of Tailscale's DERP server. The target is
 observable compatibility with the pinned Go implementation, including the
@@ -104,11 +105,14 @@ Two consequences are worth stating rather than discovering:
   `Derpex.Listener.Transports.SSL` reads it per connection. A renewed
   certificate therefore reaches hellos with and without SNI alike.
 
-One inventory row stays open. `TestIPCertManagerNextProvider` covers upstream's
-delegation of a DNS hello from the IP certificate manager to a separate
-autocert manager. DERPEX has no second provider to delegate to — one manager
-orders both IP and hostname certificates — so the `:next_provider` seam has no
-production caller and the row is recorded as `pending` rather than claimed.
+One inventory row is a structural seam rather than a behavior.
+`TestIPCertManagerNextProvider` covers upstream's delegation of a DNS hello
+from the IP certificate manager to a separate autocert manager. DERPEX has no
+second provider to delegate to — one manager orders both IP and hostname
+certificates — so `:next_provider` is a seam with no production caller. The row
+is `implementation-specific` on that argument, citing the delegation test in
+`test/derpex/certificates/ip_manager_test.exs`; it is not a claim that DERPEX
+ships the two-provider arrangement upstream tests.
 
 The plaintext listener `DERPEX_HTTP_PORT` opens is restricted to what Go's
 `tsweb.Port80Handler` serves: the challenge path and the unauthenticated
@@ -161,6 +165,39 @@ so they are not implemented by accident:
   `derp_ring_producer_naps`, exceeding it is a counted tail drop, and callers
   that must not sleep for one destination — the router and the drain
   coordinator — enqueue with `wait: false`. See ADR 0001.
+- Pinned `cmd/derper` sets `MinVersion: tls.VersionTLS12` on its TLS listener
+  (`derper.go:364`). DERPEX serves and dials TLS 1.3 only
+  (`config/runtime.exs`, `lib/derpex/mesh/client.ex`), which is a deliberate
+  hardening rather than parity: a conforming TLS-1.2-only client is refused
+  rather than served. `DERPEX_TLS_MIN_VERSION` accepts `1.2` or `1.3` and
+  defaults to `1.3`, so an operator who needs upstream's floor can restore it;
+  the setting applies to the listener and to the mesh client's outbound dial
+  alike, so a mesh connection cannot be weaker than the listener that
+  configured it.
+- Go's `tsweb.AllowDebugAccess` grants the debug endpoints to any address in
+  the Tailscale CGNAT range `100.64.0.0/10`, on the reasoning that reaching a
+  relay from a Tailscale address already means membership. DERPEX denies that
+  range by default and admits it only under
+  `DERPEX_DEBUG_ALLOW_TAILSCALE_CGNAT=1`, because a relay on a public `:443`
+  may sit behind carrier-grade NAT and see genuine CGNAT source addresses that
+  are not tailnet members. Loopback and the `fd7a:115c:a1e0::/48` ULA range
+  are trusted as Go trusts them.
+- Go's `handleBootstrapDNS` retains the raw `q` parameter of each query and
+  bounds only the entry count, clearing the map past 500 names, so 500
+  attacker-chosen names can retain megabytes. DERPEX keeps the same entry bound
+  and additionally truncates each retained name at 256 bytes, which bounds the
+  set at 500 × 256 bytes. A DNS name cannot exceed 253 bytes, so no real query
+  is truncated, and lookups still use the untruncated query.
+- Go accepts connections as fast as the listener yields them and rate-limits
+  nothing before the DERP handshake. DERPEX admits through
+  `Derpex.AcceptLimiter`: a global accept bucket, a per-source token bucket and
+  connection cap, and a fixed-size tracking set. The tracking set is a memory
+  bound rather than an admission bound — when every tracked source holds a live
+  connection there is nothing to evict, so a new source is admitted *untracked*
+  and pooled into one shared overflow bucket and connection cap rather than
+  refused. Untracked admissions are counted, so the loss of per-source
+  resolution is visible without the bound becoming either an outage or an
+  unmetered hole.
 
 ### 2.4 Compatibility precedence
 
@@ -477,7 +514,7 @@ the full official Rust client.
 
 ### 5.1 Upstream inventory
 
-The baseline contains 69 named relevant Go tests:
+The baseline contains 74 named relevant Go tests:
 
 | Area | Named tests |
 | --- | ---: |
@@ -486,6 +523,7 @@ The baseline contains 69 named relevant Go tests:
 | DERP HTTP | 11 |
 | `cmd/derper` | 14 |
 | DERP prober | 3 |
+| STUN | 5 |
 | XDP | 2 |
 
 `interop/COVERAGE.md` inventories every test by package, name, upstream line,
@@ -500,6 +538,10 @@ and one of these dispositions:
 - `pending`: temporarily incomplete and therefore release-blocking.
 
 No test may silently disappear, and a release may contain no `pending` rows.
+As of 2026-08-29 there are none: every row carries one of the other four
+dispositions, `test/derpex/upstream_coverage_test.exs` fails if one turns
+`pending` again or if the row count moves, and CI regenerates the file and
+fails on a diff.
 
 ### 5.2 Test layers
 
@@ -544,7 +586,6 @@ mix test                 # unit and property tests
 mix test.interop         # official Go and Rust clients against DERPEX
 mix test.diff            # Go-vs-DERPEX behavioral oracle
 mix test.system          # TLS, WebSocket, STUN, signals, external services
-mix test.gentility       # authorization, revocation, quotas, accounting
 mix test.all             # all release-blocking correctness gates
 mix bench                # non-blocking benchmark suite
 mix quality              # format, compile warnings, static analysis; no tests
@@ -559,12 +600,28 @@ carry `@moduletag :system`, which `test/test_helper.exs` excludes by default,
 so they run under `mix test.system` rather than a plain `mix test`. `mix
 test.all` opts every tagged gate back in (`--include system --include
 go_interop --include rust_interop`) and needs `DERPEX_TAILSCALE_DIR` and
-`DERPEX_TAILSCALE_RS_DIR` pointing at the pinned checkouts. `mix release.check` runs `artifact.check` under `MIX_ENV=prod` in a
-child Mix invocation, because the surrounding gate runs in `MIX_ENV=test`.
+`DERPEX_TAILSCALE_RS_DIR` pointing at the pinned checkouts. There is no
+separate Gentility alias: the admission, revocation, quota and accounting
+suites live under `test/derpex/admission` and run in a plain `mix test`.
 
-Fast pull-request CI runs unit tests and a compact Go interop slice. Full
-differential, system, race-heavy, fuzz, and soak jobs run on main/nightly and
-before release. No nightly-only failure may be waived for a release.
+`mix release.check` is the local form of the release gate, so it runs what CI
+runs: `quality`, `test.all`, the Rust crate's own `cargo test --locked`, the
+relay benchmark under the same three `--fail-on` thresholds CI uses, and
+`artifact.check` under `MIX_ENV=prod` in a child Mix invocation, because the
+surrounding gate runs in `MIX_ENV=test`. A threshold that only exists in the
+workflow is one a developer first meets on a pull request.
+
+Pull-request CI is not a subset. Every job — quality, unit and property tests,
+system tests, Rust tests, the benchmark smoke with its thresholds, Go interop
+including the differential oracle and the tsnet stack, and Rust interop — runs
+on every pull request and every non-tag push, because the whole suite fits in
+CI minutes and a gate that runs later is a gate that blocks later. Two
+schedules sit outside it: `.github/workflows/benchmark.yml` runs the long relay
+and slow-client soak weekly, and `.github/workflows/nightly.yml` runs each
+night what is too slow for a pull request — the property suite at
+`PROPERTY_RUNS=5000`, the benchmark at pull-request thresholds but a longer
+run, and `mix test.system`. No nightly or weekly failure may be waived for a
+release.
 
 The release workflow cannot publish around those gates. `release.yml` calls
 `ci.yml` as a reusable workflow in a job named `gate`, and every job that
@@ -751,7 +808,7 @@ Deliverables:
 - Add source-build, no-Rust consumer, and tag-triggered precompiled-NIF workflow
   skeletons using the target matrix in Section 3.7.
 - Commit `interop/upstream.lock` and checkout/bootstrap tooling.
-- Generate the 69-test inventory and initial compatibility dispositions.
+- Generate the 74-test inventory and initial compatibility dispositions.
 - Add a Go oracle/helper module without modifying the upstream checkout, and
   inventory the hooks exported by `derp/derpserver/fortest.go`.
 - Implement `Derpex.Clock` with a real and a controllable test implementation.
@@ -1131,7 +1188,7 @@ Exit gate:
 - The release candidate installs and starts on every supported target without
   `go`, `cargo`, or `rustc`, using only the published checksum-verified NIF
   archive.
-- Every one of the 69 baseline tests is accounted for with no pending row.
+- Every one of the 74 baseline tests is accounted for with no pending row.
 - No known observable difference exists without a documented, user-approved
   compatibility exception.
 - Long-running tests show bounded mailboxes, queues, timers, and binary memory.
@@ -1223,7 +1280,7 @@ DERPEX is complete for the pinned baseline when:
 
 - all release-blocking Mix, Go interop, differential, Rust interop, and system
   gates pass;
-- all 69 relevant baseline Go tests have a reviewed disposition and none are
+- all 74 relevant baseline Go tests have a reviewed disposition and none are
   pending;
 - unchanged official Go clients can use native HTTP, TLS fast-start, and mesh
   paths;
@@ -1258,9 +1315,16 @@ These decisions are intentionally deferred until evidence is available:
 - capacity targets beyond the initial reference instances and launch SLOs;
 - additional deployment packaging beyond the multi-architecture OCI image and
   OTP release;
-- ACME provider dependency selection (Milestone 9);
 - whether metrics must be byte-for-byte Prometheus compatible or only preserve
-  all documented names, values, and labels.
+  all documented names, values, and labels;
+- the project-wide license for original DERPEX code. `interop/PROVENANCE.md`
+  records the upstream licenses DERPEX derives from and states that it selects
+  none for this repository. That is still a product-owner decision, and the
+  repository carries no `LICENSE` file until it is made.
+
+ACME provider dependency selection is no longer deferred: no published Hex
+library carried IP identifiers or the RFC 8555 profiles extension, so
+`Derpex.ACME` is written against OTP alone. ADR 0004 records the survey.
 
 The defaults are macOS/Linux development, Linux production, OTP release plus a
 container artifact, semantically identical Prometheus exposition, and no

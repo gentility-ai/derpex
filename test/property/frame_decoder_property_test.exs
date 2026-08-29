@@ -84,8 +84,15 @@ defmodule Derpex.Frame.DecoderPropertyTest do
   end
 
   property "rejects a header declaring more than the cap before reading a payload" do
+    # Drawing uniformly from a four-billion-wide range almost never lands on
+    # the first byte past the cap, which is the only value an off-by-one gets
+    # wrong, so half the draws come from the sixty-four lengths above it.
     check all type <- integer(0..255),
-              declared <- integer((@max_frame_length + 1)..0xFFFFFFFF),
+              declared <-
+                one_of([
+                  integer((@max_frame_length + 1)..(@max_frame_length + 64)),
+                  integer((@max_frame_length + 1)..0xFFFFFFFF)
+                ]),
               trailer <- binary(max_length: 8) do
       header = <<type, declared::unsigned-big-32>>
 

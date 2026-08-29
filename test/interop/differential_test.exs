@@ -8,17 +8,13 @@ defmodule Derpex.Interop.DifferentialTest do
   alias Derpex.Crypto
   alias Derpex.Listener.Handler
   alias Derpex.Secret
+  alias Derpex.Test.UpstreamPin
 
   @mesh_key_hex "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
   @operations_token "differential-trace-operations-token"
 
   test "pinned Go server and DERPEX produce the same normalized semantic trace" do
-    upstream =
-      System.get_env("DERPEX_TAILSCALE_DIR") ||
-        raise "DERPEX_TAILSCALE_DIR must name the pinned Tailscale checkout"
-
-    {actual_commit, 0} = System.cmd("git", ["rev-parse", "HEAD"], cd: upstream)
-    assert String.trim(actual_commit) == "1e69418c298b680562a2fecd7020f7f58d17d166"
+    upstream = UpstreamPin.checkout!()
 
     {server_public, server_private} = Crypto.generate_keypair()
 
@@ -117,6 +113,39 @@ defmodule Derpex.Interop.DifferentialTest do
              "unknown_destination_plain",
              "derp_peer_gone_not_here_frames"
            ) == 0
+
+    # Five probes, one allowance of three: every probe is dropped as an unknown
+    # destination, but only the first three are answered with a not-here frame.
+    assert counter(
+             oracle,
+             "relay_and_drops",
+             "rate_limited_not_here",
+             dropped("disco", "unknown_dest")
+           ) == 5
+
+    assert counter(
+             oracle,
+             "relay_and_drops",
+             "rate_limited_not_here",
+             "derp_peer_gone_not_here_frames"
+           ) == 3
+
+    assert Enum.map(events(oracle, "relay_and_drops", "rate_limited_not_here"), & &1["kind"]) ==
+             ["peer_gone", "peer_gone", "peer_gone"]
+
+    # TestSendRecv's wantActive walk: 0 -> 1 -> 1 -> 0 -> 0 -> 1, then the home
+    # client disconnects and takes the gauge back down with it.
+    assert Enum.map(
+             [
+               "home_preferred_on",
+               "home_preferred_repeat_on",
+               "home_preferred_off",
+               "home_preferred_repeat_off",
+               "home_second_preferred_on",
+               "close_second"
+             ],
+             &counter(oracle, "relay_and_drops", &1, "derp_current_home_connections")
+           ) == [1, 0, -1, 0, 1, -1]
 
     # Both queues overrun. These cells are sign-compared, so 1 means "drops
     # happened" rather than "one packet was dropped".

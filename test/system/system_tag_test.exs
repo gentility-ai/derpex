@@ -3,9 +3,12 @@ defmodule Derpex.System.SystemTagTest do
 
   @moduletag :system
 
-  # Placeholder inhabitant of the system suite until the SIGHUP test lands. It
-  # keeps `mix test.system` exercising a real ExUnit run and proves the suite
-  # never rides along with a plain `mix test`.
+  # The signal and send-freeze tests landed alongside this one, so it is no
+  # longer holding the suite open. What it still does is check the mechanism
+  # the other two rely on: that :system is both included and excluded here, so
+  # these files run under `mix test.system` and never ride along with a plain
+  # `mix test`. A tag that stopped working would otherwise show up as a suite
+  # that silently got faster.
   test "the system suite only runs when its tag is included" do
     configuration = ExUnit.configuration()
 

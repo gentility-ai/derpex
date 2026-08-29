@@ -701,7 +701,10 @@ defmodule Derpex.Admission.GentilityTest do
     assert log =~ "could not close a peer"
 
     # Every peer in the batch was attempted, and the controller kept answering.
-    for key <- keys, do: assert_received({:closing, ^key})
+    # The batch runs outside the controller call, so waiting on the failure
+    # counter says nothing about the two closes that succeed; they have to be
+    # waited for rather than assumed already delivered.
+    for key <- keys, do: assert_receive({:closing, ^key}, 2_000)
     assert Process.alive?(controller)
     assert Gentility.stats(controller).cache_entries == 0
 
@@ -1220,11 +1223,25 @@ defmodule Derpex.Admission.GentilityTest do
     claim_p99 = percentile(Enum.map(claims, &elem(&1, 0)), 99)
     release_p99 = percentile(releases, 99)
 
-    assert claim_p99 < 100,
-           "claim p99 was #{claim_p99} us over #{samples} samples with #{entries} cached leases"
+    # A fixed 100 us was a statement about the hardware; this test is about the
+    # shape of the cost. What it has to exclude is a claim that walks the cache,
+    # so the ceiling is half of what one pass over the cache costs on this
+    # machine right now, measured as `entries` keyed ETS lookups. An
+    # implementation that scanned even half the leases fails it, while a
+    # constant-cost one -- measured here at well under a tenth of the ceiling --
+    # has room for the scheduler noise the fixed bound kept tripping over. The
+    # ceiling rises with the cache under DERPEX_SLOW_TESTS, and so does the cost
+    # of the scan it excludes.
+    lookup_cost = ets_lookup_microseconds(entries)
+    scan_cost = entries * lookup_cost
+    ceiling = round(scan_cost / 2)
 
-    assert release_p99 < 100,
-           "release p99 was #{release_p99} us over #{samples} samples with #{entries} cached leases"
+    for {label, p99} <- [{"claim", claim_p99}, {"release", release_p99}] do
+      assert p99 < ceiling,
+             "#{label} p99 was #{p99} us over #{samples} samples with #{entries} cached " <>
+               "leases; the ceiling is #{ceiling} us, half the #{round(scan_cost)} us one " <>
+               "pass over the cache costs at #{lookup_cost} us per ETS lookup"
+    end
 
     Enum.each(connections, &Process.exit(&1, :kill))
   end
@@ -1926,6 +1943,26 @@ defmodule Derpex.Admission.GentilityTest do
     after
       50 -> keys
     end
+  end
+
+  # One keyed lookup against a table the size of the lease cache, timed in
+  # batches so the microsecond clock has something to measure, reported as the
+  # median of twenty-one rounds so one preempted round cannot set the unit.
+  defp ets_lookup_microseconds(entries) do
+    table = :ets.new(:lease_cache_baseline, [:set, :public, read_concurrency: true])
+    Enum.each(1..entries, &:ets.insert(table, {<<&1::256>>, &1}))
+    batch = 1_000
+
+    rounds =
+      for _round <- 1..21 do
+        {microseconds, :ok} =
+          :timer.tc(fn -> Enum.each(1..batch, &:ets.lookup(table, <<&1::256>>)) end)
+
+        microseconds / batch
+      end
+
+    :ets.delete(table)
+    rounds |> Enum.sort() |> Enum.at(10)
   end
 
   defp percentile(samples, percentile) do

@@ -22,12 +22,12 @@ a repository path that exists, and every `ported`, `black-box`, and
 
 | State | Count |
 | --- | ---: |
-| Total | 69 |
-| Ported | 52 |
-| Black-box | 9 |
+| Total | 74 |
+| Ported | 54 |
+| Black-box | 11 |
 | Differential | 2 |
-| Pending (release-blocking) | 2 |
-| Implementation-specific | 4 |
+| Pending (release-blocking) | 0 |
+| Implementation-specific | 7 |
 
 | Area | Upstream test | Source | Disposition | Gate/notes |
 | --- | --- | --- | --- | --- |
@@ -53,8 +53,8 @@ a repository path that exists, and every `ported`, `black-box`, and
 | DERP server | `TestMultiForwarder` | `derp/derpserver/derpserver_test.go:349` | `ported` | adapted in test/derpex/router_test.exs with 5,000 routes concurrent with repeated forwarder changes |
 | DERP server | `TestMetaCert` | `derp/derpserver/derpserver_test.go:405` | `ported` | ported certificate shape in test/derpex/meta_certificate_test.exs plus the official TLS fast-start gate in test/interop/go_client_test.exs |
 | DERP server | `TestModifyTLSConfigToAddMetaCert` | `derp/derpserver/derpserver_test.go:441` | `ported` | adapted in test/derpex/certificates_test.exs; concurrent augmentation returns fresh chains without provider mutation |
-| DERP server | `TestServerDupClients` | `derp/derpserver/derpserver_test.go:498` | `differential` | duplicate routing is compared step for step against the pinned Go server in test/interop/differential_test.exs; the connection lifecycle cases are in test/derpex/router_test.exs |
-| DERP server | `TestLimiter` | `derp/derpserver/derpserver_test.go:747` | `ported` | ported shared burst, refill, zero-rate, disable, and pre-allocation rejection cases in test/derpex/rate_limiter_test.exs and test/derpex/receive_limiter_test.exs |
+| DERP server | `TestServerDupClients` | `derp/derpserver/derpserver_test.go:498` | `differential` | the lastWriterIsActive half is compared step for step against the pinned Go server in test/interop/differential_test.exs and the connection lifecycle cases are in test/derpex/router_test.exs; the disableFighters half is not reproduced, because that policy is set only by upstream's own test and Server.dupPolicy leaves it off everywhere else, so DERPEX implements the shipped policy only |
+| DERP server | `TestLimiter` | `derp/derpserver/derpserver_test.go:747` | `ported` | upstream logs 200 reservations against a shared bucket and asserts nothing; DERPEX pins the behavior it explores — burst, refill, and reservation delay in test/derpex/rate_limiter_test.exs and test/derpex/receive_limiter_test.exs, and the zero-rate disable and burst clamp in test/derpex/rate_config_test.exs |
 | DERP server | `TestParseSSOutput` | `derp/derpserver/derpserver_test.go:884` | `ported` | ported in test/derpex/debug/ss_test.exs with IPv4, IPv6, counters, service names, and malformed rows |
 | DERP server | `TestServeDebugTrafficUniqueSenders` | `derp/derpserver/derpserver_test.go:895` | `ported` | ported active-route debug lookup and unique-sender reporting in test/derpex/debug/traffic_test.exs |
 | DERP server | `TestGetPerClientSendQueueDepth` | `derp/derpserver/derpserver_test.go:924` | `ported` | ported in test/derpex/send_queue_config_test.exs; empty/default and explicit depths preserved |
@@ -92,11 +92,16 @@ a repository path that exists, and every `ported`, `black-box`, and
 | cmd/derper | `TestNoContent` | `cmd/derper/derper_test.go:42` | `ported` | ported all challenge validity cases in test/derpex/http1_test.exs |
 | cmd/derper | `TestDeps` | `cmd/derper/derper_test.go:101` | `implementation-specific` | Go dependency graph; the release's runtime application closure is held to an allowlist by scripts/dependency_closure.exs, which mix quality runs |
 | cmd/derper | `TestTemplate` | `cmd/derper/derper_test.go:116` | `ported` | ported conditional abuse, policy, disabled-status, and debug homepage sections in test/derpex/home_page_test.exs |
-| cmd/derper | `TestIPCertManager` | `cmd/derper/ipcert_test.go:328` | `ported` | ported IPv4/IPv6 issuance with the shortlived profile, SNI checks, HTTP-01 routing and disk-cache reuse in test/derpex/certificates/ip_manager_test.exs, driven end to end against the ported fake certificate authority in test/derpex/acme/client_test.exs |
-| cmd/derper | `TestIPCertManagerNextProvider` | `cmd/derper/ipcert_test.go:426` | `pending` | upstream's IP certificate manager delegates a DNS hello to a separate autocert provider; DERPEX has no second provider to delegate to, because one manager orders both IP and hostname certificates, so the `:next_provider` seam has no production caller and this row stays open even though a DNS hello creating no IP order is covered in test/derpex/certificates/ip_manager_test.exs |
+| cmd/derper | `TestIPCertManager` | `cmd/derper/ipcert_test.go:328` | `ported` | ported IPv4/IPv6 issuance with the shortlived profile, SNI checks, HTTP-01 routing and disk-cache reuse in test/derpex/certificates/ip_manager_test.exs, driven end to end against the ported fake certificate authority in test/derpex/acme/client_test.exs and through the real boot path — placeholder, order, HTTP-01 fetched back off the plaintext listener, issued leaf served to a no-SNI handshake — in test/derpex/certificates/acme_boot_test.exs |
+| cmd/derper | `TestIPCertManagerNextProvider` | `cmd/derper/ipcert_test.go:426` | `implementation-specific` | upstream's IP certificate manager hands a DNS hello to a separate autocert provider; DERPEX orders both IP and hostname certificates from one manager, so `:next_provider` is a structural seam with no production caller — the argument PLAN.md §2.3 records — and the delegation the seam exists for is exercised in test/derpex/certificates/ip_manager_test.exs:70-92 |
 | cmd/derper | `TestCertModeIPCertsGating` | `cmd/derper/ipcert_test.go:448` | `ported` | ported certificate-mode/IP-host gating in test/derpex/certificates/mode_test.exs and the boot-time refusal of unimplemented modes in test/derpex/certificates/boot_test.exs |
-| DERP prober | `TestDerpProber` | `prober/derp_test.go:25` | `pending` | release-blocking mapping not yet implemented |
-| DERP prober | `TestRunDerpProbeNodePair` | `prober/derp_test.go:146` | `black-box` | upstream 100 MB transfer and 30-packet in-flight bound run through DERPEX with unchanged official clients in test/interop/go_client_test.exs |
+| DERP prober | `TestDerpProber` | `prober/derp_test.go:25` | `implementation-specific` | tests the separate prober tool (cmd/derpprobe) planning probes from a DERP map, not the DERP server; DERPEX ships no prober planner, and the server surface a prober needs is black-box gated by TestRunDerpProbeNodePair in test/interop/go_client_test.exs |
+| DERP prober | `TestRunDerpProbeNodePair` | `prober/derp_test.go:146` | `black-box` | upstream's runDerpProbeNodePair is unexported, so interop/go/prober_smoke.go re-implements the probe loop — the same 100 MB transfer and 30-packet in-flight bound — around two unchanged official derphttp clients, which are what DERPEX is measured through in test/interop/go_client_test.exs |
 | DERP prober | `Test_packetsForSize` | `prober/derp_test.go:202` | `ported` | ported exact packet counts, total sizes, per-call randomness, and large-payload caching in test/derpex/prober_test.exs |
-| XDP | `TestXDP` | `derp/xdp/xdp_linux_test.go:274` | `implementation-specific` | separate Linux XDP path is not in the cmd/derper request path; the pinned oracle job in .github/workflows/ci.yml still runs upstream's own XDP package |
-| XDP | `TestCountersMapKey` | `derp/xdp/xdp_linux_test.go:1042` | `implementation-specific` | layout invariant for the unused Go/XDP implementation; the pinned oracle job in .github/workflows/ci.yml still runs upstream's own XDP package |
+| STUN | `TestParseResponse` | `net/stun/stun_test.go:188` | `black-box` | DERPEX is a STUN server and ships no response parser; the reciprocal claim, that its binding response is what the unchanged official stun.ParseResponse reads, is asserted by interop/go/stun_smoke.go in test/interop/go_client_test.exs |
+| STUN | `TestIs` | `net/stun/stun_test.go:213` | `implementation-specific` | Go's classifier for a socket magicsock multiplexes between STUN and WireGuard; DERPEX's responder owns its UDP port in lib/derpex/stun.ex and validates every datagram as a binding request instead, so there is no packet kind to guess |
+| STUN | `TestParseBindingRequest` | `net/stun/stun_test.go:239` | `ported` | ported in test/derpex/stun/protocol_test.exs; the official binding-request shape, upstream's tolerance of the unused declared attribute length, and rejection of a wrong software attribute, a corrupted fingerprint, or trailing attributes |
+| STUN | `TestResponse` | `net/stun/stun_test.go:251` | `ported` | ported in test/derpex/stun/protocol_test.exs as byte-identical IPv4 and IPv6 XOR-MAPPED-ADDRESS vectors, including the IPv4-mapped IPv6 source Go answers as IPv4; the round trip upstream asserts is closed by the official parser in test/interop/go_client_test.exs |
+| STUN | `TestAttrOrderForXdpDERP` | `net/stun/stun_test.go:287` | `black-box` | upstream pins the attribute order its own request builder emits; DERPEX builds no request, and the order it is held to is whatever the unchanged official stun.Request sends in interop/go/stun_smoke.go, gated by test/interop/go_client_test.exs |
+| XDP | `TestXDP` | `derp/xdp/xdp_linux_test.go:274` | `implementation-specific` | separate Linux XDP data path, outside the cmd/derper request path DERPEX reimplements; the pinned oracle job in .github/workflows/ci.yml compiles upstream's own derp/xdp package, but this test calls tstest.RequireRoot and skips itself on the unprivileged runner, so what the job proves for it is that the package still builds |
+| XDP | `TestCountersMapKey` | `derp/xdp/xdp_linux_test.go:1042` | `implementation-specific` | layout invariant for the unused Go/XDP counters map; it needs no privileges, so it is the derp/xdp test that actually executes when the pinned oracle job in .github/workflows/ci.yml runs that package |
