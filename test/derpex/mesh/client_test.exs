@@ -624,6 +624,67 @@ defmodule Derpex.Mesh.ClientTest do
     assert_receive {:batch_forward, ^source, ^remote_peer, "new ring"}, 5_000
   end
 
+  test "a peer dribbling its upgrade response is cut off at the connect timeout" do
+    parent = self()
+    previous_clock = Application.fetch_env!(:derpex, :clock)
+    Application.put_env(:derpex, :clock, ManualClock)
+    on_exit(fn -> Application.put_env(:derpex, :clock, previous_clock) end)
+    start_supervised!({ManualClock, monotonic_time: 0})
+
+    {_local_public, local_private} = Crypto.generate_keypair()
+    mesh_key = :crypto.strong_rand_bytes(32)
+
+    {:ok, listener} =
+      :gen_tcp.listen(0, [:binary, packet: :raw, active: false, reuseaddr: true])
+
+    {:ok, {_ip, port}} = :inet.sockname(listener)
+    fake = spawn(fn -> dribbling_server(listener, parent) end)
+
+    on_exit(fn ->
+      :gen_tcp.close(listener)
+      if Process.alive?(fake), do: Process.exit(fake, :kill)
+    end)
+
+    _client =
+      start_supervised!(
+        {Client,
+         url: "http://127.0.0.1:#{port}/derp",
+         private_key: Secret.wrap(local_private),
+         mesh_key: Secret.wrap(mesh_key),
+         connect_timeout: 10_000,
+         reconnect_interval: 60_000,
+         event_handler: fn event -> send(parent, {:mesh_event, event}) end}
+      )
+
+    assert_receive :dribble_ready, 2_000
+
+    Enum.each(1..3, fn _byte ->
+      send(fake, :dribble)
+      assert_receive :dribbled, 2_000
+      ManualClock.advance(9_000)
+    end)
+
+    assert_receive {:mesh_event, {:connect_error, {:handshake, :timeout}}}, 2_000
+  end
+
+  defp dribbling_server(listener, parent) do
+    {:ok, socket} = :gen_tcp.accept(listener)
+    {:ok, _request, _read_ahead} = receive_http_head(socket, "")
+    send(parent, :dribble_ready)
+    dribble_loop(socket, "HTTP/1.1 101 Switching Protocols\r\n\r\n", parent)
+  rescue
+    error -> send(parent, {:fake_error, error, __STACKTRACE__})
+  end
+
+  defp dribble_loop(socket, <<byte::binary-size(1), rest::binary>>, parent) do
+    receive do
+      :dribble ->
+        :ok = :gen_tcp.send(socket, byte)
+        send(parent, :dribbled)
+        dribble_loop(socket, rest, parent)
+    end
+  end
+
   defp batch_error_server(listener, server_private, mesh_key, remote_peer, parent) do
     {:ok, socket} = :gen_tcp.accept(listener)
     _read_ahead = mesh_handshake(socket, server_private, mesh_key)

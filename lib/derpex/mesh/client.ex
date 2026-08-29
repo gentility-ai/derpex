@@ -18,6 +18,10 @@ defmodule Derpex.Mesh.Client do
   its full five second internal timeout, then exits the helper, and the send
   is still blocked afterwards.
 
+  Dialling and handshaking share one absolute deadline of `connect_timeout`,
+  captured before the socket opens and re-derived for every read, rather than
+  a fresh timeout per read that a peer could renew forever by dribbling.
+
   In the other direction a peer that stops speaking is caught by a two minute
   receive deadline, rearmed on every byte the peer sends, matching the
   `120 * time.Second` read deadline `derp.Client.Recv` sets before each frame.
@@ -235,9 +239,11 @@ defmodule Derpex.Mesh.Client do
   end
 
   defp establish_connection(state) do
-    case open_socket(state) do
+    deadline = Clock.monotonic_time(:millisecond) + state.connect_timeout
+
+    case open_socket(state, deadline) do
       {:ok, socket} ->
-        case perform_handshake(%{state | socket: socket}) do
+        case perform_handshake(%{state | socket: socket}, deadline) do
           {:ok, connected_state, read_ahead} ->
             {:ok, connected_state, read_ahead}
 
@@ -255,11 +261,11 @@ defmodule Derpex.Mesh.Client do
     end
   end
 
-  defp perform_handshake(state) do
+  defp perform_handshake(state, deadline) do
     with :ok <- socket_send(state, upgrade_request(state.endpoint)),
-         {:ok, read_ahead} <- receive_http_upgrade(state.socket, state.connect_timeout),
+         {:ok, read_ahead} <- receive_http_upgrade(state.socket, deadline),
          {:ok, type, server_key_body, read_ahead} <-
-           receive_frame(state.socket, read_ahead, state.connect_timeout),
+           receive_frame(state.socket, read_ahead, deadline),
          true <- type == Frame.type(:server_key),
          {:ok, remote_server_key} <- Handshake.decode_server_key(server_key_body) do
       state = %{state | remote_server_key: remote_server_key}
@@ -267,7 +273,7 @@ defmodule Derpex.Mesh.Client do
       if remote_server_key == state.local_public_key do
         {:self_connect, state}
       else
-        finish_handshake(state, read_ahead)
+        finish_handshake(state, read_ahead, deadline)
       end
     else
       false -> {:error, :expected_server_key, state}
@@ -275,7 +281,7 @@ defmodule Derpex.Mesh.Client do
     end
   end
 
-  defp finish_handshake(state, read_ahead) do
+  defp finish_handshake(state, read_ahead, deadline) do
     private_key = Secret.reveal(state.private_key)
 
     info = %ClientInfo{
@@ -294,7 +300,7 @@ defmodule Derpex.Mesh.Client do
          {:ok, watch} <- Body.encode_client(:watch_connections),
          :ok <- socket_send(state, [client_info, watch]),
          {:ok, type, server_info_body, read_ahead} <-
-           receive_frame(state.socket, read_ahead, state.connect_timeout),
+           receive_frame(state.socket, read_ahead, deadline),
          true <- type == Frame.type(:server_info),
          {:ok, _server_info} <-
            Handshake.decode_server_info(
@@ -490,27 +496,27 @@ defmodule Derpex.Mesh.Client do
   defp delete_ring(nil), do: :ok
   defp delete_ring(%Ring{} = ring), do: Ring.delete(ring)
 
-  defp open_socket(%{proxy: nil} = state) do
+  defp open_socket(%{proxy: nil} = state, deadline) do
     endpoint = state.endpoint
     host = String.to_charlist(endpoint.dial_host)
     tcp_options = tcp_options(state)
 
     case endpoint.scheme do
       "http" ->
-        case :gen_tcp.connect(host, endpoint.port, tcp_options, state.connect_timeout) do
+        case :gen_tcp.connect(host, endpoint.port, tcp_options, time_left(deadline)) do
           {:ok, socket} -> {:ok, {:tcp, socket}}
           {:error, reason} -> {:error, reason}
         end
 
       "https" ->
-        case :ssl.connect(host, endpoint.port, tls_options(state), state.connect_timeout) do
+        case :ssl.connect(host, endpoint.port, tls_options(state), time_left(deadline)) do
           {:ok, socket} -> {:ok, {:ssl, socket}}
           {:error, reason} -> {:error, reason}
         end
     end
   end
 
-  defp open_socket(state) do
+  defp open_socket(state, deadline) do
     proxy = state.proxy
     tcp_options = tcp_options(state)
 
@@ -518,22 +524,22 @@ defmodule Derpex.Mesh.Client do
            String.to_charlist(proxy.host),
            proxy.port,
            tcp_options,
-           state.connect_timeout
+           time_left(deadline)
          ) do
-      {:ok, socket} -> open_proxy_tunnel(state, socket)
+      {:ok, socket} -> open_proxy_tunnel(state, socket, deadline)
       {:error, reason} -> {:error, {:proxy_connect, reason}}
     end
   end
 
-  defp open_proxy_tunnel(state, socket) do
+  defp open_proxy_tunnel(state, socket, deadline) do
     target = host_and_port(state.endpoint.host, state.endpoint.port)
 
     result =
       with :ok <- :gen_tcp.send(socket, proxy_connect_request(target, state.proxy)),
-           :ok <- receive_proxy_response(socket, "", state.connect_timeout) do
+           :ok <- receive_proxy_response(socket, "", deadline) do
         case state.endpoint.scheme do
           "http" -> {:ok, {:tcp, socket}}
-          "https" -> wrap_proxy_tls(state, socket)
+          "https" -> wrap_proxy_tls(state, socket, deadline)
         end
       end
 
@@ -558,18 +564,18 @@ defmodule Derpex.Mesh.Client do
     ]
   end
 
-  defp wrap_proxy_tls(state, socket) do
-    case :ssl.connect(socket, tls_options(state), state.connect_timeout) do
+  defp wrap_proxy_tls(state, socket, deadline) do
+    case :ssl.connect(socket, tls_options(state), time_left(deadline)) do
       {:ok, tls_socket} -> {:ok, {:ssl, tls_socket}}
       {:error, reason} -> {:error, {:proxy_tls, reason}}
     end
   end
 
-  defp receive_proxy_response(_socket, buffer, _timeout)
+  defp receive_proxy_response(_socket, buffer, _deadline)
        when byte_size(buffer) > @max_http_head_bytes,
        do: {:error, :proxy_response_too_large}
 
-  defp receive_proxy_response(socket, buffer, timeout) do
+  defp receive_proxy_response(socket, buffer, deadline) do
     case :binary.match(buffer, "\r\n\r\n") do
       {head_length, 4} ->
         <<head::binary-size(^head_length), "\r\n\r\n", _read_ahead::binary>> = buffer
@@ -579,8 +585,8 @@ defmodule Derpex.Mesh.Client do
         end
 
       :nomatch ->
-        case :gen_tcp.recv(socket, 0, timeout) do
-          {:ok, data} -> receive_proxy_response(socket, buffer <> data, timeout)
+        case :gen_tcp.recv(socket, 0, time_left(deadline)) do
+          {:ok, data} -> receive_proxy_response(socket, buffer <> data, deadline)
           {:error, reason} -> {:error, {:proxy_response, reason}}
         end
     end
@@ -631,14 +637,14 @@ defmodule Derpex.Mesh.Client do
     |> Keyword.put(:send_timeout_close, true)
   end
 
-  defp receive_http_upgrade(socket, timeout),
-    do: receive_http_upgrade(socket, "", 0, timeout)
+  defp receive_http_upgrade(socket, deadline),
+    do: receive_http_upgrade(socket, "", 0, deadline)
 
-  defp receive_http_upgrade(_socket, buffer, _scanned, _timeout)
+  defp receive_http_upgrade(_socket, buffer, _scanned, _deadline)
        when byte_size(buffer) > @max_http_head_bytes,
        do: {:error, :http_head_too_large}
 
-  defp receive_http_upgrade(socket, buffer, scanned, timeout) do
+  defp receive_http_upgrade(socket, buffer, scanned, deadline) do
     case Scan.match_from(buffer, scanned, "\r\n\r\n") do
       {head_length, 4} ->
         <<head::binary-size(^head_length), "\r\n\r\n", read_ahead::binary>> = buffer
@@ -649,9 +655,12 @@ defmodule Derpex.Mesh.Client do
         end
 
       :nomatch ->
-        case socket_recv(socket, timeout) do
-          {:ok, data} -> receive_http_upgrade(socket, buffer <> data, byte_size(buffer), timeout)
-          {:error, reason} -> {:error, reason}
+        case socket_recv(socket, time_left(deadline)) do
+          {:ok, data} ->
+            receive_http_upgrade(socket, buffer <> data, byte_size(buffer), deadline)
+
+          {:error, reason} ->
+            {:error, reason}
         end
     end
   end
@@ -666,12 +675,12 @@ defmodule Derpex.Mesh.Client do
     end
   end
 
-  defp receive_frame(socket, buffer, timeout) do
-    with {:ok, buffer} <- ensure_bytes(socket, buffer, Frame.header_length(), timeout),
+  defp receive_frame(socket, buffer, deadline) do
+    with {:ok, buffer} <- ensure_bytes(socket, buffer, Frame.header_length(), deadline),
          {:ok, type, length, _rest} <- Frame.decode_header(buffer),
          true <- length <= @max_server_frame_bytes,
          {:ok, buffer} <-
-           ensure_bytes(socket, buffer, Frame.header_length() + length, timeout) do
+           ensure_bytes(socket, buffer, Frame.header_length() + length, deadline) do
       <<_header::binary-size(5), payload::binary-size(^length), rest::binary>> = buffer
       {:ok, type, payload, rest}
     else
@@ -680,15 +689,20 @@ defmodule Derpex.Mesh.Client do
     end
   end
 
-  defp ensure_bytes(_socket, buffer, wanted, _timeout) when byte_size(buffer) >= wanted,
+  defp ensure_bytes(_socket, buffer, wanted, _deadline) when byte_size(buffer) >= wanted,
     do: {:ok, buffer}
 
-  defp ensure_bytes(socket, buffer, wanted, timeout) do
-    case socket_recv(socket, timeout) do
-      {:ok, data} -> ensure_bytes(socket, buffer <> data, wanted, timeout)
+  defp ensure_bytes(socket, buffer, wanted, deadline) do
+    case socket_recv(socket, time_left(deadline)) do
+      {:ok, data} -> ensure_bytes(socket, buffer <> data, wanted, deadline)
       {:error, reason} -> {:error, reason}
     end
   end
+
+  # Every dial and read in one connect attempt shares a single deadline, so a
+  # peer that keeps a per-read timer alive by dribbling a byte at a time still
+  # runs out of connect_timeout rather than stalling the client indefinitely.
+  defp time_left(deadline), do: max(deadline - Clock.monotonic_time(:millisecond), 0)
 
   defp upgrade_request(endpoint) do
     [
