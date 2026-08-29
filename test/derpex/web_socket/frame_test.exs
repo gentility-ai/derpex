@@ -58,6 +58,36 @@ defmodule Derpex.WebSocket.FrameTest do
 
   defp encoded_binary(payload), do: IO.iodata_to_binary(Frame.encode_binary(payload))
 
+  @tag :performance
+  test "buffers a dripped frame without rescanning what it already holds" do
+    payload_bytes = 400 * 1_024
+    payload = :binary.copy("w", payload_bytes)
+    frame = IO.iodata_to_binary(client_frame(0x2, payload))
+
+    {microseconds, result} =
+      :timer.tc(fn ->
+        push_one_byte_at_a_time(frame, Frame.new(max_message_length: 1_048_576))
+      end)
+
+    assert {:ok, [{:binary, ^payload}], _state} = result
+
+    # Holding a sub-binary of the buffer defeats the in-place append, so every
+    # push copied everything buffered so far: 400 KB dripped a byte at a time
+    # took about eight seconds. Appending in place costs milliseconds.
+    assert div(microseconds, 1_000) < 500,
+           "one-byte-at-a-time push of #{payload_bytes} payload bytes took " <>
+             "#{div(microseconds, 1_000)} ms"
+  end
+
+  defp push_one_byte_at_a_time(<<>>, state), do: {:ok, [], state}
+
+  defp push_one_byte_at_a_time(<<byte, rest::binary>>, state) do
+    case Frame.push(state, <<byte>>) do
+      {:ok, [], state} -> push_one_byte_at_a_time(rest, state)
+      other -> other
+    end
+  end
+
   defp client_frame(opcode, payload, fin? \\ true) do
     mask = <<1, 2, 3, 4>>
     length = byte_size(payload)
