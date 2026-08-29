@@ -17,6 +17,7 @@ defmodule Derpex.Admission.Gentility.Closer do
   require Logger
 
   @default_max_concurrency 32
+  @default_close_timeout_ms 5_000
 
   @doc false
   @spec start_link(keyword()) :: GenServer.on_start()
@@ -51,8 +52,18 @@ defmodule Derpex.Admission.Gentility.Closer do
     max_concurrency =
       Keyword.get(options, :max_concurrency, @default_max_concurrency)
 
-    if is_function(close_peer, 1) and is_integer(max_concurrency) and max_concurrency > 0 do
-      {:ok, %{close_peer: close_peer, failures: failures, max_concurrency: max_concurrency}}
+    close_timeout_ms =
+      Keyword.get(options, :close_timeout_ms, @default_close_timeout_ms)
+
+    if is_function(close_peer, 1) and is_integer(max_concurrency) and max_concurrency > 0 and
+         is_integer(close_timeout_ms) and close_timeout_ms > 0 do
+      {:ok,
+       %{
+         close_peer: close_peer,
+         failures: failures,
+         max_concurrency: max_concurrency,
+         close_timeout_ms: close_timeout_ms
+       }}
     else
       {:stop, :invalid_closer}
     end
@@ -60,15 +71,26 @@ defmodule Derpex.Admission.Gentility.Closer do
 
   @impl GenServer
   def handle_cast({:close, keys}, state) do
+    # Every close is bounded: a router that stops answering costs one deadline
+    # per peer, not a closer that never returns to the next batch.
     keys
     |> Task.async_stream(fn key -> close_one(state, key) end,
       max_concurrency: state.max_concurrency,
       ordered: false,
-      timeout: :infinity
+      timeout: state.close_timeout_ms,
+      on_timeout: :kill_task
     )
-    |> Stream.run()
+    |> Enum.each(&record_result(state, &1))
 
     {:noreply, state}
+  end
+
+  defp record_result(_state, {:ok, _result}), do: :ok
+
+  defp record_result(state, {:exit, reason}) do
+    :atomics.add(state.failures, 1, 1)
+    Logger.warning("gentility peer close did not finish: #{inspect(reason)}")
+    :ok
   end
 
   defp close_one(state, key) do

@@ -1022,6 +1022,44 @@ defmodule Derpex.Admission.GentilityTest do
     assert Gentility.stats(controller).cache_entries == 2
   end
 
+  test "a lease expires on elapsed time even if the wall clock is stepped back" do
+    parent = self()
+    node_key = node_key(69)
+
+    controller =
+      start_controller(
+        authority: fn request -> {:ok, signed_lease(request.node_key)} end,
+        close_peer: fn key -> send(parent, {:closed, key}) end
+      )
+
+    policy = Gentility.policy(controller)
+    assert {:ok, _context} = Gentility.authorize(request(node_key), policy)
+
+    # The wall clock is stepped backwards; by it, the lease is nowhere near
+    # expiry. Its lifetime elapses on the monotonic clock all the same.
+    Manual.set_system_time(500)
+    Manual.advance(1_000)
+
+    assert_receive {:closed, ^node_key}, 2_000
+    assert Gentility.stats(controller).cache_entries == 0
+  end
+
+  @tag :tmp_dir
+  test "refuses a cache path that is a symlink or oversized", %{tmp_dir: tmp_dir} do
+    path = Path.join(tmp_dir, "admission.cache")
+    target = Path.join(tmp_dir, "elsewhere.cache")
+    :ok = Cache.store(target, [], [])
+    :ok = File.ln_s(target, path)
+
+    controller =
+      start_controller(
+        authority: fn _request -> {:error, :unavailable} end,
+        cache_path: path
+      )
+
+    assert Gentility.stats(controller).load_error == :cache_not_a_regular_file
+  end
+
   test "evicts the soonest-expiring lease that no connection is claiming" do
     parent = self()
     keeper = node_key(27)

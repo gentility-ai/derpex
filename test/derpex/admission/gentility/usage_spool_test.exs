@@ -83,4 +83,23 @@ defmodule Derpex.Admission.Gentility.UsageSpoolTest do
     {:ok, encoded} = UsageContract.encode(batch)
     encoded
   end
+
+  @tag :tmp_dir
+  test "refuses a spool path that is not a regular file", %{tmp_dir: tmp_dir} do
+    path = Path.join(tmp_dir, "usage.spool")
+    target = Path.join(tmp_dir, "elsewhere.spool")
+    {:ok, spool} = UsageSpool.load(target, 4, 1_000_000)
+    {:ok, _spool} = UsageSpool.put(spool, encoded_batch(0))
+    :ok = File.ln_s(target, path)
+
+    assert UsageSpool.load(path, 4, 1_000_000) == {:error, :spool_not_a_regular_file}
+  end
+
+  @tag :tmp_dir
+  test "refuses a spool larger than its configured bounds allow", %{tmp_dir: tmp_dir} do
+    path = Path.join(tmp_dir, "usage.spool")
+    :ok = File.write(path, :binary.copy(<<0>>, 4_096))
+
+    assert UsageSpool.load(path, 1, 8) == {:error, :spool_too_large}
+  end
 end

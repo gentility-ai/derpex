@@ -12,11 +12,36 @@ defmodule Derpex.Admission.Gentility.Cache do
   def load(nil, _max_leases, _max_revocations), do: {:ok, {[], []}}
 
   def load(path, max_leases, max_revocations) when is_binary(path) do
+    case readable(path, max_bytes(max_leases, max_revocations)) do
+      :ok -> read_and_decode(path, max_leases, max_revocations)
+      :missing -> {:ok, {[], []}}
+      {:error, _reason} = error -> error
+    end
+  end
+
+  defp read_and_decode(path, max_leases, max_revocations) do
     case File.read(path) do
       {:ok, data} -> decode(data, max_leases, max_revocations)
       {:error, :enoent} -> {:ok, {[], []}}
       {:error, reason} -> {:error, {:read, reason}}
     end
+  end
+
+  # The cache is written by this relay and read back with the same privileges.
+  # A symlink or an oversized file at that path is a sign the path is not what
+  # it should be, and is refused before a byte is read into memory.
+  defp readable(path, maximum) do
+    case File.lstat(path) do
+      {:ok, %File.Stat{type: :regular, size: size}} when size <= maximum -> :ok
+      {:ok, %File.Stat{type: :regular}} -> {:error, :cache_too_large}
+      {:ok, %File.Stat{}} -> {:error, :cache_not_a_regular_file}
+      {:error, :enoent} -> :missing
+      {:error, reason} -> {:error, {:read, reason}}
+    end
+  end
+
+  defp max_bytes(max_leases, max_revocations) do
+    (max_leases + max_revocations) * (4 + @max_record_size) + 64
   end
 
   @spec store(nil | Path.t(), [binary()], [binary()]) :: :ok | {:error, term()}

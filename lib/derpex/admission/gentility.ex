@@ -548,6 +548,7 @@ defmodule Derpex.Admission.Gentility do
            end),
          leases: %{},
          by_expiry: :gb_trees.empty(),
+         by_monotonic: :gb_trees.empty(),
          unclaimed: :gb_trees.empty(),
          revocations: %{},
          revocations_by_time: :gb_trees.empty(),
@@ -875,10 +876,16 @@ defmodule Derpex.Admission.Gentility do
     lifetime = max(lease.expires_at_ms - lease.issued_at_ms, 0)
     {numerator, denominator} = @renewal_fraction
 
+    close_at_ms = lease.expires_at_ms - state.expiry_jitter.(lifetime)
+
     %{
       wire: wire,
       lease: lease,
-      close_at_ms: lease.expires_at_ms - state.expiry_jitter.(lifetime),
+      close_at_ms: close_at_ms,
+      # The wall clock can be stepped; a lease must not outlive its lifetime
+      # because of it. The same deadline is therefore also held on the monotonic
+      # clock, and whichever expires first closes the lease.
+      monotonic_close_at_ms: now_monotonic_ms(state) + max(close_at_ms - now_ms(state), 0),
       renew_at_ms: lease.issued_at_ms + div(lifetime * numerator, denominator)
     }
   end
@@ -897,6 +904,7 @@ defmodule Derpex.Admission.Gentility do
       state
       | leases: Map.put(state.leases, node_key, entry),
         by_expiry: :gb_trees.enter(key, true, state.by_expiry),
+        by_monotonic: :gb_trees.enter(monotonic_key(node_key, entry), true, state.by_monotonic),
         by_renewal: :gb_trees.enter(renewal_key(node_key, entry), true, state.by_renewal),
         budgets: Budgets.add_lease(state.budgets, entry.lease, now_microsecond(state))
     }
@@ -918,6 +926,8 @@ defmodule Derpex.Admission.Gentility do
           state
           | leases: leases,
             by_expiry: :gb_trees.delete_any(key, state.by_expiry),
+            by_monotonic:
+              :gb_trees.delete_any(monotonic_key(node_key, entry), state.by_monotonic),
             unclaimed: :gb_trees.delete_any(key, state.unclaimed),
             by_renewal: :gb_trees.delete_any(renewal_key(node_key, entry), state.by_renewal),
             budgets: Budgets.remove_lease(state.budgets, entry.lease, now_microsecond(state))
@@ -926,6 +936,8 @@ defmodule Derpex.Admission.Gentility do
   end
 
   defp expiry_key(node_key, entry), do: {entry.close_at_ms, node_key}
+
+  defp monotonic_key(node_key, entry), do: {entry.monotonic_close_at_ms, node_key}
 
   defp renewal_key(node_key, entry), do: {entry.renew_at_ms, node_key}
 
@@ -1487,9 +1499,44 @@ defmodule Derpex.Admission.Gentility do
   # Expiry order is maintained incrementally, so purging walks only the leases
   # that have actually expired rather than the whole cache.
   defp purge_expired(state) do
-    case purge_expired_leases(state, now_ms(state), []) do
-      {state, []} -> state
-      {state, keys} -> state |> close_peers(keys, :expiry) |> mark_cache_dirty()
+    {state, closed} = purge_expired_leases(state, now_ms(state), [])
+    {state, closed} = purge_elapsed_leases(state, now_monotonic_ms(state), closed)
+
+    case closed do
+      [] -> state
+      keys -> state |> close_peers(keys, :expiry) |> mark_cache_dirty()
+    end
+  end
+
+  # The monotonic backstop: a lease whose lifetime has elapsed is closed even if
+  # the wall clock has been stepped backwards and still calls it valid.
+  defp purge_elapsed_leases(state, now, closed) do
+    if :gb_trees.is_empty(state.by_monotonic) do
+      {state, closed}
+    else
+      {{deadline, node_key} = key, _present} = :gb_trees.smallest(state.by_monotonic)
+
+      if deadline <= now do
+        state = %{state | by_monotonic: :gb_trees.delete_any(key, state.by_monotonic)}
+        {state, closed} = elapse_lease(state, node_key, key, closed)
+        purge_elapsed_leases(state, now, closed)
+      else
+        {state, closed}
+      end
+    end
+  end
+
+  defp elapse_lease(state, node_key, key, closed) do
+    case state.leases[node_key] do
+      nil ->
+        {state, closed}
+
+      entry ->
+        if monotonic_key(node_key, entry) == key do
+          {drop_lease_entry(state, node_key), [node_key | closed]}
+        else
+          {state, closed}
+        end
     end
   end
 
@@ -1735,14 +1782,33 @@ defmodule Derpex.Admission.Gentility do
   defp reschedule_expiry(state) do
     state = cancel_expiry(state)
 
-    if :gb_trees.is_empty(state.by_expiry) do
-      state
+    case expiry_delay(state) do
+      nil ->
+        state
+
+      delay ->
+        token = make_ref()
+        timer = state.clock.send_after(self(), {__MODULE__, :expire, token}, delay)
+        %{state | expiry_timer: timer, expiry_token: token}
+    end
+  end
+
+  # Whichever deadline comes first decides when the sweep runs.
+  defp expiry_delay(state) do
+    [
+      tree_delay(state.by_expiry, now_ms(state)),
+      tree_delay(state.by_monotonic, now_monotonic_ms(state))
+    ]
+    |> Enum.reject(&is_nil/1)
+    |> Enum.min(fn -> nil end)
+  end
+
+  defp tree_delay(tree, now) do
+    if :gb_trees.is_empty(tree) do
+      nil
     else
-      {{expires_at_ms, _node_key}, _present} = :gb_trees.smallest(state.by_expiry)
-      delay = max(expires_at_ms - now_ms(state), 0)
-      token = make_ref()
-      timer = state.clock.send_after(self(), {__MODULE__, :expire, token}, delay)
-      %{state | expiry_timer: timer, expiry_token: token}
+      {{deadline, _node_key}, _present} = :gb_trees.smallest(tree)
+      max(deadline - now, 0)
     end
   end
 
@@ -2047,6 +2113,8 @@ defmodule Derpex.Admission.Gentility do
   defp now_ms(state), do: state.clock.system_time(:millisecond)
 
   defp now_microsecond(state), do: state.clock.monotonic_time(:microsecond)
+
+  defp now_monotonic_ms(state), do: state.clock.monotonic_time(:millisecond)
 
   defp validate_verification_keys(keys) when map_size(keys) > 0 and map_size(keys) <= 16 do
     if Enum.all?(keys, fn {key_id, key} ->
