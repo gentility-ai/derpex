@@ -670,6 +670,51 @@ defmodule Derpex.Admission.GentilityTest do
              {:error, :no_cached_lease}
   end
 
+  test "a close that fails is counted and costs neither the closer nor the batch" do
+    parent = self()
+    keys = [node_key(62), node_key(63), node_key(64)]
+
+    controller =
+      start_controller(
+        authority: fn request -> {:ok, signed_lease(request.node_key)} end,
+        close_peer: fn key ->
+          send(parent, {:closing, key})
+          if key == node_key(62), do: exit(:timeout), else: 1
+        end
+      )
+
+    policy = Gentility.policy(controller)
+
+    Enum.each(keys, fn key ->
+      assert {:ok, _context} = Gentility.authorize(request(key), policy)
+    end)
+
+    log =
+      ExUnit.CaptureLog.capture_log(fn ->
+        assert Gentility.reconcile(controller, Enum.map(keys, &signed_revocation(&1, 10))) ==
+                 {:ok, %{applied: 3, stale: 0}}
+
+        eventually(fn -> Gentility.stats(controller).close_peer_failures == 1 end)
+      end)
+
+    assert log =~ "could not close a peer"
+
+    # Every peer in the batch was attempted, and the controller kept answering.
+    for key <- keys, do: assert_received({:closing, ^key})
+    assert Process.alive?(controller)
+    assert Gentility.stats(controller).cache_entries == 0
+
+    # The closer survived, so a later batch still runs.
+    fresh = node_key(65)
+    assert {:ok, _context} = Gentility.authorize(request(fresh), policy)
+
+    assert Gentility.reconcile(controller, [signed_revocation(fresh, 10)]) ==
+             {:ok, %{applied: 1, stale: 0}}
+
+    assert_receive {:closing, ^fresh}, 2_000
+    assert Gentility.stats(controller).close_peer_failures == 1
+  end
+
   test "a mass close runs outside the controller call" do
     parent = self()
     keys = [node_key(55), node_key(56)]

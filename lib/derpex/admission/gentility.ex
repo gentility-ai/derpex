@@ -296,6 +296,7 @@ defmodule Derpex.Admission.Gentility do
       close_peer_counts: state.close_peer_counts,
       nearest_lease_expiry_seconds: nearest_lease_expiry_seconds(state),
       usage_shed_total: :atomics.get(state.policy.counters, @usage_shed_counter),
+      close_peer_failures: :atomics.get(state.close_failures, 1),
       cache_load_error: state.load_error != nil,
       cache_persist_error: state.persist_error != nil,
       load_error: state.load_error,
@@ -441,7 +442,7 @@ defmodule Derpex.Admission.Gentility do
     cond do
       state.usage && state.usage.server == pid -> {:stop, reason, state}
       state.cache_writer == pid -> {:stop, reason, state}
-      state.closer == pid -> {:stop, reason, state}
+      state.closer == pid -> restart_closer(state, reason)
       true -> unexpected_exit(state, pid, reason)
     end
   end
@@ -494,10 +495,11 @@ defmodule Derpex.Admission.Gentility do
     cache_path = Keyword.get(options, :cache_path)
 
     close_peer = Keyword.get(options, :close_peer, &Router.close_peer/1)
+    close_failures = :atomics.new(1, signed: false)
 
     with :ok <- validate_verification_keys(verification_keys),
          {:ok, cache_writer} <- initial_cache_writer(cache_path),
-         {:ok, closer} <- Closer.start_link(close_peer: close_peer),
+         {:ok, closer} <- Closer.start_link(close_peer: close_peer, failures: close_failures),
          {:ok, usage} <- initial_usage(Keyword.get(options, :usage), clock) do
       budgets = Budgets.new()
 
@@ -527,6 +529,7 @@ defmodule Derpex.Admission.Gentility do
          clock: clock,
          close_peer: close_peer,
          closer: closer,
+         close_failures: close_failures,
          close_connection:
            Keyword.get(options, :close_connection, fn connection, reason ->
              send(connection, {:derpex_admission_close, reason})
@@ -1847,9 +1850,16 @@ defmodule Derpex.Admission.Gentility do
     Cache.encode(leases, revocations)
   end
 
+  # A router that cannot answer must not take the controller with it: one close
+  # is isolated here exactly as a batch is inside the closer.
   defp close_peer(state, key, cause) when cause in @close_peer_causes do
     _connection_count = state.close_peer.(key)
     :ok
+  catch
+    kind, reason ->
+      :atomics.add(state.close_failures, 1, 1)
+      Logger.warning("gentility could not close a peer: #{inspect(kind)} #{inspect(reason)}")
+      :ok
   end
 
   # One close is a single router call and stays inline. A batch is handed to the
@@ -1870,6 +1880,17 @@ defmodule Derpex.Admission.Gentility do
   defp count_close_peer(state, cause, count \\ 1) do
     counts = Map.update(state.close_peer_counts, cause, count, &(&1 + count))
     %{state | close_peer_counts: counts}
+  end
+
+  # Losing the closer costs the batch it was running, not the relay: admission
+  # keeps deciding while a fresh closer takes over.
+  defp restart_closer(state, reason) do
+    Logger.warning("gentility peer closer exited: #{inspect(reason)}; restarting it")
+
+    case Closer.start_link(close_peer: state.close_peer, failures: state.close_failures) do
+      {:ok, closer} -> {:noreply, %{state | closer: closer}}
+      {:error, _unavailable} -> {:noreply, %{state | closer: nil}}
+    end
   end
 
   defp unexpected_exit(state, pid, reason) do
