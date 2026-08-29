@@ -736,7 +736,25 @@ defmodule Derpex.Router do
   defp safe_enqueue(ring, message, options \\ []) do
     Ring.enqueue(ring, message, options)
   rescue
-    ArgumentError -> {:dropped, :closed_destination}
+    # The ring's table died with its owner between the route lookup and the
+    # publish. The ring cannot count a drop it never reached, so it is counted
+    # here, as the disconnect it is.
+    ArgumentError ->
+      record_closed_destination(message)
+      {:dropped, :closed_destination}
+  end
+
+  defp record_closed_destination({:recv_packet, _source, packet}),
+    do: record_closed_destination_packet(packet)
+
+  defp record_closed_destination({:forward_packet, _source, _destination, packet}),
+    do: record_closed_destination_packet(packet)
+
+  defp record_closed_destination(_lifecycle_message), do: :ok
+
+  defp record_closed_destination_packet(packet) do
+    kind = if Disco.looks_like_wrapper?(packet), do: :disco, else: :other
+    Metrics.add_drop(Metrics.default_handle(), :gone_disconnected, kind, byte_size(packet))
   end
 
   # The router is a singleton. Waiting a millisecond for one connection's writer

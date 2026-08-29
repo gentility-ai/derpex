@@ -41,7 +41,7 @@ defmodule Derpex.Metrics do
     :write_error,
     :dup_client
   ]
-  @packet_kinds [:disco, :other]
+  @packet_kinds [:disco, :other, :forward]
   @tcp_rtt_buckets [
     {10_000, "10ms"},
     {20_000, "20ms"},

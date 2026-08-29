@@ -578,6 +578,36 @@ defmodule Derpex.RouterTest do
     Process.exit(watcher, :kill)
   end
 
+  test "a packet for a torn-down destination counts as a disconnect drop" do
+    parent = self()
+    key = :crypto.strong_rand_bytes(32)
+    source = :crypto.strong_rand_bytes(32)
+
+    connection = spawn(fn -> Process.sleep(:infinity) end)
+
+    # A ring dies with the process that owns its table. The route survives until
+    # the router reaps it, so a packet can still find a destination that is gone.
+    owner = spawn(fn -> send(parent, {:ring, Ring.new(1)}) end)
+    monitor = Process.monitor(owner)
+    assert_receive {:ring, ring}
+    assert_receive {:DOWN, ^monitor, :process, ^owner, _reason}
+    assert Router.register(key, connection, ring) == :ok
+
+    on_exit(fn ->
+      Router.unregister(key, connection)
+      Process.exit(connection, :kill)
+    end)
+
+    before = Metrics.snapshot()
+    assert Router.route(source, key, "orphan") == {:dropped, :closed_destination}
+    after_snapshot = Metrics.snapshot()
+
+    assert delta(before, after_snapshot, {:packets_dropped, :gone_disconnected, :other}) == 1
+    assert delta(before, after_snapshot, {:bytes_dropped, :gone_disconnected, :other}) == 6
+  end
+
+  defp delta(before, current, key), do: Map.fetch!(current, key) - Map.fetch!(before, key)
+
   test "a vanished ring owner becomes a drop instead of crashing topology state" do
     parent = self()
 

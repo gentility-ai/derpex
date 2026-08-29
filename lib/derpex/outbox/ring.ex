@@ -49,7 +49,7 @@ defmodule Derpex.Outbox.Ring do
             wake_message: atom(),
             test_hook: nil | (atom() -> term()),
             metrics: Metrics.handle() | nil,
-            metric_kind: :disco | :other | nil
+            metric_kind: :disco | :other | :forward | nil
           }
 
   @type enqueue_result :: {:ok, :wake | :coalesced | :replaced} | {:dropped, atom()}
