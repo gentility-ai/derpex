@@ -1,9 +1,13 @@
 defmodule Derpex.Admission.Gentility.Contract do
   @moduledoc """
-  Canonical Gentility admission contract v1 encoding and authentication.
+  Canonical Gentility admission contract v1 authentication and decoding.
 
   Both leases and revocations are signed with Ed25519. All integers are
   unsigned big-endian values and all text fields are length-prefixed UTF-8.
+
+  A relay verifies records; it never mints them. Signing therefore lives with
+  Gentility, and in this repository with the test fixtures, so no release ships
+  the ability to issue a lease.
   """
 
   alias Derpex.Admission.Gentility.Lease
@@ -36,14 +40,6 @@ defmodule Derpex.Admission.Gentility.Contract do
   def record_type(<<@revocation_magic, _rest::binary>>), do: {:ok, :revocation}
   def record_type(wire) when is_binary(wire), do: {:error, :unknown_record_type}
 
-  @doc "Signs a validated lease and returns its portable contract record."
-  @spec sign_lease(Lease.t(), <<_::256>>) :: {:ok, binary()} | {:error, term()}
-  def sign_lease(%Lease{} = lease, <<private_key::binary-size(32)>>) do
-    with {:ok, payload} <- encode_lease_payload(lease) do
-      {:ok, payload <> sign(payload, private_key)}
-    end
-  end
-
   @doc "Authenticates, decodes, and time-validates a contract v1 lease."
   @spec verify_lease(binary(), verification_keys(), integer(), [verify_option()]) ::
           {:ok, Lease.t()} | {:error, term()}
@@ -59,20 +55,17 @@ defmodule Derpex.Admission.Gentility.Contract do
     end
   end
 
-  @doc "Decodes a lease without authenticating it. Intended for durable-cache recovery tooling."
+  @doc """
+  Decodes a lease without authenticating it.
+
+  The durable cache uses this to tell which of two records for one node key is
+  the later one before either is verified.
+  """
   @spec decode_lease(binary()) :: {:ok, Lease.t()} | {:error, term()}
   def decode_lease(wire) when is_binary(wire) do
     with :ok <- wire_size(wire),
          {:ok, payload, _signature} <- split_signature(wire) do
       decode_lease_payload(payload)
-    end
-  end
-
-  @doc "Signs a validated active-revocation record."
-  @spec sign_revocation(Revocation.t(), <<_::256>>) :: {:ok, binary()} | {:error, term()}
-  def sign_revocation(%Revocation{} = revocation, <<private_key::binary-size(32)>>) do
-    with {:ok, payload} <- encode_revocation_payload(revocation) do
-      {:ok, payload <> sign(payload, private_key)}
     end
   end
 
@@ -87,38 +80,6 @@ defmodule Derpex.Admission.Gentility.Contract do
          {:ok, public_key} <- verification_key(verification_keys, revocation.key_id),
          :ok <- verify_signature(payload, signature, public_key) do
       {:ok, revocation}
-    end
-  end
-
-  defp encode_lease_payload(lease) do
-    with :ok <- validate_lease(lease),
-         {:ok, key_id} <- text(lease.key_id, @max_key_id_size),
-         {:ok, node_id} <- text(lease.node_id, @max_identity_size),
-         {:ok, organization_id} <- text(lease.organization_id, @max_identity_size),
-         {:ok, owner_kind} <- text(lease.owner_kind, @max_owner_kind_size),
-         {:ok, deployment_id} <- text(lease.deployment_id, @max_identity_size) do
-      {:ok,
-       <<
-         @lease_magic,
-         @version::16,
-         key_id::binary,
-         lease.node_key::binary-size(32),
-         node_id::binary,
-         organization_id::binary,
-         owner_kind::binary,
-         deployment_id::binary,
-         lease.region_id::32,
-         lease.policy_revision::64,
-         lease.quota_revision::64,
-         lease.issued_at_ms::64,
-         lease.expires_at_ms::64,
-         lease.node_connection_limit::32,
-         lease.organization_connection_limit::32,
-         lease.node_bytes_per_second::64,
-         lease.node_byte_burst::64,
-         lease.organization_bytes_per_second::64,
-         lease.organization_byte_burst::64
-       >>}
     end
   end
 
@@ -174,23 +135,6 @@ defmodule Derpex.Admission.Gentility.Contract do
 
   defp decode_lease_payload(_payload), do: {:error, :invalid_lease_encoding}
 
-  defp encode_revocation_payload(revocation) do
-    with :ok <- validate_revocation(revocation),
-         {:ok, key_id} <- text(revocation.key_id, @max_key_id_size),
-         {:ok, reason} <- text(revocation.reason, @max_reason_size) do
-      {:ok,
-       <<
-         @revocation_magic,
-         @version::16,
-         key_id::binary,
-         revocation.node_key::binary-size(32),
-         revocation.policy_revision::64,
-         revocation.revoked_at_ms::64,
-         reason::binary
-       >>}
-    end
-  end
-
   defp decode_revocation_payload(<<@revocation_magic, @version::16, rest::binary>>) do
     with {:ok, key_id, rest} <- take_text(rest, @max_key_id_size),
          <<node_key::binary-size(32), policy_revision::64, revoked_at_ms::64, rest::binary>> <-
@@ -216,7 +160,9 @@ defmodule Derpex.Admission.Gentility.Contract do
 
   defp decode_revocation_payload(_payload), do: {:error, :invalid_revocation_encoding}
 
-  defp validate_lease(%Lease{} = lease) do
+  @doc "Validates every field of a lease against contract v1 ranges."
+  @spec validate_lease(Lease.t()) :: :ok | {:error, term()}
+  def validate_lease(%Lease{} = lease) do
     with :ok <- binary_size(lease.key_id, @max_key_id_size, :key_id),
          :ok <- exact_binary_size(lease.node_key, 32, :node_key),
          :ok <- utf8_size(lease.node_id, @max_identity_size, :node_id),
@@ -248,7 +194,9 @@ defmodule Derpex.Admission.Gentility.Contract do
     end
   end
 
-  defp validate_revocation(%Revocation{} = revocation) do
+  @doc "Validates every field of a revocation against contract v1 ranges."
+  @spec validate_revocation(Revocation.t()) :: :ok | {:error, term()}
+  def validate_revocation(%Revocation{} = revocation) do
     with :ok <- binary_size(revocation.key_id, @max_key_id_size, :key_id),
          :ok <- exact_binary_size(revocation.node_key, 32, :node_key),
          :ok <- uint(revocation.policy_revision, @u64_max, :policy_revision),
@@ -273,10 +221,6 @@ defmodule Derpex.Admission.Gentility.Contract do
       lease.expires_at_ms - lease.issued_at_ms > max_lease_ms -> {:error, :lease_too_long}
       true -> :ok
     end
-  end
-
-  defp sign(payload, private_key) do
-    :crypto.sign(:eddsa, :none, payload, [private_key, :ed25519])
   end
 
   defp verify_signature(payload, signature, public_key) do
@@ -305,12 +249,6 @@ defmodule Derpex.Admission.Gentility.Contract do
 
   defp wire_size(wire) when byte_size(wire) <= @max_wire_size, do: :ok
   defp wire_size(_wire), do: {:error, :record_too_large}
-
-  defp text(value, maximum) do
-    with :ok <- utf8_size(value, maximum, :text) do
-      {:ok, <<byte_size(value)::16, value::binary>>}
-    end
-  end
 
   defp take_text(<<size::16, rest::binary>>, maximum) when size <= maximum do
     case rest do

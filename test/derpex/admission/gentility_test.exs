@@ -6,6 +6,7 @@ defmodule Derpex.Admission.GentilityTest do
   alias Derpex.Admission.Gentility.Contract
   alias Derpex.Admission.Gentility.Lease
   alias Derpex.Admission.Gentility.Revocation
+  alias Derpex.Admission.Gentility.Signer
   alias Derpex.Admission.Gentility.UsageContract
   alias Derpex.Admission.Request
   alias Derpex.ClientInfo
@@ -1543,7 +1544,7 @@ defmodule Derpex.Admission.GentilityTest do
       organization_byte_burst: Keyword.get(options, :organization_byte_burst, 200_000)
     }
 
-    {:ok, wire} = Contract.sign_lease(lease, @private_key)
+    {:ok, wire} = Signer.sign_lease(lease, @private_key)
     wire
   end
 
@@ -1576,7 +1577,7 @@ defmodule Derpex.Admission.GentilityTest do
       organization_byte_burst: 200_000
     }
 
-    {:ok, wire} = Contract.sign_lease(lease, @private_key)
+    {:ok, wire} = Signer.sign_lease(lease, @private_key)
     wire
   end
 
@@ -1603,7 +1604,7 @@ defmodule Derpex.Admission.GentilityTest do
       reason: "node-disabled"
     }
 
-    {:ok, wire} = Contract.sign_revocation(revocation, @private_key)
+    {:ok, wire} = Signer.sign_revocation(revocation, @private_key)
     wire
   end
 

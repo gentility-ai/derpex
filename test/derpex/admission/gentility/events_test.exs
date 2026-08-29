@@ -5,6 +5,7 @@ defmodule Derpex.Admission.Gentility.EventsTest do
   alias Derpex.Admission.Gentility.Contract
   alias Derpex.Admission.Gentility.Events
   alias Derpex.Admission.Gentility.Revocation
+  alias Derpex.Admission.Gentility.Signer
   alias Derpex.Clock.Manual
 
   @private_key :binary.copy(<<0x23>>, 32)
@@ -268,7 +269,7 @@ defmodule Derpex.Admission.Gentility.EventsTest do
       reason: "disabled"
     }
 
-    {:ok, wire} = Contract.sign_revocation(revocation, @private_key)
+    {:ok, wire} = Signer.sign_revocation(revocation, @private_key)
     wire
   end
 
