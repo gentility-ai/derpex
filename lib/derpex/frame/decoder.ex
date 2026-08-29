@@ -18,7 +18,8 @@ defmodule Derpex.Frame.Decoder do
             payload_length: 0,
             fragments: [],
             max_frame_length: @default_max_frame_length,
-            frame_policy: nil
+            frame_policy: nil,
+            charged: 0
 
   @type frame :: {Frame.type_code(), binary() | {:discarded, non_neg_integer()}}
   @type frame_mode :: :buffer | :discard
@@ -34,7 +35,8 @@ defmodule Derpex.Frame.Decoder do
             payload_length: non_neg_integer(),
             fragments: [binary()],
             max_frame_length: non_neg_integer(),
-            frame_policy: nil | frame_policy()
+            frame_policy: nil | frame_policy(),
+            charged: non_neg_integer()
           }
 
   @doc "Creates an empty decoder with a bounded accepted frame length."
@@ -48,6 +50,28 @@ defmodule Derpex.Frame.Decoder do
       frame_policy: Keyword.get(options, :frame_policy)
     }
   end
+
+  @doc """
+  Returns and clears the declared length of every header accepted so far.
+
+  Go charges its receive limiter as soon as it has read a frame header
+  (`derpserver.go`, right after `readFrameHeader`), not once the body has
+  arrived: a frame that declares four gigabytes must be rate-limited before it
+  streams, not after. The decoder counts what has been declared so the caller
+  can charge it at the same point.
+  """
+  @spec take_charge(t()) :: {non_neg_integer(), t()}
+  def take_charge(%__MODULE__{charged: charged} = decoder), do: {charged, %{decoder | charged: 0}}
+
+  @doc """
+  Removes `length` bytes from the tally, for a frame the caller does not charge.
+
+  Go reads the ClientInfo frame before its rate-limited loop starts, so the
+  handshake frame is never charged to the client it authenticates.
+  """
+  @spec discharge(t(), non_neg_integer()) :: t()
+  def discharge(%__MODULE__{} = decoder, length),
+    do: %{decoder | charged: max(decoder.charged - length, 0)}
 
   @doc "Changes the limit applied to subsequent frame headers."
   @spec with_max_frame_length(t(), non_neg_integer()) :: t()
@@ -125,7 +149,8 @@ defmodule Derpex.Frame.Decoder do
   defp start_frame(decoder, type, payload_length, mode, chunk, frames) do
     decoder = %{
       decoder
-      | type: type,
+      | charged: decoder.charged + payload_length,
+        type: type,
         mode: mode,
         remaining: payload_length,
         payload_length: payload_length,

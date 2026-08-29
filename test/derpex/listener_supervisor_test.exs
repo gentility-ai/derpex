@@ -200,6 +200,51 @@ defmodule Derpex.ListenerSupervisorTest do
     assert Keyword.fetch!(transport_options, :send_timeout) == 10_000
   end
 
+  test "a listener caps its concurrent connections and its idle reads" do
+    {_server_public, server_private} = Crypto.generate_keypair()
+
+    listener = [
+      port: 0,
+      num_acceptors: 8,
+      transport_options: [ip: {127, 0, 0, 1}]
+    ]
+
+    assert {:ok, {_flags, [child_spec]}} =
+             ListenerSupervisor.init({[listener], Secret.wrap(server_private)})
+
+    assert {ThousandIsland, :start_link, [options]} = child_spec.start
+
+    # Thousand Island counts connections per acceptor, so the cap has to be
+    # divided by the acceptors that share it.
+    assert Keyword.fetch!(options, :num_connections) * 8 <= 65_536
+    assert Keyword.fetch!(options, :read_timeout) == 60_000
+  end
+
+  test "a configured connection cap and read timeout are the ones used" do
+    {_server_public, server_private} = Crypto.generate_keypair()
+    previous_max = Application.get_env(:derpex, :max_connections)
+    previous_timeout = Application.get_env(:derpex, :read_timeout_ms)
+    Application.put_env(:derpex, :max_connections, 1_024)
+    Application.put_env(:derpex, :read_timeout_ms, 15_000)
+
+    on_exit(fn ->
+      restore(:max_connections, previous_max)
+      restore(:read_timeout_ms, previous_timeout)
+    end)
+
+    listener = [port: 0, num_acceptors: 4, transport_options: [ip: {127, 0, 0, 1}]]
+
+    assert {:ok, {_flags, [child_spec]}} =
+             ListenerSupervisor.init({[listener], Secret.wrap(server_private)})
+
+    assert {ThousandIsland, :start_link, [options]} = child_spec.start
+    assert Keyword.fetch!(options, :num_connections) == 256
+    assert Keyword.fetch!(options, :read_timeout) == 15_000
+  end
+
+  defp restore(key, nil), do: Application.delete_env(:derpex, key)
+  defp restore(key, value), do: Application.put_env(:derpex, key, value)
+
   test "an unconfigured listener hands the handler the pinned default" do
     {_server_public, server_private} = Crypto.generate_keypair()
     listener = [port: 0, num_acceptors: 1, transport_options: [ip: {127, 0, 0, 1}]]

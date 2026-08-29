@@ -101,7 +101,6 @@ defmodule Derpex.ConnectionTest do
              :start_send_loop,
              {:cancel_timeout, :handshake},
              {:set_timeout, :keep_alive, _interval},
-             {:rate_limit, 38},
              :activity,
              {:client_message, {:send_packet, ^destination, "packet"}}
            ] = actions
@@ -153,7 +152,6 @@ defmodule Derpex.ConnectionTest do
              :start_send_loop,
              {:cancel_timeout, :handshake},
              {:set_timeout, :keep_alive, _interval},
-             {:rate_limit, 0},
              :activity,
              {:client_message, :watch_connections}
            ] = actions
@@ -221,9 +219,20 @@ defmodule Derpex.ConnectionTest do
       Connection.receive_data(state, IO.iodata_to_binary(client_info_frame))
 
     header = Frame.encode_header(0xFE, 0xFFFFFFFF)
-    assert {:ok, state, []} = Connection.receive_data(state, header <> :binary.copy(<<1>>, 128))
+
+    # Go charges its receive limiter for the declared length as soon as it has
+    # the header, so a frame announcing four gigabytes is rate-limited before it
+    # streams rather than after.
+    assert {:ok, state, [{:rate_limit, 0xFFFFFFFF}]} =
+             Connection.receive_data(state, header <> :binary.copy(<<1>>, 128))
+
     assert state.decoder.remaining == 0xFFFFFFFF - 128
     assert state.decoder.fragments == []
+
+    # The rest of the body arrives uncharged: the frame was paid for at its
+    # header, and only a new header charges again.
+    assert {:ok, state, []} = Connection.receive_data(state, :binary.copy(<<1>>, 128))
+    assert state.decoder.remaining == 0xFFFFFFFF - 256
   end
 
   test "closes a wrong first frame on its header rather than after its body" do
