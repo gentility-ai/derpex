@@ -557,6 +557,111 @@ consistency(check_output)                            # /debug/check
 The Go oracle helper emits the same schema. Event comparison permits only
 explicitly documented reorderings between independent connections.
 
+`interop/go/differential_trace.go` is the single driver for both servers:
+`oracle` mode starts the pinned Go server behind the same `/debug/varz` handler
+`cmd/derper` publishes, and DERPEX mode drives the DERPEX relay and scrapes its
+token-protected `/metrics`. The driver publishes only the per-server
+`derpserver.Server.ExpVar` set; the `derp_packets_dropped` and
+`derp_bytes_dropped` maps register themselves in the default expvar registry
+during `derpserver` package initialization and need no help from the driver.
+`test/interop/differential_test.exs` decodes both traces, compares them scenario
+by scenario and step by step so a divergence names the step that produced it,
+and then asserts whole-structure equality. Nothing in the trace is a literal
+written by the driver.
+
+The trace is a list of scenarios, each a list of steps. A step records the
+frames its clients observed and the delta of every tracked counter since the
+previous step. Three scenarios run in order:
+
+- `relay_and_drops` — relay of empty, short, and `MaxPacketSize` payloads; a
+  ping/pong exchange; a disco and a plain packet to never-connected keys; a
+  flood that overruns both send queues of a recipient which has stopped
+  reading, then that recipient catching up; and a disconnect observed by a peer.
+- `duplicate_keys` — two connections sharing one public key plus a sender,
+  covering newest-connection delivery, the older connection writing, and
+  last-writer delivery.
+- `watch_presence` — a trusted mesh watcher over the initial presence snapshot,
+  a forwarded packet of each kind for a key this server does not hold, a later
+  arrival, and a departure.
+
+The tracked counter subset, named as Go's varz exposes it, is
+`packets_sent`, `packets_received`, `packets_forwarded_in`, `packets_dropped`
+for all seven reasons crossed with both packet kinds,
+`peer_gone_disconnected_frames`, `peer_gone_not_here_frames`,
+`total_dup_client_conns`, `current_dup_client_keys`, `current_dup_client_conns`,
+`current_connections`, `unknown_frames`, `got_ping`, and `sent_pong`. A tracked
+counter that a server does not publish fails the run rather than reading as
+zero, so a missing counter cannot compare equal to a present one.
+
+Only these normalizations are applied, identically to both traces:
+
+1. Random node keys, addresses, and payload bytes become stable labels, a
+   loopback boolean, and a size plus SHA-256 digest.
+2. Metric names are canonicalized by trimming the `gauge_`/`counter_` type
+   prefixes that Go's varz strips and DERPEX's `/metrics` keeps, and by sorting
+   drop labels, which the two order differently.
+3. Saturation is per counter, not per step. A step names the counters it
+   compares by sign instead of by value, and every other counter in that step
+   is compared exactly. Only two steps name any: the flood signs `packets_sent`
+   and every `packets_dropped` cell, and the catch-up signs the
+   `packets_dropped` cells. How many packets reach the socket before it blocks
+   depends on kernel buffer sizes; the rest does not. In particular the flood
+   still compares `packets_received` exactly (192), and the catch-up compares
+   `packets_sent` exactly (65: a 32-deep ordinary queue, a 32-deep disco queue,
+   and the packet in flight), which pins the send-queue depth.
+4. The initial presence snapshot enumerates connected peers in unspecified
+   order, so that one step's events are sorted. No other reordering is allowed.
+
+Steps synchronize before snapshotting. Each waits for the server's
+`current_connections` gauge to reach the expected value, and each round-trips a
+ping on the connections whose accounting it depends on. A DERP server reads one
+connection's frames in order and drains its pong queue last, so a received pong
+proves both that the frames that client sent have been routed and that the
+frames queued for it have been written and counted. The stalled recipient is the
+one connection that cannot be pinged, which is why its send accounting is signed
+rather than exact.
+
+Each run also checks itself: across the flood and catch-up steps, the packets
+the server accepted must equal the packets it wrote plus the packets it dropped
+for a recorded reason, with nothing left over once the recipient has caught up
+and disconnected. The check uses the raw deltas, not the signed ones, and fails
+the run rather than the comparison, so a server that loses packets is caught
+even when both servers lose them.
+
+Five tracked cells stay zero-delta invariants because no unchanged official
+client can drive them, and the upstream checkout may not be modified to add one:
+
+- `unknown_frames` — the official client has no way to emit an unknown frame
+  type. The invariant still catches a server that miscounts ordinary frames as
+  unknown; driving a real unknown frame belongs to the raw-socket edge suite.
+- `packets_dropped{*,dup_client}` — reached only when a key has two or more
+  connections and none of them is currently the active one, a window the server
+  opens and closes on its own schedule.
+- `packets_dropped{*,gone_disconnected}` — requires a packet to be enqueued for
+  a recipient that is already tearing down, which no client can time.
+- `packets_dropped{*,queue_tail}` — Go tail-drops only after three failed
+  head-drop attempts under racing writers, which a deterministic scenario
+  cannot force.
+- `packets_dropped{*,write_error}` — requires the recipient's socket write to
+  fail, which means killing a connection mid-write and racing the two-second
+  write deadline.
+
+Every other cell is exercised: `unknown_dest` for both kinds by a disco and a
+plain packet to never-connected keys, `unknown_dest_on_fwd` for both kinds by
+the mesh watcher forwarding for a key this server does not hold, and
+`queue_head` for both kinds by the flood, which overruns the ordinary queue
+first and then the disco queue while the writer is stuck on the ordinary one.
+
+`bytes_sent`, `bytes_received`, and `bytes_dropped` are excluded as a
+byte-granularity restatement of the packet counters already compared.
+
+The mesh coverage here is deliberately watch-scoped. It exercises the surface a
+single server presents to a trusted peer — the presence snapshot, live presence
+and departure updates, and an inbound forwarded packet — but not a real mesh of
+two servers: no outbound forwarding, no `packets_forwarded_out`, no forwarder
+registration or replacement, and no `close_peer`. Those paths belong to the mesh
+interoperability suite, which runs DERPEX against a second live Go server.
+
 ## 6. Delivery milestones
 
 Every milestone has a hard exit gate. From Milestone 2 onward each milestone
