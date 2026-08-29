@@ -601,6 +601,102 @@ defmodule Derpex.Listener.HandlerTest do
     :gen_tcp.close(socket)
   end
 
+  # A client is allowed to pipeline its whole opening burst behind the upgrade
+  # request. Everything after the request is read-ahead, and the handler runs it
+  # from inside the action list the upgrade produced rather than from a socket
+  # read, so a rate limit reached there is reached on a path that never had a
+  # branch for pacing: the connection died of a CaseClauseError with the client
+  # doing nothing wrong.
+  test "read-ahead pipelined with the upgrade is paced, not crashed" do
+    start_supervised!({Manual, monotonic_time: 0})
+    previous_clock = Application.fetch_env!(:derpex, :clock)
+    Application.put_env(:derpex, :clock, Manual)
+    on_exit(fn -> Application.put_env(:derpex, :clock, previous_clock) end)
+
+    rate_controller =
+      start_supervised!(
+        {RateController,
+         name: nil,
+         config: %RateConfig{
+           per_client_rate_limit_bytes_per_second: 1,
+           per_client_rate_burst_bytes: RateConfig.minimum_burst()
+         }}
+      )
+
+    {server_public, server_private} = Crypto.generate_keypair()
+    {_client_public, client_private} = Crypto.generate_keypair()
+    destination = :crypto.strong_rand_bytes(32)
+    payload = :binary.copy(<<0xA5>>, 65_536)
+    parent = self()
+
+    event_handler = fn event ->
+      send(parent, {:handler_event, self(), event})
+      :ok
+    end
+
+    {:ok, server} =
+      ThousandIsland.start_link(
+        port: 0,
+        # Buffers large enough that the opening burst is one read: the fault
+        # needs the frames to arrive with the request they were pipelined
+        # behind, which is what a client that writes them together does.
+        transport_options: [
+          ip: {127, 0, 0, 1},
+          recbuf: 4 * 1_024 * 1_024,
+          buffer: 4 * 1_024 * 1_024
+        ],
+        num_acceptors: 1,
+        handler_module: Handler,
+        handler_options: [
+          server_private_key: Secret.wrap(server_private),
+          server_public_key: server_public,
+          event_handler: event_handler,
+          rate_controller: rate_controller
+        ]
+      )
+
+    stop_server_on_exit(server)
+    {:ok, {_ip, port}} = ThousandIsland.listener_info(server)
+    {:ok, socket} = :gen_tcp.connect({127, 0, 0, 1}, port, [:binary, active: false])
+    key = Base.encode64(:crypto.strong_rand_bytes(16))
+
+    request =
+      "GET /derp HTTP/1.1\r\nHost: localhost\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n" <>
+        "Sec-WebSocket-Version: 13\r\nSec-WebSocket-Key: #{key}\r\n" <>
+        "Sec-WebSocket-Protocol: derp\r\n\r\n"
+
+    info = %ClientInfo{version: 2, can_ack_pings: true, app_name: "ws-pipelined"}
+    {:ok, client_info} = Handshake.client_info_frame(client_private, server_public, info)
+    packet = IO.iodata_to_binary(Frame.encode(:send_packet, [destination, payload]))
+
+    # The first packet exactly consumes the burst, which is sized for one
+    # maximum DERP frame, so the second one has to wait.
+    :ok =
+      :gen_tcp.send(
+        socket,
+        request <>
+          websocket_client_frame(IO.iodata_to_binary(client_info)) <>
+          websocket_client_frame(packet) <> websocket_client_frame(packet)
+      )
+
+    assert_receive {:handler_event, handler, {:authenticated, _key, %ClientInfo{}}}, 2_000
+    monitor = Process.monitor(handler)
+
+    assert_receive {:handler_event, ^handler,
+                    {:client_message, {:send_packet, ^destination, ^payload}}},
+                   2_000
+
+    assert_eventually(fn -> Manual.pending_timer_count() == 2 end)
+    refute_received {:DOWN, ^monitor, :process, ^handler, _reason}
+    assert Process.alive?(handler)
+
+    # Paced, and still answering: a drain close closes it without the clock
+    # ever reaching the pace deadline.
+    send(handler, {:derpex_drain_close, make_ref()})
+    assert_receive {:DOWN, ^monitor, :process, ^handler, _reason}, 100
+    :gen_tcp.close(socket)
+  end
+
   defp connect_websocket(port, server_public, client_private) do
     {:ok, socket} = :gen_tcp.connect({127, 0, 0, 1}, port, [:binary, active: false])
     key = Base.encode64(:crypto.strong_rand_bytes(16))

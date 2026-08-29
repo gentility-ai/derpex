@@ -361,8 +361,9 @@ defmodule Derpex.Listener.Handler do
       {:ok, state} ->
         {:continue, state}
 
-      {:pace, delay, state, pending} ->
-        {:continue, pace(state, delay, pending), {:continue, :derpex_pause_reads}}
+      {:pace, delay, state, pending_actions, pending_events} ->
+        {:continue, pace(state, delay, pending_actions, pending_events),
+         {:continue, :derpex_pause_reads}}
 
       {:error, reason, state} ->
         close_or_error(reason, state)
@@ -390,7 +391,7 @@ defmodule Derpex.Listener.Handler do
   defp close_after_actions(socket, state, actions) do
     case execute_actions(socket, state, actions) do
       {:ok, state} -> {:close, state}
-      {:pace, _delay, state, _pending} -> {:close, state}
+      {:pace, _delay, state, _pending_actions, _pending_events} -> {:close, state}
       {:error, reason, state} -> {:error, reason, state}
     end
   end
@@ -426,8 +427,8 @@ defmodule Derpex.Listener.Handler do
     end
   end
 
-  defp continue_paced({:pace, delay, state, actions}, socket, events),
-    do: {:noreply, {socket, pace(state, delay, actions, events)}}
+  defp continue_paced({:pace, delay, state, actions, paced_events}, socket, events),
+    do: {:noreply, {socket, pace(state, delay, actions, paced_events ++ events)}}
 
   defp continue_paced({:error, {:admission, _reason}, state}, socket, _events),
     do: resume(socket, {:close, state})
@@ -476,7 +477,7 @@ defmodule Derpex.Listener.Handler do
       {:close, session, _reason, actions} ->
         case execute_actions(socket, %{state | session: session}, actions) do
           {:error, error, state} -> resume(socket, {:error, error, state})
-          {:pace, _delay, state, _pending} -> resume(socket, {:close, state})
+          {:pace, _delay, state, _actions, _events} -> resume(socket, {:close, state})
           {:ok, state} -> resume(socket, {:close, state})
         end
     end
@@ -489,7 +490,7 @@ defmodule Derpex.Listener.Handler do
   # Pacing is a state, not a pause in the code: the handler keeps answering
   # keepalives, rate updates and close requests while the client's own bytes
   # wait in the kernel buffer.
-  defp pace(state, delay_microseconds, pending_actions, pending_events \\ []) do
+  defp pace(state, delay_microseconds, pending_actions, pending_events) do
     token = make_ref()
     milliseconds = max(div(delay_microseconds + 999, 1_000), 1)
     timer = Clock.send_after(self(), {:derpex_rate_limit_ready, token}, milliseconds)
@@ -502,13 +503,26 @@ defmodule Derpex.Listener.Handler do
     Writer.write_control(state.writer, data, state.write_timeout_ms + 1_000)
   end
 
+  # Pacing carries what still has to run when the delay is over: the actions
+  # this list has left, and — when the paced action was read-ahead pipelined
+  # behind an upgrade — the WebSocket messages that arrived with it. Read-ahead
+  # is the last action a session emits, so nothing of this list waits behind
+  # those messages.
   defp execute_actions(_socket, state, []), do: {:ok, state}
 
   defp execute_actions(socket, state, [action | rest]) do
     case execute_action(socket, state, action) do
-      {:ok, state} -> execute_actions(socket, state, rest)
-      {:pace, delay_microseconds, state} -> {:pace, delay_microseconds, state, rest}
-      {:error, reason, state} -> {:error, reason, state}
+      {:ok, state} ->
+        execute_actions(socket, state, rest)
+
+      {:pace, delay_microseconds, state} ->
+        {:pace, delay_microseconds, state, rest, []}
+
+      {:pace, delay_microseconds, state, actions, events} ->
+        {:pace, delay_microseconds, state, actions ++ rest, events}
+
+      {:error, reason, state} ->
+        {:error, reason, state}
     end
   end
 
@@ -612,9 +626,14 @@ defmodule Derpex.Listener.Handler do
     {:ok, %{state | wire_mode: :websocket}}
   end
 
+  # Read-ahead is ordinary WebSocket data that happened to arrive with the
+  # upgrade request, and it can meet the rate limiter exactly as a later frame
+  # does. What waits is the session work of the frame that hit the limit and the
+  # messages decoded alongside it.
   defp execute_action(socket, state, {:websocket_data, data}) do
     case receive_websocket_data(socket, state, data) do
       {:ok, state} -> {:ok, state}
+      {:pace, _delay, _state, _actions, _events} = paced -> paced
       {:close, state} -> {:error, :websocket_closed, state}
       {:error, reason, state} -> {:error, reason, state}
     end
@@ -779,14 +798,14 @@ defmodule Derpex.Listener.Handler do
         case execute_actions(socket, %{state | session: session}, actions) do
           {:ok, state} -> process_websocket_events(socket, state, rest)
           # The messages this one arrived with wait with it.
-          {:pace, delay, state, actions} -> {:pace, delay, state, actions, rest}
+          {:pace, delay, state, actions, events} -> {:pace, delay, state, actions, events ++ rest}
           {:error, reason, state} -> close_or_error(reason, state)
         end
 
       {:close, session, _reason, actions} ->
         case execute_actions(socket, %{state | session: session}, actions) do
           {:ok, state} -> {:close, state}
-          {:pace, _delay, state, _actions} -> {:close, state}
+          {:pace, _delay, state, _actions, _events} -> {:close, state}
           {:error, reason, state} -> {:error, reason, state}
         end
     end
