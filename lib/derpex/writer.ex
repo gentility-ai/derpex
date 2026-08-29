@@ -13,6 +13,7 @@ defmodule Derpex.Writer do
   alias Derpex.Frame.Body
   alias Derpex.Metrics
   alias Derpex.Outbox.Ring
+  alias Derpex.SocketOptions
   alias Derpex.WebSocket.Frame, as: WebSocketFrame
 
   @wake_message :derpex_outbox_ready
@@ -42,9 +43,15 @@ defmodule Derpex.Writer do
   @spec attach(pid(), rings()) :: :ok | {:error, term()}
   def attach(writer, rings), do: GenServer.call(writer, {:attach, rings})
 
-  @doc "Writes bounded handshake/HTTP control data in call order."
+  @doc """
+  Writes bounded handshake/HTTP control data in call order.
+
+  The caller passes its own socket write timeout plus a margin: giving up
+  sooner than the socket does would abandon a write that is still legitimately
+  in flight, and a mesh peer is allowed thirty seconds.
+  """
   @spec write_control(pid(), iodata(), timeout()) :: :ok | {:error, term()}
-  def write_control(writer, data, timeout \\ 5_000),
+  def write_control(writer, data, timeout \\ SocketOptions.default_write_timeout_ms() + 1_000),
     do: GenServer.call(writer, {:control, data}, timeout)
 
   @doc "Switches subsequent writes to RFC 6455 binary messages."

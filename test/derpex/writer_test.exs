@@ -313,6 +313,33 @@ defmodule Derpex.WriterTest do
     assert Writer.estimated_unique_senders(writer) in 1..3
   end
 
+  defmodule SlowTransport do
+    @behaviour Derpex.Transport
+
+    @impl true
+    def send(_socket, _data) do
+      Process.sleep(6_000)
+      :ok
+    end
+
+    @impl true
+    def close(_socket), do: :ok
+
+    @impl true
+    def peername(_socket), do: {:ok, :test}
+
+    @impl true
+    def secure?(_socket), do: false
+  end
+
+  @tag timeout: 60_000
+  test "a control write waits as long as the socket is allowed to take" do
+    {:ok, writer} = Writer.start_link(owner: self(), transport: SlowTransport, socket: :socket)
+
+    mesh_timeout = Derpex.SocketOptions.mesh_write_timeout_ms()
+    assert Writer.write_control(writer, "server-info", mesh_timeout + 1_000) == :ok
+  end
+
   test "a saturated ordinary ring cannot starve the pong and disco rings" do
     {:ok, writer} =
       Writer.start_link(

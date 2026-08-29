@@ -134,6 +134,8 @@ defmodule Derpex.Listener.Handler do
         accept_limiter: accept_limiter,
         drain: drain,
         metrics: metrics,
+        write_timeout_ms:
+          Keyword.get(options, :write_timeout_ms, SocketOptions.default_write_timeout_ms()),
         mesh_write_timeout:
           Keyword.get(
             options,
@@ -222,7 +224,7 @@ defmodule Derpex.Listener.Handler do
 
     case Traffic.sample(debug.previous, debug.options) do
       {:ok, current, body} ->
-        case Writer.write_control(state.writer, encode_chunk(body)) do
+        case write_control(state, encode_chunk(body)) do
           :ok ->
             timer =
               Clock.send_after(self(), :derpex_debug_traffic_tick, debug.interval_ms)
@@ -238,7 +240,7 @@ defmodule Derpex.Listener.Handler do
         error_body = ["ss failed: ", debug_error(reason)]
         terminal = [encode_chunk(error_body), "0\r\n\r\n"]
 
-        case Writer.write_control(state.writer, terminal) do
+        case write_control(state, terminal) do
           :ok -> {:stop, {:shutdown, :debug_traffic_complete}, {socket, state}}
           {:error, write_reason} -> {:stop, {:debug_traffic_write, write_reason}, {socket, state}}
         end
@@ -307,6 +309,12 @@ defmodule Derpex.Listener.Handler do
     end
   end
 
+  # A control write may not give up before the socket does. The socket's own
+  # send timeout is two seconds, or thirty once the peer is a trusted mesh node.
+  defp write_control(state, data) do
+    Writer.write_control(state.writer, data, state.write_timeout_ms + 1_000)
+  end
+
   defp execute_actions(socket, state, actions) do
     Enum.reduce_while(actions, {:ok, state}, fn action, {:ok, state} ->
       case execute_action(socket, state, action) do
@@ -317,7 +325,7 @@ defmodule Derpex.Listener.Handler do
   end
 
   defp execute_action(_socket, state, {:send, data}) do
-    case Writer.write_control(state.writer, data) do
+    case write_control(state, data) do
       :ok -> {:ok, state}
       {:error, reason} -> {:error, {:send, reason}, state}
     end
@@ -352,10 +360,15 @@ defmodule Derpex.Listener.Handler do
   end
 
   defp execute_action(socket, state, {:authenticated, key, info, can_mesh}) do
-    if can_mesh do
-      _ignored =
-        SocketOptions.configure_mesh_write_timeout(socket, state.mesh_write_timeout)
-    end
+    state =
+      if can_mesh do
+        _ignored =
+          SocketOptions.configure_mesh_write_timeout(socket, state.mesh_write_timeout)
+
+        %{state | write_timeout_ms: state.mesh_write_timeout}
+      else
+        state
+      end
 
     case admit(state, key, info, can_mesh) do
       {:ok, {admission_context, request}} ->
