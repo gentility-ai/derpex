@@ -423,6 +423,46 @@ defmodule Derpex.Admission.GentilityTest do
     Process.exit(connection, :kill)
   end
 
+  test "a hung renewal gives its concurrency slot back at the authority deadline" do
+    parent = self()
+    node_key = node_key(59)
+
+    controller =
+      start_controller(
+        authority: fn request ->
+          if request.metadata[:renewal] do
+            send(parent, {:renewing, self()})
+            Process.sleep(:infinity)
+          else
+            {:ok, signed_lease(request.node_key, issued_at_ms: 1_000, expires_at_ms: 11_000)}
+          end
+        end,
+        max_lease_ms: 10_000,
+        max_concurrent_requests: 1,
+        authority_timeout: 50
+      )
+
+    policy = Gentility.policy(controller)
+    {:ok, context} = Gentility.authorize(request(node_key), policy)
+    [connection] = connections(1)
+    assert {:ok, ^context} = Gentility.claim(request(node_key), context, connection, policy)
+
+    Manual.advance(8_000)
+    assert_receive {:renewing, hung}, 2_000
+    monitor = Process.monitor(hung)
+
+    # The deadline kills the call and hands the slot back.
+    assert_receive {:DOWN, ^monitor, :process, ^hung, :killed}, 2_000
+    eventually(fn -> Gentility.stats(controller).active_requests == 0 end)
+    eventually(fn -> Gentility.stats(controller).renewals_in_flight == 0 end)
+
+    # A connecting node is not shed behind the abandoned renewal.
+    assert {:ok, %{gentility: %{source: :live}}} =
+             Gentility.authorize(request(node_key(60)), policy)
+
+    Process.exit(connection, :kill)
+  end
+
   test "a failed renewal keeps serving the lease until it expires" do
     parent = self()
     node_key = node_key(41)

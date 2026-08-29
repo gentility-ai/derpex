@@ -1529,11 +1529,15 @@ defmodule Derpex.Admission.Gentility do
       :ok ->
         parent = self()
         authority = state.policy.authority
+        timeout = state.policy.authority_timeout
         request = renewal_request(node_key)
 
+        # A renewal is bounded exactly like a live authorization: an authority
+        # that never answers is killed at the deadline, so it can neither hold a
+        # concurrency slot nor keep a renewal from being retried.
         {pid, monitor} =
           spawn_monitor(fn ->
-            result = invoke_authority(authority, request)
+            result = bounded_authority_answer(authority, request, timeout)
             send(parent, {__MODULE__, :renewed, self(), node_key, result})
           end)
 
@@ -1542,6 +1546,13 @@ defmodule Derpex.Admission.Gentility do
 
       {:error, :admission_overloaded} ->
         requeue_renewal(state, node_key, entry)
+    end
+  end
+
+  defp bounded_authority_answer(authority, request, timeout) do
+    case invoke_with_timeout(authority, request, timeout) do
+      {:ok, answer} -> answer
+      {:error, _unavailable} = failure -> failure
     end
   end
 
