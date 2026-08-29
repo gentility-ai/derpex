@@ -128,6 +128,7 @@ defmodule Derpex.Outbox.RingTest do
     Enum.each(1..5, fn _attempt ->
       {producer, producer_monitor} = spawn_monitor(fn -> contend(ring, parent) end)
       assert_receive {:contending, ^producer}
+      await_parked(producer)
       Process.exit(producer, :kill)
       assert_receive {:DOWN, ^producer_monitor, :process, ^producer, :killed}
     end)
@@ -221,9 +222,24 @@ defmodule Derpex.Outbox.RingTest do
   end
 
   defp contend(ring, parent) do
-    Ring.enqueue(ring, :contended)
     send(parent, {:contending, self()})
     contend_forever(ring)
+  end
+
+  # The kill has to land while the producer is inside a retry, which is where a
+  # producer spends nearly all of its time against a lock that is never
+  # released. Waiting for the parked state keeps that deterministic without
+  # depending on how long a retry takes.
+  defp await_parked(producer, attempts \\ 500)
+  defp await_parked(_producer, 0), do: :ok
+
+  defp await_parked(producer, attempts) do
+    if Process.info(producer, :status) == {:status, :waiting} do
+      :ok
+    else
+      Process.sleep(1)
+      await_parked(producer, attempts - 1)
+    end
   end
 
   defp contend_forever(ring) do
