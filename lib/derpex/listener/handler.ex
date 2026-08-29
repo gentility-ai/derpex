@@ -5,6 +5,10 @@ defmodule Derpex.Listener.Handler do
 
   require Logger
 
+  # What a paced connection may hold while it waits: one segment's worth, not a
+  # client's entire send buffer.
+  @paced_read_limit 64 * 1_024
+
   alias Derpex.AcceptLimiter
   alias Derpex.Admission
   alias Derpex.Admission.Request, as: AdmissionRequest
@@ -178,12 +182,21 @@ defmodule Derpex.Listener.Handler do
     end
   end
 
-  # While paced the socket is passive, but one message may already have been in
-  # flight. It waits with the rest of the client's bytes, whatever wire mode
-  # this connection is in.
+  # Thousand Island re-arms the socket on its way out of every handle_data, so a
+  # paced connection is handed one more segment per cycle however passive we
+  # make it in between. That is fine while it is one segment; it is not fine
+  # unbounded, so what a paced connection may hold is capped, and a client that
+  # keeps sending past the cap is closed rather than buffered.
   @impl ThousandIsland.Handler
   def handle_data(data, _socket, %{paced: paced} = state) when paced != nil do
-    {:continue, %{state | paced_data: state.paced_data <> data}, {:continue, :derpex_pause_reads}}
+    buffered = state.paced_data <> data
+
+    if byte_size(buffered) > @paced_read_limit do
+      :ok = Metrics.add(state.metrics, :paced_read_overruns, 1)
+      {:error, {:paced_read_overrun, byte_size(buffered)}, state}
+    else
+      {:continue, %{state | paced_data: buffered}, {:continue, :derpex_pause_reads}}
+    end
   end
 
   def handle_data(data, socket, %{wire_mode: :websocket} = state) do

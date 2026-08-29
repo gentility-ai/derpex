@@ -425,6 +425,114 @@ defmodule Derpex.Listener.HandlerTest do
     :gen_tcp.close(socket)
   end
 
+  @tag :performance
+  test "a paced connection cannot be made to buffer without limit" do
+    start_supervised!({Manual, monotonic_time: 0})
+    previous_clock = Application.fetch_env!(:derpex, :clock)
+    Application.put_env(:derpex, :clock, Manual)
+    on_exit(fn -> Application.put_env(:derpex, :clock, previous_clock) end)
+
+    rate_controller =
+      start_supervised!(
+        {RateController,
+         name: nil,
+         config: %RateConfig{
+           per_client_rate_limit_bytes_per_second: 1,
+           per_client_rate_burst_bytes: RateConfig.minimum_burst()
+         }}
+      )
+
+    {server_public, server_private} = Crypto.generate_keypair()
+    {_client_public, client_private} = Crypto.generate_keypair()
+    destination = :crypto.strong_rand_bytes(32)
+    payload = :binary.copy(<<0xA5>>, 65_536)
+    parent = self()
+
+    event_handler = fn event ->
+      send(parent, {:handler_event, self(), event})
+      :ok
+    end
+
+    {:ok, server} =
+      ThousandIsland.start_link(
+        port: 0,
+        # Room for a client to keep sending: with a small kernel buffer the
+        # socket stops it long before the handler's own limit matters.
+        transport_options: [ip: {127, 0, 0, 1}, recbuf: 4 * 1_024 * 1_024],
+        num_acceptors: 1,
+        handler_module: Handler,
+        handler_options: [
+          server_private_key: Secret.wrap(server_private),
+          server_public_key: server_public,
+          event_handler: event_handler,
+          rate_controller: rate_controller
+        ]
+      )
+
+    stop_server_on_exit(server)
+    {:ok, {_ip, port}} = ThousandIsland.listener_info(server)
+    socket = connect_and_send_info(port, server_public, client_private, %ClientInfo{version: 2})
+    :ok = :inet.setopts(socket, sndbuf: 4 * 1_024 * 1_024)
+    assert_receive {:handler_event, handler, {:authenticated, _key, %ClientInfo{}}}, 2_000
+    assert {:ok, <<_type, length::unsigned-big-32>>} = :gen_tcp.recv(socket, 5, 2_000)
+    assert {:ok, _server_info} = :gen_tcp.recv(socket, length, 2_000)
+
+    packet = IO.iodata_to_binary(Frame.encode(:send_packet, [destination, payload]))
+    :ok = :gen_tcp.send(socket, packet)
+
+    assert_receive {:handler_event, ^handler,
+                    {:client_message, {:send_packet, ^destination, ^payload}}},
+                   2_000
+
+    :ok = :gen_tcp.send(socket, packet)
+    assert_eventually(fn -> Manual.pending_timer_count() == 2 end)
+
+    # A paced client that keeps sending is handed one segment per cycle by
+    # Thousand Island. Half a megabyte of it must not become half a megabyte of
+    # handler; the fault this covers retained 403 MiB in one second.
+    monitor = Process.monitor(handler)
+    # The client must not block on a server that has stopped reading: a send
+    # that times out is the backpressure working.
+    :ok = :inet.setopts(socket, send_timeout: 100)
+    junk = :binary.copy(<<0x5A>>, 64 * 1_024)
+    peak = flood_paced(socket, junk, 16, 0, handler)
+
+    assert peak < 1_048_576,
+           "a paced handler held #{div(peak, 1_024)} KiB of binaries"
+
+    # Whatever Thousand Island hands over while the socket is meant to be
+    # passive, the handler holds at most the cap.
+    {_socket, paced_state} = :sys.get_state(handler)
+    assert byte_size(paced_state.paced_data) <= 64 * 1_024
+    assert Process.alive?(handler)
+    refute_received {:DOWN, ^monitor, :process, ^handler, _reason}
+
+    :gen_tcp.close(socket)
+  end
+
+  defp flood_paced(_socket, _junk, 0, peak, _handler), do: peak
+
+  defp flood_paced(socket, junk, remaining, peak, handler) do
+    case :gen_tcp.send(socket, junk) do
+      :ok ->
+        peak = max(peak, handler_binary_bytes(handler))
+        flood_paced(socket, junk, remaining - 1, peak, handler)
+
+      {:error, _closed} ->
+        peak
+    end
+  end
+
+  defp handler_binary_bytes(handler) do
+    case Process.info(handler, :binary) do
+      {:binary, binaries} ->
+        Enum.reduce(binaries, 0, fn {_id, size, _refs}, total -> total + size end)
+
+      nil ->
+        0
+    end
+  end
+
   test "a paced WebSocket connection is paced, not crashed" do
     start_supervised!({Manual, monotonic_time: 0})
     previous_clock = Application.fetch_env!(:derpex, :clock)
