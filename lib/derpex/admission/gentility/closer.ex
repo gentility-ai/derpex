@@ -39,7 +39,7 @@ defmodule Derpex.Admission.Gentility.Closer do
   def stop(nil), do: :ok
 
   def stop(server) do
-    GenServer.stop(server, :shutdown, 1_000)
+    GenServer.stop(server, :shutdown, 500)
   catch
     :exit, _reason -> :ok
   end

@@ -266,6 +266,12 @@ that can never be encoded would otherwise block the spool and shed every
 relayed packet behind it. Every other row sharing its window is still
 exported. Any increase in that counter is an accounting loss and must alert.
 
+A spool file the relay cannot read — corrupt, truncated, replaced, or over its
+configured bounds — is moved aside as `<path>.corrupt-<timestamp>`, logged, and
+flagged by `derpex_gentility_usage_spool_load_error`; accounting then restarts
+empty. The ledger for that window is lost and the kept file is what to recover
+from, but a relay never refuses to boot over one unreadable file.
+
 `derpex_gentility_usage_dropped_rows` counts since the usage worker started, so
 a restart resets it to zero. Alert on an increase rather than an absolute
 value, and read a reset as a restart, not as recovery. Spooled batches survive

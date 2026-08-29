@@ -1022,6 +1022,47 @@ defmodule Derpex.Admission.GentilityTest do
   end
 
   @tag :tmp_dir
+  test "a corrupt usage spool is moved aside and accounting restarts empty", %{tmp_dir: tmp_dir} do
+    parent = self()
+    node_key = node_key(73)
+    spool_path = Path.join(tmp_dir, "usage.spool")
+    File.write!(spool_path, :binary.copy(<<0xEE>>, 19))
+
+    exporter = fn id, wire ->
+      send(parent, {:usage_export, id, wire})
+      :ok
+    end
+
+    log =
+      ExUnit.CaptureLog.capture_log(fn ->
+        controller =
+          start_controller(
+            authority: fn request -> {:ok, signed_lease(request.node_key)} end,
+            usage: usage_options(tmp_dir, exporter)
+          )
+
+        policy = Gentility.policy(controller)
+        assert {:ok, context} = Gentility.authorize(request(node_key), policy)
+
+        # The relay boots and keeps accounting rather than looping on the file.
+        assert Gentility.stats(controller).usage.spool_load_error
+        assert Gentility.stats(controller).usage.spool_batches == 0
+        assert Gentility.record_usage(context, 64, :accepted, policy) == :ok
+
+        Manual.advance(100)
+        assert_receive {:usage_export, _id, _wire}, 5_000
+      end)
+
+    assert log =~ "could not be loaded"
+    assert log =~ "starting empty"
+
+    # The unreadable file is kept for recovery, not deleted.
+    aside = Path.wildcard(Path.join(tmp_dir, "usage.spool.corrupt-*"))
+    assert [kept] = aside
+    assert File.read!(kept) == :binary.copy(<<0xEE>>, 19)
+  end
+
+  @tag :tmp_dir
   test "corrupt durable state fails closed without preventing startup", %{tmp_dir: tmp_dir} do
     path = Path.join(tmp_dir, "admission.cache")
     File.write!(path, "not a cache")

@@ -195,8 +195,8 @@ defmodule Derpex.Admission.Gentility.UsageWorker do
     max_batches = positive_option!(options, :max_batches, @default_max_batches)
     max_bytes = positive_option!(options, :max_bytes, @default_max_bytes)
 
-    with :ok <- validate_identity(instance_id, region_id, spool_path, exporter, owner),
-         {:ok, spool} <- UsageSpool.load(spool_path, max_batches, max_bytes) do
+    with :ok <- validate_identity(instance_id, region_id, spool_path, exporter, owner) do
+      {spool, load_error} = load_spool(spool_path, max_batches, max_bytes)
       blocked = :atomics.new(1, signed: false)
       if UsageSpool.stats(spool).batches >= max_batches, do: :atomics.put(blocked, 1, 1)
 
@@ -218,8 +218,43 @@ defmodule Derpex.Admission.Gentility.UsageWorker do
          timer_token: nil,
          export: nil,
          last_error: nil,
+         load_error: load_error,
          dropped_rows: 0
        }}
+    end
+  end
+
+  # A spool this relay cannot read is a lost ledger, not a reason to refuse to
+  # relay: the file is moved aside so it can be recovered by hand, the loss is
+  # counted and logged, and accounting restarts empty. Refusing to boot would
+  # turn one corrupt file into an outage that only an operator can end.
+  defp load_spool(path, max_batches, max_bytes) do
+    case UsageSpool.load(path, max_batches, max_bytes) do
+      {:ok, spool} ->
+        {spool, nil}
+
+      {:error, reason} ->
+        Logger.warning(
+          "gentility usage spool at #{path} could not be loaded: #{inspect(reason)}; " <>
+            "moving it aside and starting empty"
+        )
+
+        set_aside(path)
+        {:ok, spool} = UsageSpool.load(nil, max_batches, max_bytes)
+        {%{spool | path: path}, reason}
+    end
+  end
+
+  defp set_aside(path) do
+    aside = "#{path}.corrupt-#{System.system_time(:millisecond)}"
+
+    case File.rename(path, aside) do
+      :ok ->
+        :ok
+
+      {:error, reason} ->
+        Logger.warning("gentility could not move #{path} aside: #{inspect(reason)}")
+        :ok
     end
   end
 
@@ -421,6 +456,7 @@ defmodule Derpex.Admission.Gentility.UsageWorker do
       spool_bytes: spool.bytes,
       exporting?: not is_nil(state.export),
       dropped_rows: state.dropped_rows,
+      spool_load_error: state.load_error != nil,
       last_error: state.last_error
     }
 
@@ -435,6 +471,7 @@ defmodule Derpex.Admission.Gentility.UsageWorker do
       spool_bytes: 0,
       exporting?: false,
       dropped_rows: 0,
+      spool_load_error: false,
       last_error: :usage_unavailable
     }
   end

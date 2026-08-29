@@ -64,7 +64,7 @@ defmodule Derpex.Admission.Gentility do
     :other
   ]
   @close_peer_causes [:expiry, :revocation, :eviction, :key_rotation]
-  @cache_write_timeout_ms 2_000
+  @cache_write_timeout_ms 1_500
   @budget_prune_chunk 1_000
   @reverify_chunk 1_000
   defmodule Policy do

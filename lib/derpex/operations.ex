@@ -314,7 +314,8 @@ defmodule Derpex.Operations do
       blocked?: "derpex_gentility_usage_blocked",
       shed_total: "derpex_gentility_usage_shed_total",
       exporting?: "derpex_gentility_usage_exporting",
-      dropped_rows: "derpex_gentility_usage_dropped_rows"
+      dropped_rows: "derpex_gentility_usage_dropped_rows",
+      spool_load_error: "derpex_gentility_usage_spool_load_error"
     }
 
     merge_values(metrics, usage, names)
