@@ -18,7 +18,12 @@ defmodule Derpex.Connection do
   alias Derpex.ServerInfo
 
   @handshake_timeout 10_000
-  @max_client_info_length 256 * 1_024
+
+  # The pinned Go server accepts a client-info frame up to 256 KiB
+  # (`recvClientKey`). Real ClientInfo is under 200 bytes, so DERPEX caps the
+  # pre-authentication frame at 16 KiB. Recorded as a compatibility exception
+  # in PLAN.md Section 2.3.
+  @max_client_info_length 16 * 1_024
 
   @derive {Inspect, except: [:private_key, :mesh_key]}
   defstruct [

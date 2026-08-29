@@ -97,6 +97,11 @@ so they are not implemented by accident:
   clear error. No setec client is implemented.
 - `/debug/set-mutex-profile-fraction` is Go-runtime-specific and is
   `implementation-specific` in the inventory.
+- The pinned Go `recvClientKey` accepts an unauthenticated `ClientInfo` frame
+  of up to 256 KiB. DERPEX caps it at 16 KiB, because a real `ClientInfo`
+  payload is under 200 bytes and the frame is read before the peer is
+  authenticated. A conforming client is never affected; an oversize frame is
+  closed at its header instead of after its body.
 
 ### 2.4 Compatibility precedence
 

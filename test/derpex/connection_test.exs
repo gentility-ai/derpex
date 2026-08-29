@@ -218,6 +218,21 @@ defmodule Derpex.ConnectionTest do
     assert state.decoder.fragments == []
   end
 
+  test "closes on a client-info frame above the pre-authentication cap" do
+    {_server_public, server_private} = Crypto.generate_keypair()
+    {:ok, state, _actions} = Connection.new(server_private)
+
+    at_cap = Frame.encode_header(Frame.type(:client_info), 16 * 1_024)
+    assert {:ok, _state, []} = Connection.receive_data(state, IO.iodata_to_binary(at_cap))
+
+    above_cap = Frame.encode_header(Frame.type(:client_info), 17 * 1_024)
+
+    assert {:close, closed, {:frame_too_large, 17_408, 16_384}, []} =
+             Connection.receive_data(state, IO.iodata_to_binary(above_cap))
+
+    assert Connection.info(closed).phase == :closed
+  end
+
   test "keeps the server private key and mesh key out of inspected state" do
     {_server_public, server_private} = Crypto.generate_keypair()
     mesh_key = :crypto.strong_rand_bytes(32)
