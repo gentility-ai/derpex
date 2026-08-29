@@ -57,12 +57,15 @@ defmodule Derpex.Outbox.Ring do
   @doc "Creates a ring owned by the calling process."
   @spec new(pos_integer(), keyword()) :: t()
   def new(capacity, options \\ []) when is_integer(capacity) and capacity > 0 do
+    # Every read and write happens under the ring lock, so decorated
+    # concurrency options would only buy per-scheduler structures that cost
+    # tens of kilobytes per connection and are never contended.
     table =
       :ets.new(__MODULE__, [
         :set,
         :public,
-        read_concurrency: true,
-        write_concurrency: true
+        read_concurrency: false,
+        write_concurrency: false
       ])
 
     true = :ets.insert(table, for(index <- 0..(capacity - 1), do: {index, 0, 0, nil}))
@@ -154,6 +157,10 @@ defmodule Derpex.Outbox.Ring do
         :busy
     end
   end
+
+  @doc "Returns the ring table's memory footprint in machine words."
+  @spec memory_words(t()) :: non_neg_integer()
+  def memory_words(%__MODULE__{} = ring), do: :ets.info(ring.table, :memory)
 
   @doc "Closes the ring and releases every retained item. Idempotent."
   @spec close(t()) :: :ok | :busy

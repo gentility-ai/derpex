@@ -226,6 +226,14 @@ defmodule Derpex.Outbox.RingTest do
     assert_stale_producer_recovery(:after_publish, {:ok, :packet})
   end
 
+  test "an idle ring costs a bounded amount of table memory" do
+    ring = Ring.new(32)
+
+    # Every access is serialised by the ring lock, so the table needs none of
+    # the per-scheduler structures that decorated concurrency options allocate.
+    assert Ring.memory_words(ring) < 4_096
+  end
+
   test "close is idempotent and clears every retained reference" do
     ring = Ring.new(2)
     assert Ring.enqueue(ring, :first) == {:ok, :wake}

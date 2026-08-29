@@ -91,6 +91,7 @@ defmodule Derpex.Bench.Relay do
 
     flows = Enum.map(options.sizes, &run_flow(&1, options))
     soak = run_slow_client_soak(options)
+    idle = measure_idle_connection(options)
 
     :erlang.garbage_collect()
     memory_after = :erlang.memory(:total)
@@ -108,6 +109,7 @@ defmodule Derpex.Bench.Relay do
       },
       "relay_flows" => flows,
       "slow_client_isolation" => soak,
+      "idle_connection" => idle,
       "beam_total_memory_before_bytes" => memory_before,
       "beam_total_memory_after_bytes" => memory_after,
       "beam_total_memory_delta_bytes" => memory_after - memory_before,
@@ -246,6 +248,39 @@ defmodule Derpex.Bench.Relay do
       stop_destination(slow_writer, slow_rings, slow_destination)
       stop_destination(fast_writer, fast_rings, fast_destination)
     end
+  end
+
+  # What one connected, silent client costs: four ring tables, their atomics,
+  # and the writer process.
+  defp measure_idle_connection(options) do
+    :erlang.garbage_collect()
+    before_bytes = :erlang.memory(:total)
+    connections = 64
+
+    started =
+      Enum.map(1..connections, fn _index ->
+        start_destination(Transport.new(0), options.queue_depth)
+      end)
+
+    :erlang.garbage_collect()
+    after_bytes = :erlang.memory(:total)
+
+    ring_words =
+      started
+      |> Enum.flat_map(fn {_writer, rings, _destination} -> Map.values(rings) end)
+      |> Enum.map(&Ring.memory_words/1)
+      |> Enum.sum()
+
+    Enum.each(started, fn {writer, rings, destination} ->
+      stop_destination(writer, rings, destination)
+    end)
+
+    %{
+      "connections" => connections,
+      "bytes_per_idle_connection" => div(after_bytes - before_bytes, connections),
+      "ring_table_bytes_per_idle_connection" =>
+        div(ring_words * :erlang.system_info(:wordsize), connections)
+    }
   end
 
   defp start_destination(socket, queue_depth) do
