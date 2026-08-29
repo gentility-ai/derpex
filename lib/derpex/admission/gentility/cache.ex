@@ -75,27 +75,36 @@ defmodule Derpex.Admission.Gentility.Cache do
   # A journal is read best-effort: it is a tail of records appended one at a
   # time, so a torn final record after a crash costs that record and nothing
   # else. Every record is verified before it is trusted.
+  #
+  # When there are more records than the bound allows, the *newest* are the ones
+  # kept: the in-memory table evicts the oldest revocation when it is full, so
+  # recovering the oldest would resurrect exactly the nodes the running relay had
+  # already decided it could forget.
   defp load_journal(path, max_revocations) do
     journal = journal_path(path)
     maximum = max_revocations * (4 + @max_record_size) + 64
 
     with :ok <- readable(journal, maximum),
          {:ok, <<@journal_magic, @version::16, rest::binary>>} <- File.read(journal) do
-      journal_records(rest, max_revocations, [])
+      rest |> newest_records(:queue.new(), 0, max_revocations) |> :queue.to_list()
     else
       _unreadable -> []
     end
   end
 
-  defp journal_records(_data, 0, records), do: Enum.reverse(records)
-
-  defp journal_records(<<size::32, rest::binary>>, remaining, records)
-       when size <= @max_record_size and byte_size(rest) >= size do
+  defp newest_records(<<size::32, rest::binary>>, records, held, maximum)
+       when size <= @max_record_size and byte_size(rest) >= size and maximum > 0 do
     <<record::binary-size(^size), rest::binary>> = rest
-    journal_records(rest, remaining - 1, [record | records])
+
+    {records, held} =
+      if held < maximum,
+        do: {:queue.in(record, records), held + 1},
+        else: {:queue.in(record, :queue.drop(records)), held}
+
+    newest_records(rest, records, held, maximum)
   end
 
-  defp journal_records(_data, _remaining, records), do: Enum.reverse(records)
+  defp newest_records(_data, records, _held, _maximum), do: records
 
   defp load_snapshot(path, max_leases, max_revocations) do
     case readable(path, max_bytes(max_leases, max_revocations)) do

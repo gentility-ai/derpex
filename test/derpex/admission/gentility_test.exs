@@ -1124,6 +1124,55 @@ defmodule Derpex.Admission.GentilityTest do
   end
 
   @tag :tmp_dir
+  test "a crash keeps the newest revocations, not the oldest", %{tmp_dir: tmp_dir} do
+    path = Path.join(tmp_dir, "admission.cache")
+    maximum = 20
+    count = 100
+
+    controller =
+      start_supervised!(
+        {Gentility,
+         [
+           authority: fn _request -> {:error, :unavailable} end,
+           verification_keys: %{@signing_key_id => @public_key},
+           clock: Manual,
+           max_lease_ms: 1_000,
+           max_future_skew_ms: 0,
+           max_revocations: maximum,
+           cache_path: path,
+           cache_persist_ms: 3_600_000,
+           close_peer: fn _key -> 0 end
+         ]}
+      )
+
+    for index <- 1..count do
+      assert {:ok, :applied} =
+               Gentility.revoke(controller, signed_revocation(<<index::256>>, 10, 1_000 + index))
+    end
+
+    assert Gentility.stats(controller).revocations == maximum
+
+    # A hard kill leaves only what was made durable as it went.
+    Process.exit(controller, :kill)
+
+    assert {:ok, {_leases, wires}} = Cache.load(path, 100_000, maximum)
+
+    recovered =
+      wires
+      |> Enum.map(fn wire ->
+        {:ok, %{node_key: <<index::256>>}} =
+          Contract.verify_revocation(wire, %{@signing_key_id => @public_key})
+
+        index
+      end)
+      |> Enum.sort()
+
+    # The running relay had already evicted the oldest; recovery must not bring
+    # them back in place of the revocations it actually still held.
+    assert recovered == Enum.to_list((count - maximum + 1)..count)
+  end
+
+  @tag :tmp_dir
   test "corrupt durable state fails closed without preventing startup", %{tmp_dir: tmp_dir} do
     path = Path.join(tmp_dir, "admission.cache")
     File.write!(path, "not a cache")
@@ -2227,12 +2276,12 @@ defmodule Derpex.Admission.GentilityTest do
     Enum.at(sorted, index)
   end
 
-  defp signed_revocation(node_key, revision) do
+  defp signed_revocation(node_key, revision, revoked_at_ms \\ 1_100) do
     revocation = %Revocation{
       key_id: @signing_key_id,
       node_key: node_key,
       policy_revision: revision,
-      revoked_at_ms: 1_100,
+      revoked_at_ms: revoked_at_ms,
       reason: "node-disabled"
     }
 
