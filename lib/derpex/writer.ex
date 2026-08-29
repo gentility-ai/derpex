@@ -23,7 +23,7 @@ defmodule Derpex.Writer do
   @retry_message :derpex_outbox_retry
   @retry_interval_ms 5
   @websocket_chunk_size 16 * 1_024
-  @packet_classes [:ordinary, :disco, :pong]
+  @packet_classes [:lifecycle, :ordinary, :disco, :pong]
 
   @type rings :: %{
           ordinary: Ring.t(),
@@ -209,20 +209,12 @@ defmodule Derpex.Writer do
     %{state | retry_timer: nil}
   end
 
-  # Go's sendLoop selects at random among the ready channels, so no packet class
-  # can be starved by another. Lifecycle frames still come first: peer-gone and
-  # mesh updates are state changes, not traffic. Among the packet classes a
-  # cursor rotates, which is the deterministic form of the same fairness -
-  # picking the oldest head instead would drain a full ordinary ring before a
-  # pong that arrived after it.
+  # Go's sendLoop selects at random among the ready channels, and its lifecycle
+  # channels are in that same select: no class is preferred and none can be
+  # starved. A cursor rotating over the four classes is the deterministic form
+  # of that fairness. Picking the oldest ready head instead would drain a full
+  # ordinary ring before a pong that arrived after it.
   defp take_next(state) do
-    case Outbox.take_with_age(state.rings.lifecycle) do
-      :empty -> take_packet(state)
-      result -> {result, state}
-    end
-  end
-
-  defp take_packet(state) do
     take_in_order(state, rotation(state.packet_cursor), :empty)
   end
 
@@ -233,7 +225,7 @@ defmodule Derpex.Writer do
   defp take_in_order(state, [], outcome), do: {outcome, state}
 
   defp take_in_order(state, [class | rest], outcome) do
-    case Ring.take_with_age(Map.fetch!(state.rings, class)) do
+    case Outbox.take_with_age(Map.fetch!(state.rings, class)) do
       {:ok, _message, _age} = result ->
         {result, %{state | packet_cursor: next_cursor(class)}}
 

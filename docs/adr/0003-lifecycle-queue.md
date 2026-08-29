@@ -54,6 +54,8 @@ the only action that both bounds memory and avoids handing out a wrong view,
 and a mesh watcher reconnects and takes a fresh snapshot.
 
 Memory is bounded by the soft cap rather than by a constant: 65,536 retained
-frames is the worst case per watcher, against 32 for a ring. The ordinary case
-is a queue that is empty except while the writer is mid-drain, because a
-lifecycle frame is drained before any packet.
+frames is the worst case per watcher, against 32 for a ring. The queue takes
+its turn in the writer's rotation alongside the three packet classes, the way
+Go's select treats its lifecycle channels: a watcher with a long backlog drains
+it without holding up that connection's packets, and packets do not hold up its
+presence updates either.
