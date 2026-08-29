@@ -48,7 +48,8 @@ defmodule Derpex.Certificates.Boot do
          {:ok, provider} <- provider(mode, directory, hostname, requested, options),
          :ok <- validate_operator_certificates(issuer, provider, options),
          :ok <- validate_issuer(issuer, directory, hostname),
-         :ok <- validate_challenge_listener(provider, options) do
+         :ok <- validate_challenge_listener(provider, options),
+         :ok <- validate_directory_url(Keyword.get(options, :directory_url)) do
       {:ok, build(mode, directory, hostname, issuer, provider, requested, options)}
     end
   end
@@ -281,6 +282,42 @@ defmodule Derpex.Certificates.Boot do
        "an ACME certificate mode answers HTTP-01 challenges over plaintext HTTP, so it " <>
          "requires DERPEX_HTTP_PORT (conventionally 80) to be set and reachable from the " <>
          "certificate authority."}
+    end
+  end
+
+  # An ACME session carries the account key and every challenge it publishes,
+  # so the directory it is pinned to has to be reached over TLS. Loopback is
+  # the documented exception: it is how the fake certificate authority in the
+  # test suite is reached, and it is not reachable off the host.
+  defp validate_directory_url(nil), do: :ok
+  defp validate_directory_url(""), do: :ok
+
+  defp validate_directory_url(url) do
+    case URI.new(url) do
+      {:ok, %URI{scheme: "https", host: host}} when is_binary(host) and host != "" ->
+        :ok
+
+      {:ok, %URI{scheme: "http", host: host}} when is_binary(host) and host != "" ->
+        if loopback?(host) do
+          :ok
+        else
+          {:error,
+           "DERPEX_ACME_DIRECTORY_URL must be https, got #{inspect(url)}. Plain HTTP would " <>
+             "expose the account key and every challenge this relay publishes; only a " <>
+             "loopback authority may be reached over HTTP."}
+        end
+
+      _invalid ->
+        {:error, "DERPEX_ACME_DIRECTORY_URL must be an absolute HTTPS URL, got #{inspect(url)}"}
+    end
+  end
+
+  defp loopback?(host) do
+    case :inet.parse_address(String.to_charlist(host)) do
+      {:ok, {127, _b, _c, _d}} -> true
+      {:ok, {0, 0, 0, 0, 0, 0, 0, 1}} -> true
+      {:ok, _other} -> false
+      {:error, _reason} -> host == "localhost"
     end
   end
 

@@ -85,6 +85,31 @@ Both genuine unknowns were resolved before accepting this ADR:
   resulting CSR passes `openssl req -verify` and reports exactly
   `X509v3 Subject Alternative Name: IP Address:203.0.113.7`.
 
+## Transport rules
+
+Three rules are enforced rather than assumed, because a certificate authority
+supplies the URLs its own responses are fetched from:
+
+- Every ACME URL must be HTTPS. The single exception is a loopback host
+  (`127.0.0.0/8`, `::1`, `localhost`), which is how the fake authority in the
+  test suite is reached and is not reachable off the machine. This is checked
+  at boot for `DERPEX_ACME_DIRECTORY_URL` and again on every request.
+- Every URL after the directory must share the directory's origin — scheme,
+  host, and effective port. RFC 8555 does not require the `certificate`
+  download to live elsewhere and no supported authority puts it elsewhere, so a
+  cross-origin URL is refused rather than followed. If an authority ever needs
+  it, the refusal names the URL and the pinned origin.
+- `Derpex.HTTPClient` forces `verify_peer` and the hostname check after any
+  caller-supplied TLS options, so a caller can pin its own trust anchors but
+  cannot turn verification off.
+
+Key material held by a long-lived process is wrapped in `Derpex.Secret`: the
+manager keeps no issuer private key at all and holds only a wrapped DER copy
+for `:ssl`, and the client holds its account key and external-account HMAC key
+wrapped. `format_status/1` covers `:sys.get_state/1` and the terminate report;
+the wrapper covers what neither reaches, including the arguments an exception
+renders into a crash report.
+
 ## Consequences
 
 DERPEX owns an ACME implementation and its maintenance. That is accepted: the

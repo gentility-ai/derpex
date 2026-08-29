@@ -39,6 +39,7 @@ defmodule Derpex.ACME.Client do
   alias Derpex.ACME.Order
   alias Derpex.Certificates
   alias Derpex.Clock
+  alias Derpex.Secret
 
   @bad_nonce_suffix "badnonce"
   @nonce_attempts 3
@@ -103,13 +104,52 @@ defmodule Derpex.ACME.Client do
        directory_url: Keyword.fetch!(options, :directory_url),
        certificate_directory: Keyword.fetch!(options, :directory),
        email: Keyword.get(options, :email),
-       external_account: Keyword.get(options, :external_account),
+       external_account: wrap_external_account(Keyword.get(options, :external_account)),
        challenge: Keyword.fetch!(options, :challenge),
        http_options: Keyword.get(options, :http_options, []),
        session: nil,
        nonces: []
      }}
   end
+
+  # This process holds the ACME account key and, for GCP, the external account
+  # HMAC key. Both are long-lived credentials for the relay's identity at a
+  # certificate authority, so neither reaches `:sys.get_state/1` or a crash
+  # report.
+  @impl true
+  def format_status(status) do
+    Map.update(status, :state, nil, &redact/1)
+  end
+
+  defp redact(%{session: session} = state) do
+    %{state | session: redact_session(session)}
+    |> Map.replace(:external_account, redact_external_account(state.external_account))
+    |> Map.replace(:nonces, length(state.nonces))
+  end
+
+  defp redact(state), do: state
+
+  defp redact_session(nil), do: nil
+  defp redact_session(session), do: Map.put(session, :account_key, :redacted)
+
+  defp redact_external_account(nil), do: nil
+  defp redact_external_account(external_account), do: Map.put(external_account, :key, :redacted)
+
+  defp wrap_account_key(key), do: Secret.wrap(:public_key.der_encode(:ECPrivateKey, key))
+
+  defp reveal_account_key(key) do
+    key |> Secret.reveal() |> then(&:public_key.der_decode(:ECPrivateKey, &1))
+  end
+
+  defp wrap_external_account(nil), do: nil
+
+  defp wrap_external_account(%{kid: kid, key: key}),
+    do: %{kid: kid, key: Secret.wrap(key)}
+
+  defp reveal_external_account(nil), do: nil
+
+  defp reveal_external_account(%{kid: kid, key: key}),
+    do: %{kid: kid, key: Secret.reveal(key)}
 
   @impl true
   def handle_call(:session, _from, state) do
@@ -137,10 +177,13 @@ defmodule Derpex.ACME.Client do
     {:noreply, %{state | nonces: Enum.take([nonce | state.nonces], 8)}}
   end
 
+  # The account key lives wrapped in this long-lived process and is decoded per
+  # order, into the flight that signs with it. What `:sys.get_state/1`, the
+  # observer, and a crash report in this process can reach is the wrapper.
   defp public_session(state) do
     %{
       directory: state.session.directory,
-      account_key: state.session.account_key,
+      account_key: reveal_account_key(state.session.account_key),
       kid: state.session.kid,
       challenge: state.challenge,
       http_options: state.http_options
@@ -152,9 +195,18 @@ defmodule Derpex.ACME.Client do
   defp establish(%{session: session} = state) when not is_nil(session), do: {:ok, state}
 
   defp establish(state) do
-    with {:ok, directory} <- Directory.fetch(state.directory_url, state.http_options),
+    with {:ok, origin} <- HTTP.origin(state.directory_url),
+         state = %{state | http_options: Keyword.put(state.http_options, :origin, origin)},
+         {:ok, directory} <- Directory.fetch(state.directory_url, state.http_options),
          {:ok, account_key} <- Account.load_or_create_key(state.certificate_directory),
-         state = %{state | session: %{directory: directory, account_key: account_key, kid: nil}},
+         state = %{
+           state
+           | session: %{
+               directory: directory,
+               account_key: wrap_account_key(account_key),
+               kid: nil
+             }
+         },
          {:ok, kid, state} <- register(state) do
       {:ok, put_in(state.session.kid, kid)}
     else
@@ -166,10 +218,12 @@ defmodule Derpex.ACME.Client do
   defp register(state) do
     url = state.session.directory.new_account
 
+    account_key = reveal_account_key(state.session.account_key)
+
     payload =
       Account.payload(
-        [email: state.email, external_account: state.external_account],
-        state.session.account_key,
+        [email: state.email, external_account: reveal_external_account(state.external_account)],
+        account_key,
         url
       )
 
@@ -195,7 +249,8 @@ defmodule Derpex.ACME.Client do
   end
 
   defp send_request(state, url, payload, kid, attempt, nonce) do
-    body = JWS.encode(payload, state.session.account_key, kid: kid, nonce: nonce, url: url)
+    account_key = reveal_account_key(state.session.account_key)
+    body = JWS.encode(payload, account_key, kid: kid, nonce: nonce, url: url)
 
     case HTTP.post(url, body, state.http_options) do
       {:ok, response} ->

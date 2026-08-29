@@ -17,6 +17,21 @@ defmodule Derpex.ACME.HTTP do
   @timeout_ms 30_000
 
   @type response :: %{status: 100..999, headers: [{binary(), binary()}], body: binary()}
+  @type origin :: {binary(), binary(), :inet.port_number()}
+
+  @doc """
+  Returns the origin every later URL has to match.
+
+  A certificate authority hands out the URLs its own responses are fetched
+  from, so an authority — or anyone who can answer for it — could otherwise
+  walk the relay onto any host it names. Pinning to the origin of the directory
+  URL the operator configured means a redirected order can only ever talk back
+  to the authority that was chosen.
+  """
+  @spec origin(binary()) :: {:ok, origin()} | {:error, term()}
+  def origin(url) do
+    with {:ok, uri} <- absolute(url), do: {:ok, {uri.scheme, uri.host, port(uri)}}
+  end
 
   @doc "Performs the directory GET."
   @spec get(binary(), keyword()) :: {:ok, response()} | {:error, term()}
@@ -62,14 +77,20 @@ defmodule Derpex.ACME.HTTP do
   def problem(response) do
     with {:ok, fields} <- decode(response),
          type when is_binary(type) <- field(fields, "type") do
-      %{type: type, detail: field(fields, "detail")}
+      %{type: bounded(type), detail: bounded(field(fields, "detail"))}
     else
       _not_a_problem_document -> nil
     end
   end
 
+  # Both members are attacker-influenced text that reaches a log line, so
+  # neither is carried at whatever length the authority chose to send.
+  defp bounded(nil), do: nil
+  defp bounded(text) when is_binary(text), do: binary_part(text, 0, min(byte_size(text), 256))
+  defp bounded(_other), do: nil
+
   defp send_request(url, options, build) do
-    with {:ok, uri} <- parse(url) do
+    with {:ok, uri} <- parse(url, options) do
       request = build.(uri, options)
 
       case HTTPClient.request(uri, request, client_options(options)) do
@@ -82,7 +103,15 @@ defmodule Derpex.ACME.HTTP do
     end
   end
 
-  defp parse(url) do
+  defp parse(url, options) do
+    with {:ok, uri} <- absolute(url),
+         :ok <- confidential(uri),
+         :ok <- same_origin(uri, Keyword.get(options, :origin)) do
+      {:ok, uri}
+    end
+  end
+
+  defp absolute(url) when is_binary(url) do
     case URI.new(url) do
       {:ok, %URI{scheme: scheme, host: host} = uri}
       when scheme in ["http", "https"] and is_binary(host) and host != "" ->
@@ -92,6 +121,45 @@ defmodule Derpex.ACME.HTTP do
         {:error, {:acme_url, url}}
     end
   end
+
+  defp absolute(url), do: {:error, {:acme_url, url}}
+
+  # ACME carries account keys and challenge material, so it is HTTPS only. The
+  # one exception is a loopback authority, which is how the fake certificate
+  # authority in the test suite is reached and is not reachable off the host.
+  defp confidential(%URI{scheme: "https"}), do: :ok
+
+  defp confidential(%URI{scheme: "http", host: host} = uri) do
+    if loopback?(host), do: :ok, else: {:error, {:acme_insecure_url, URI.to_string(uri)}}
+  end
+
+  defp confidential(uri), do: {:error, {:acme_insecure_url, URI.to_string(uri)}}
+
+  defp loopback?(host) do
+    case :inet.parse_address(String.to_charlist(host)) do
+      {:ok, {127, _b, _c, _d}} -> true
+      {:ok, {0, 0, 0, 0, 0, 0, 0, 1}} -> true
+      {:ok, _other} -> false
+      {:error, _reason} -> host == "localhost"
+    end
+  end
+
+  # Every URL after the directory is one the authority supplied, including the
+  # certificate download: RFC 8555 does not require it to be elsewhere, and no
+  # authority DERPEX supports puts it elsewhere, so a cross-origin URL is
+  # refused rather than followed.
+  defp same_origin(_uri, nil), do: :ok
+
+  defp same_origin(%URI{scheme: scheme, host: host} = uri, origin) do
+    if {scheme, host, port(uri)} == origin do
+      :ok
+    else
+      {:error, {:acme_cross_origin_url, URI.to_string(uri), origin}}
+    end
+  end
+
+  defp port(%URI{port: port}) when is_integer(port), do: port
+  defp port(%URI{scheme: scheme}), do: URI.default_port(scheme)
 
   defp get_request(uri, _options) do
     [

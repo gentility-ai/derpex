@@ -43,6 +43,7 @@ defmodule Derpex.Certificates.IPManager do
   alias Derpex.Certificates
   alias Derpex.Certificates.Manual
   alias Derpex.Clock
+  alias Derpex.Secret
 
   @short_lived_profile "shortlived"
   @challenge_prefix "/.well-known/acme-challenge/"
@@ -63,6 +64,16 @@ defmodule Derpex.Certificates.IPManager do
           :private_key => tuple(),
           optional(:chain) => [binary()]
         }
+
+  @typedoc """
+  What `certificate/3` returns.
+
+  The private key an issuer supplied is deliberately absent: it is needed to
+  serve TLS and for nothing else, so it is encoded once at issuance, wrapped,
+  and handed only to `:ssl`. Nothing that asks this manager for a certificate
+  is given the key that goes with it.
+  """
+  @type served :: %{:certificate_der => binary(), optional(:chain) => [binary()]}
   @type issuer :: (binary(), binary() -> {:ok, certificate()} | {:error, term()})
   @type next_provider :: (binary() -> {:ok, term()} | {:error, term()})
   @type certs_keys :: %{cert: [binary()], key: {atom(), binary()}}
@@ -73,7 +84,7 @@ defmodule Derpex.Certificates.IPManager do
 
   @doc "Returns a certificate for the connection's local IP and optional SNI."
   @spec certificate(GenServer.server(), binary(), binary()) ::
-          {:ok, certificate() | term()} | {:error, term()}
+          {:ok, served() | term()} | {:error, term()}
   def certificate(manager, local_ip, server_name \\ "") do
     GenServer.call(manager, {:certificate, local_ip, server_name}, :infinity)
   end
@@ -263,6 +274,33 @@ defmodule Derpex.Certificates.IPManager do
     {:ok, schedule_renewal(state)}
   end
 
+  # `:sys.get_state/1`, `:observer`, and every crash report route through this,
+  # and this process holds one private key per certificate plus the key
+  # authorizations it is publishing. None of that is replaced by a summary
+  # elsewhere, so it is replaced here, once, for all of them.
+  @impl true
+  def format_status(status) do
+    Map.update(status, :state, nil, &redact/1)
+  end
+
+  defp redact(%{entries: entries, challenges: challenges} = state) do
+    %{
+      state
+      | entries: Map.new(entries, fn {subject, entry} -> {subject, redact_entry(entry)} end),
+        challenges:
+          Map.new(challenges, fn {path, {_response, owner}} -> {path, {:redacted, owner}} end)
+    }
+    |> Map.put(:issuer, :redacted)
+    |> Map.put(:next_provider, :redacted)
+  end
+
+  defp redact(state), do: state
+
+  defp redact_entry(entry), do: Map.replace(entry, :tls, redact_tls(entry.tls))
+
+  defp redact_tls(nil), do: nil
+  defp redact_tls(tls), do: Map.put(tls, :key, :redacted)
+
   # A manager that is gone is not serving a placeholder, so its subject leaves
   # the set the readiness probe and the gauge read.
   @impl true
@@ -386,7 +424,7 @@ defmodule Derpex.Certificates.IPManager do
   end
 
   defp project({:managed, entry}, :certificate), do: {:ok, entry.certificate}
-  defp project({:managed, entry}, :certs_keys), do: {:ok, entry.tls}
+  defp project({:managed, entry}, :certs_keys), do: {:ok, revealed(entry.tls)}
   defp project({:delegated, certificate}, :certificate), do: {:ok, certificate}
 
   defp project({:delegated, _certificate}, :certs_keys),
@@ -678,8 +716,15 @@ defmodule Derpex.Certificates.IPManager do
     :ok
   end
 
-  defp with_meta_certificate(tls, meta_certificate) do
-    %{cert: Certificates.append_meta_certificate(tls.cert, meta_certificate), key: tls.key}
+  # Revealed only on the way out, to `:ssl`, which needs the bytes.
+  defp revealed(%{key: {type, key}} = tls), do: %{tls | key: {type, Secret.reveal(key)}}
+
+  # Revealed only here, on its way to `:ssl`, which needs the bytes.
+  defp with_meta_certificate(%{key: {type, key}} = tls, meta_certificate) do
+    %{
+      cert: Certificates.append_meta_certificate(tls.cert, meta_certificate),
+      key: {type, Secret.reveal(key)}
+    }
   end
 
   defp load_cached_entry(state, subject) do
@@ -733,7 +778,7 @@ defmodule Derpex.Certificates.IPManager do
       {:ok, {not_before, not_after}} ->
         entry = %{
           new_entry()
-          | certificate: certificate,
+          | certificate: Map.delete(certificate, :private_key),
             tls: certs_keys_entry(certificate),
             not_before: not_before,
             not_after: not_after
@@ -753,9 +798,13 @@ defmodule Derpex.Certificates.IPManager do
   # A certificate authority returns the leaf followed by the intermediates a
   # client needs to build a path, so the whole chain is what gets served and
   # cached. A self-signed issuer returns a leaf and nothing else.
+  # The encoded key is wrapped: this map lives in the manager's state, and an
+  # exception's arguments are rendered into a crash report whatever
+  # `format_status/1` does with the state itself.
   defp certs_keys_entry(%{private_key: private_key} = certificate) do
     type = elem(private_key, 0)
-    %{cert: chain(certificate), key: {type, :public_key.der_encode(type, private_key)}}
+    key = Secret.wrap(:public_key.der_encode(type, private_key))
+    %{cert: chain(certificate), key: {type, key}}
   end
 
   defp chain(%{chain: [_leaf | _rest] = chain}), do: chain
