@@ -2,6 +2,10 @@ name: CI
 
 on:
   push:
+    # Release tags reach this workflow through release.yml's gate job, so
+    # ignoring them here keeps a tag from running the whole suite twice.
+    tags-ignore:
+      - "v*"
   pull_request:
   workflow_call:
 

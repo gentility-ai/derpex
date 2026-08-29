@@ -30,13 +30,18 @@ boots the packaged crypto NIF through the release executable.
 The release-blocking aliases are:
 
 ```text
-mix test         # unit and property tests
-mix test.system  # test/system: TLS, signals, external services
-mix test.diff    # the Go-versus-DERPEX differential oracle
-mix test.interop # official Go and Rust clients against DERPEX
-mix test.all     # every tagged gate, via --include go_interop --include rust_interop
+mix test          # unit and property tests
+mix test.system   # test/system: TLS, signals, external services
+mix test.diff     # the Go-versus-DERPEX differential oracle
+mix test.interop  # official Go and Rust clients against DERPEX
+mix test.all      # every tagged gate: system, Go interop, Rust interop
 mix release.check # mix quality + mix test.all + mix artifact.check
 ```
+
+Every test under `test/system` must carry `@moduletag :system`. That tag is
+excluded by default in `test/test_helper.exs`, so the system suite runs only
+under `mix test.system` (or `mix test.all`) and never rides along with a plain
+`mix test`.
 
 `mix test.all` and `mix test.interop` need `DERPEX_TAILSCALE_DIR` and
 `DERPEX_TAILSCALE_RS_DIR` pointing at the pinned sibling checkouts; both
@@ -72,6 +77,8 @@ whole CI workflow as a reusable workflow in a job named `gate`, and every job
 that builds, packages, or publishes an artifact declares `needs: [gate, ...]`.
 A red quality, unit, Go interop, Rust interop, or runtime-boundary job blocks
 the tag from producing a NIF archive, a GitHub release, or a runtime image.
+CI ignores `v*` tag pushes on its own trigger, so a release tag runs the suite
+once, through that gate.
 
 The `tsnet` smoke advertises DERPEX from Tailscale's own in-memory test control
 server, pins DERPEX's raw-IP TLS certificate, forces the two nodes off direct

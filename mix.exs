@@ -73,29 +73,16 @@ defmodule Derpex.MixProject do
         "cmd cargo fmt --manifest-path native/derpex_crypto/Cargo.toml -- --check",
         "cmd cargo clippy --manifest-path native/derpex_crypto/Cargo.toml --all-targets -- -D warnings"
       ],
-      "test.system": [&test_system/1],
-      "test.all": ["test --include go_interop --include rust_interop"],
+      "test.system": ["test test/system --include system"],
+      "test.all": [
+        "test --include system --include go_interop --include rust_interop"
+      ],
       "release.check": [
         "quality",
         "test.all",
         "cmd env MIX_ENV=prod mix artifact.check"
       ]
     ]
-  end
-
-  @system_test_root "test/system"
-
-  # `mix test` refuses a directory holding no `*_test.exs`, so the system suite
-  # reports an empty run instead of failing the release gate before the first
-  # system test lands.
-  defp test_system(arguments) do
-    case Path.wildcard(Path.join(@system_test_root, "**/*_test.exs")) do
-      [] ->
-        Mix.shell().info("mix test.system: no #{@system_test_root}/**/*_test.exs yet")
-
-      _files ->
-        Mix.Task.run("test", [@system_test_root | arguments])
-    end
   end
 
   defp releases do
