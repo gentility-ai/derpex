@@ -29,6 +29,15 @@ if config_env() == :prod do
         end
     end
 
+  # Pinned cmd/derper accepts TLS 1.2; DERPEX serves and dials 1.3 only unless
+  # an operator lowers the floor, and the same floor applies in both directions
+  # so a mesh dial cannot quietly be weaker than the listener.
+  tls_versions =
+    case Derpex.TLSVersion.parse(System.get_env("DERPEX_TLS_MIN_VERSION")) do
+      {:ok, versions} -> versions
+      {:error, :invalid_tls_min_version} -> raise Derpex.TLSVersion.message()
+    end
+
   # The certificate plan is resolved before anything else so a mode DERPEX
   # cannot honour is refused while the operator is still reading configuration
   # errors, not after a listener has bound :443 — and it is refused whether or
@@ -156,15 +165,19 @@ if config_env() == :prod do
           |> Enum.map(fn peer ->
             cond do
               String.starts_with?(peer, ["http://", "https://"]) ->
-                [url: peer]
+                [url: peer, tls_options: [versions: tls_versions]]
 
               true ->
                 case String.split(peer, "/", parts: 2) do
                   [host] when host != "" ->
-                    [url: "https://#{host}/derp"]
+                    [url: "https://#{host}/derp", tls_options: [versions: tls_versions]]
 
                   [host, dial_host] when host != "" and dial_host != "" ->
-                    [url: "https://#{host}/derp", dial_host: dial_host]
+                    [
+                      url: "https://#{host}/derp",
+                      dial_host: dial_host,
+                      tls_options: [versions: tls_versions]
+                    ]
 
                   _invalid ->
                     raise "DERPEX_MESH_WITH contains an invalid peer: #{inspect(peer)}"
@@ -404,7 +417,7 @@ if config_env() == :prod do
               write_timeout_ms: tcp_write_timeout_ms
             ],
             transport_options: [
-              versions: [:"tlsv1.3"],
+              versions: tls_versions,
               alpn_preferred_protocols: ["http/1.1"]
             ]
           ]
@@ -422,7 +435,7 @@ if config_env() == :prod do
             transport_options: [
               certfile: certfile,
               keyfile: keyfile,
-              versions: [:"tlsv1.3"],
+              versions: tls_versions,
               alpn_preferred_protocols: ["http/1.1"]
             ]
           ]

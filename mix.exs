@@ -4,6 +4,13 @@ defmodule Derpex.MixProject do
   @version "0.1.0-dev"
   @source_url "https://github.com/jtippett/derpex"
 
+  # Kept byte-identical to the "Smoke relay benchmark harness" step in
+  # .github/workflows/ci.yml; test/release_gate_test.exs compares the two.
+  @benchmark_smoke "--packets 2000 --sizes 64,1200 --slow-packets 2000 --slow-delay-ms 50 " <>
+                     "--fail-on queue_replacements=0 " <>
+                     "--fail-on memory_delta_bytes=1048576 " <>
+                     "--fail-on latency_p99_us=25000"
+
   def project do
     [
       app: :derpex,
@@ -79,9 +86,14 @@ defmodule Derpex.MixProject do
       "test.all": [
         "test --include system --include go_interop --include rust_interop"
       ],
+      # The local form of the release gate, so it runs what CI runs. The Rust
+      # crate's own suite and the benchmark thresholds were workflow-only, which
+      # made a pull request the first place a developer met them.
       "release.check": [
         "quality",
         "test.all",
+        "cmd cargo test --locked --manifest-path native/derpex_crypto/Cargo.toml --all-targets",
+        "cmd env MIX_ENV=dev mix bench -- " <> @benchmark_smoke,
         "cmd env MIX_ENV=prod mix artifact.check"
       ]
     ]

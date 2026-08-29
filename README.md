@@ -35,7 +35,8 @@ mix test.system   # test/system: TLS, signals, external services
 mix test.diff     # the Go-versus-DERPEX differential oracle
 mix test.interop  # official Go and Rust clients against DERPEX
 mix test.all      # every tagged gate: system, Go interop, Rust interop
-mix release.check # mix quality + mix test.all + mix artifact.check
+mix release.check # quality, test.all, cargo test, the benchmark thresholds,
+                  # and artifact.check: the release gate, run locally
 ```
 
 Every test under `test/system` must carry `@moduletag :system`. That tag is
@@ -71,6 +72,19 @@ DERPEX_TAILSCALE_RS_DIR=../tailscale-rs DERPEX_RUST_INTEROP=1 \
 
 With `DERPEX_TAILSCALE_DIR` set, `mix test.diff` runs just the normalized
 semantic comparison against the pinned Go server.
+
+`mix release.check` runs what CI runs, including the two gates that used to
+live only in the workflow: the Rust crate's own `cargo test --locked` and the
+relay benchmark under CI's three `--fail-on` thresholds. A threshold a
+developer first meets on a pull request is a threshold that was not a local
+gate.
+
+Every CI job runs on every pull request; there is no reduced pull-request
+subset. Two schedules sit outside that: `.github/workflows/benchmark.yml` runs
+the long relay and slow-client soak weekly, and `.github/workflows/nightly.yml`
+runs nightly what is too slow for a pull request — the property suite at
+`PROPERTY_RUNS=5000`, a ten-times-longer benchmark against the same
+thresholds, and `mix test.system`.
 
 Releases cannot skip any of that. `.github/workflows/release.yml` calls the
 whole CI workflow as a reusable workflow in a job named `gate`, and every job
@@ -185,6 +199,14 @@ clients that send SNI and clients that do not.
 The certificate plan is resolved before anything else starts, whether or not
 `DERPEX_LISTEN_PORT` is set, so a configuration mistake stops the boot rather
 than surfacing later.
+
+DERPEX serves and dials TLS 1.3 only. Pinned `cmd/derper` sets a TLS 1.2
+minimum, so this is a deliberate hardening and not parity: a conforming
+TLS-1.2-only client is refused. `DERPEX_TLS_MIN_VERSION=1.2` restores the
+upstream floor, and `1.3` (the default) keeps it raised; nothing else is
+accepted. The setting reaches both directions — the TLS listener and every
+mesh peer the relay dials — so a mesh connection cannot end up weaker than the
+listener it came from.
 
 The server identity is created atomically with mode `0600` and is stable across
 restarts. The UDP STUN service listens on port `3478` by default whenever the

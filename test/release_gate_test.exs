@@ -4,6 +4,7 @@ defmodule Derpex.ReleaseGateTest do
   @root Path.expand("..", __DIR__)
   @ci Path.join(@root, ".github/workflows/ci.yml")
   @release Path.join(@root, ".github/workflows/release.yml")
+  @nightly Path.join(@root, ".github/workflows/nightly.yml")
   @test_helper Path.join(@root, "test/test_helper.exs")
   @manifest_step "Require a published checksum manifest on a stable tag"
   @manifest "checksum-Elixir.Derpex.Crypto.Native.exs"
@@ -40,6 +41,60 @@ defmodule Derpex.ReleaseGateTest do
       assert "test.all" in steps
       assert Enum.any?(steps, &(&1 =~ "artifact.check"))
       assert Enum.any?(steps, &(&1 =~ "MIX_ENV=prod"))
+    end
+
+    test "release.check runs the Rust crate's own suite as CI does", %{aliases: aliases} do
+      step =
+        aliases
+        |> Keyword.fetch!(:"release.check")
+        |> Enum.find(&(&1 =~ "cargo test"))
+
+      assert step, "release.check does not run cargo test"
+      assert step =~ "--locked"
+      assert step =~ "--manifest-path native/derpex_crypto/Cargo.toml"
+
+      workflow = Map.fetch!(jobs(@ci), "quality")
+      assert workflow =~ String.replace_prefix(step, "cmd ", "")
+    end
+
+    test "release.check enforces the benchmark thresholds CI enforces", %{aliases: aliases} do
+      step =
+        aliases
+        |> Keyword.fetch!(:"release.check")
+        |> Enum.find(&(&1 =~ "mix bench"))
+
+      assert step, "release.check does not run the benchmark"
+
+      thresholds = fail_on(step)
+      refute thresholds == [], "the benchmark step sets no --fail-on threshold"
+
+      assert thresholds == fail_on(Map.fetch!(jobs(@ci), "quality")),
+             "release.check and the CI benchmark smoke disagree on --fail-on thresholds"
+    end
+  end
+
+  describe "nightly workflow" do
+    setup do
+      {:ok, nightly: File.read!(@nightly), job: Map.fetch!(jobs(@nightly), "deep")}
+    end
+
+    test "runs on a schedule rather than on pushes", %{nightly: nightly} do
+      assert nightly =~ ~r/^  schedule:$/m
+      assert nightly =~ ~r/^    - cron: "[^"]+"$/m
+      refute nightly =~ ~r/^  (push|pull_request):$/m
+    end
+
+    test "widens the property search well past a pull request's", %{job: job} do
+      assert job =~ ~r/PROPERTY_RUNS: "5000"/
+      assert job =~ ~r/run: mix test test\/property$/m
+    end
+
+    test "runs the benchmark against the same thresholds CI uses", %{job: job} do
+      assert fail_on(job) == fail_on(Map.fetch!(jobs(@ci), "quality"))
+    end
+
+    test "runs the system suite", %{job: job} do
+      assert job =~ ~r/run: mix test\.system$/m
     end
   end
 
@@ -151,6 +206,16 @@ defmodule Derpex.ReleaseGateTest do
       assert needs(parsed["inline"]) == ["gate", "version"]
       assert needs(parsed["block"]) == ["gate", "version"]
     end
+  end
+
+  # Every `--fail-on NAME=VALUE` in a block of text, sorted, so a Mix alias and
+  # a workflow step can be compared without depending on their argument order
+  # or on how each one wraps its lines.
+  defp fail_on(text) do
+    ~r/--fail-on\s+([a-z_]+=\d+)/
+    |> Regex.scan(text)
+    |> Enum.map(&List.last/1)
+    |> Enum.sort()
   end
 
   # Runs one workflow step's shell body the way Actions does (`bash -e`), in a
