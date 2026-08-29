@@ -4,6 +4,7 @@ defmodule Derpex.Admission.Gentility.ContractTest do
   alias Derpex.Admission.Gentility.Contract
   alias Derpex.Admission.Gentility.Lease
   alias Derpex.Admission.Gentility.Revocation
+  alias Derpex.Admission.Gentility.Signer
 
   @private_key Base.decode16!(
                  "1010101010101010101010101010101010101010101010101010101010101010",
@@ -14,7 +15,7 @@ defmodule Derpex.Admission.Gentility.ContractTest do
   test "lease records are deterministic, authenticated, and round-trip every allocation" do
     lease = lease()
 
-    assert {:ok, signed} = Contract.sign_lease(lease, @private_key)
+    assert {:ok, signed} = Signer.sign_lease(lease, @private_key)
     assert byte_size(signed) == 240
 
     assert :crypto.hash(:sha256, signed) ==
@@ -30,7 +31,7 @@ defmodule Derpex.Admission.Gentility.ContractTest do
   end
 
   test "lease verification rejects tampering, unknown keys, bad time windows, and versions" do
-    assert {:ok, signed} = Contract.sign_lease(lease(), @private_key)
+    assert {:ok, signed} = Signer.sign_lease(lease(), @private_key)
     <<first, rest::binary>> = signed
     tampered = <<Bitwise.bxor(first, 1), rest::binary>>
 
@@ -64,7 +65,7 @@ defmodule Derpex.Admission.Gentility.ContractTest do
       reason: "node-disabled"
     }
 
-    assert {:ok, signed} = Contract.sign_revocation(revocation, @private_key)
+    assert {:ok, signed} = Signer.sign_revocation(revocation, @private_key)
 
     assert :crypto.hash(:sha256, signed) ==
              Base.decode16!(
@@ -82,10 +83,10 @@ defmodule Derpex.Admission.Gentility.ContractTest do
 
   test "rejects invalid field ranges before signing" do
     invalid = %{lease() | node_key: "short"}
-    assert Contract.sign_lease(invalid, @private_key) == {:error, {:invalid_field, :node_key}}
+    assert Signer.sign_lease(invalid, @private_key) == {:error, {:invalid_field, :node_key}}
 
     invalid = %{lease() | expires_at_ms: 1_000}
-    assert Contract.sign_lease(invalid, @private_key) == {:error, :invalid_lease_time_range}
+    assert Signer.sign_lease(invalid, @private_key) == {:error, :invalid_lease_time_range}
   end
 
   defp lease do

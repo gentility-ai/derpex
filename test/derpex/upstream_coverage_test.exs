@@ -54,9 +54,11 @@ defmodule Derpex.UpstreamCoverageTest do
     end
   end
 
-  test "no row is release-blocking" do
-    pending = rows() |> Enum.filter(&(&1.disposition == "pending")) |> Enum.map(& &1.name)
-    assert pending == []
+  test "only the prober plan and the next-provider seam are pending" do
+    pending =
+      rows() |> Enum.filter(&(&1.disposition == "pending")) |> Enum.map(& &1.name) |> Enum.sort()
+
+    assert pending == ["TestDerpProber", "TestIPCertManagerNextProvider"]
   end
 
   test "the send-freeze row points at the system test that ports it" do

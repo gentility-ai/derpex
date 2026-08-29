@@ -124,12 +124,8 @@ defmodule Derpex.UpstreamInventory do
       "ported all challenge validity cases in test/derpex/http1_test.exs",
     {"cmd/derper/ipcert_test.go", "TestIPCertManager"} =>
       "ported IPv4/IPv6 issuance with the shortlived profile, SNI checks, HTTP-01 routing and disk-cache reuse in test/derpex/certificates/ip_manager_test.exs, driven end to end against the ported fake certificate authority in test/derpex/acme/client_test.exs",
-    {"cmd/derper/ipcert_test.go", "TestIPCertManagerNextProvider"} =>
-      "ported DNS-SNI delegation without creating an IP certificate order in test/derpex/certificates/ip_manager_test.exs; a configured DNS hostname is ordered by the same manager rather than handed on",
     {"cmd/derper/ipcert_test.go", "TestCertModeIPCertsGating"} =>
       "ported certificate-mode/IP-host gating in test/derpex/certificates/mode_test.exs and the boot-time refusal of unimplemented modes in test/derpex/certificates/boot_test.exs",
-    {"prober/derp_test.go", "TestDerpProber"} =>
-      "ported dynamic region filtering, probe inventory, and add/remove reconciliation in test/derpex/prober_test.exs",
     {"prober/derp_test.go", "Test_packetsForSize"} =>
       "ported exact packet counts, total sizes, per-call randomness, and large-payload caching in test/derpex/prober_test.exs"
   }
@@ -169,7 +165,10 @@ defmodule Derpex.UpstreamInventory do
   }
 
   # Rows that stay release-blocking until the work they name exists.
-  @pending %{}
+  @pending %{
+    {"cmd/derper/ipcert_test.go", "TestIPCertManagerNextProvider"} =>
+      "upstream's IP certificate manager delegates a DNS hello to a separate autocert provider; DERPEX has no second provider to delegate to, because one manager orders both IP and hostname certificates, so the `:next_provider` seam has no production caller and this row stays open even though a DNS hello creating no IP order is covered in test/derpex/certificates/ip_manager_test.exs"
+  }
 
   # A row about a Go implementation detail. The behavior it protects is still
   # gated here, so each of these cites the artifact that gates it.

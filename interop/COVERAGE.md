@@ -23,10 +23,10 @@ a repository path that exists, and every `ported`, `black-box`, and
 | State | Count |
 | --- | ---: |
 | Total | 69 |
-| Ported | 54 |
+| Ported | 52 |
 | Black-box | 9 |
 | Differential | 2 |
-| Pending (release-blocking) | 0 |
+| Pending (release-blocking) | 2 |
 | Implementation-specific | 4 |
 
 | Area | Upstream test | Source | Disposition | Gate/notes |
@@ -93,9 +93,9 @@ a repository path that exists, and every `ported`, `black-box`, and
 | cmd/derper | `TestDeps` | `cmd/derper/derper_test.go:101` | `implementation-specific` | Go dependency graph; the release's runtime application closure is held to an allowlist by scripts/dependency_closure.exs, which mix quality runs |
 | cmd/derper | `TestTemplate` | `cmd/derper/derper_test.go:116` | `ported` | ported conditional abuse, policy, disabled-status, and debug homepage sections in test/derpex/home_page_test.exs |
 | cmd/derper | `TestIPCertManager` | `cmd/derper/ipcert_test.go:328` | `ported` | ported IPv4/IPv6 issuance with the shortlived profile, SNI checks, HTTP-01 routing and disk-cache reuse in test/derpex/certificates/ip_manager_test.exs, driven end to end against the ported fake certificate authority in test/derpex/acme/client_test.exs |
-| cmd/derper | `TestIPCertManagerNextProvider` | `cmd/derper/ipcert_test.go:426` | `ported` | ported DNS-SNI delegation without creating an IP certificate order in test/derpex/certificates/ip_manager_test.exs; a configured DNS hostname is ordered by the same manager rather than handed on |
+| cmd/derper | `TestIPCertManagerNextProvider` | `cmd/derper/ipcert_test.go:426` | `pending` | upstream's IP certificate manager delegates a DNS hello to a separate autocert provider; DERPEX has no second provider to delegate to, because one manager orders both IP and hostname certificates, so the `:next_provider` seam has no production caller and this row stays open even though a DNS hello creating no IP order is covered in test/derpex/certificates/ip_manager_test.exs |
 | cmd/derper | `TestCertModeIPCertsGating` | `cmd/derper/ipcert_test.go:448` | `ported` | ported certificate-mode/IP-host gating in test/derpex/certificates/mode_test.exs and the boot-time refusal of unimplemented modes in test/derpex/certificates/boot_test.exs |
-| DERP prober | `TestDerpProber` | `prober/derp_test.go:25` | `ported` | ported dynamic region filtering, probe inventory, and add/remove reconciliation in test/derpex/prober_test.exs |
+| DERP prober | `TestDerpProber` | `prober/derp_test.go:25` | `pending` | release-blocking mapping not yet implemented |
 | DERP prober | `TestRunDerpProbeNodePair` | `prober/derp_test.go:146` | `black-box` | upstream 100 MB transfer and 30-packet in-flight bound run through DERPEX with unchanged official clients in test/interop/go_client_test.exs |
 | DERP prober | `Test_packetsForSize` | `prober/derp_test.go:202` | `ported` | ported exact packet counts, total sizes, per-call randomness, and large-payload caching in test/derpex/prober_test.exs |
 | XDP | `TestXDP` | `derp/xdp/xdp_linux_test.go:274` | `implementation-specific` | separate Linux XDP path is not in the cmd/derper request path; the pinned oracle job in .github/workflows/ci.yml still runs upstream's own XDP package |
