@@ -17,6 +17,7 @@ defmodule Derpex.ListenerSupervisor do
   alias Derpex.Crypto
   alias Derpex.Listener.Handler
   alias Derpex.Listener.Transports
+  alias Derpex.MetaCertificate
   alias Derpex.Secret
   alias Derpex.SocketOptions
 
@@ -182,11 +183,19 @@ defmodule Derpex.ListenerSupervisor do
     end
   end
 
+  # The metacertificate carries only the server node key, so it is generated
+  # once here and shared by the bound options and every SNI answer. Generating
+  # an RSA key pair per hello would cost more than the DERP handshake it
+  # advertises.
   defp managed_certificate_options(manager, hostname, server_public_key) do
-    case IPManager.certificate(manager, hostname) do
-      {:ok, certificate} ->
-        IPManager.tls_options(certificate, server_public_key) ++
-          [sni_fun: IPManager.sni_fun(manager, hostname, server_public_key)]
+    meta_certificate = MetaCertificate.generate(server_public_key)
+
+    case IPManager.certs_keys(manager, hostname, "", meta_certificate) do
+      {:ok, certs_keys} ->
+        [
+          certs_keys: [certs_keys],
+          sni_fun: IPManager.sni_fun(manager, hostname, meta_certificate)
+        ]
 
       {:error, reason} ->
         raise "could not issue an IP certificate for #{hostname}: #{inspect(reason)}"

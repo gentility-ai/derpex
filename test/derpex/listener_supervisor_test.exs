@@ -56,14 +56,60 @@ defmodule Derpex.ListenerSupervisorTest do
     assert common_name(meta_certificate) ==
              "derpkey" <> Base.encode16(server_public, case: :lower)
 
+    # One metacertificate per listener, shared by the bound options and every
+    # SNI answer: it only carries the node key, and an RSA key pair per hello
+    # would cost more than the DERP handshake it advertises.
     sni_fun = Keyword.fetch!(transport_options, :sni_fun)
-    assert [certs_keys: [%{cert: [^leaf, sni_meta_certificate]}]] = sni_fun.(~c"127.0.0.1")
+    assert [certs_keys: [%{cert: [^leaf, ^meta_certificate]}]] = sni_fun.(~c"127.0.0.1")
 
-    assert common_name(sni_meta_certificate) ==
-             "derpkey" <> Base.encode16(server_public, case: :lower)
+    # OTP reads `:undefined` as "use the listen options", which would serve the
+    # listener's certificate to a name this manager just refused. A refusal has
+    # to be `:unrecognized`, which sends an unrecognized_name alert.
+    assert sni_fun.(~c"203.0.113.9") == :unrecognized
+    assert sni_fun.(~c"derp.example.com") == :unrecognized
+  end
 
-    assert sni_fun.(~c"203.0.113.9") == :undefined
-    assert sni_fun.(~c"derp.example.com") == :undefined
+  test "a mismatched SNI reaches the client as an unrecognized_name alert" do
+    {_server_public, server_private} = Crypto.generate_keypair()
+
+    directory =
+      Path.join(System.tmp_dir!(), "derpex-listener-sni-#{System.unique_integer([:positive])}")
+
+    on_exit(fn -> File.rm_rf!(directory) end)
+
+    manager =
+      start_supervised!(
+        Supervisor.child_spec(
+          {IPManager, directory: directory, issuer: &IPManager.self_signed_issuer/2},
+          id: :sni_manager
+        )
+      )
+
+    listener = [
+      port: 0,
+      num_acceptors: 1,
+      transport_module: ThousandIsland.Transports.SSL,
+      transport_options: [ip: {127, 0, 0, 1}, versions: [:"tlsv1.3"]],
+      ip_certificate_manager: {manager, "127.0.0.1"}
+    ]
+
+    assert {:ok, {_flags, [child_spec]}} =
+             ListenerSupervisor.init({[listener], Secret.wrap(server_private)})
+
+    assert {ThousandIsland, :start_link, [options]} = child_spec.start
+    server = start_supervised!({ThousandIsland, options}, id: :sni_listener)
+    assert {:ok, {_ip, port}} = ThousandIsland.listener_info(server)
+
+    for name <- [~c"203.0.113.9", ~c"derp.example.com"] do
+      assert {:error, {:tls_alert, {:unrecognized_name, _description}}} =
+               :ssl.connect(
+                 ~c"127.0.0.1",
+                 port,
+                 [verify: :verify_none, server_name_indication: name, active: false],
+                 5_000
+               ),
+             "SNI #{name} was not refused"
+    end
   end
 
   # The chain DERPEX serves is `[leaf, metacertificate]`, which is upstream's

@@ -73,31 +73,36 @@ defmodule Derpex.Certificates do
     end
   end
 
-  defp validate_private_key!(certificate_der, private_key) do
+  @doc "Reports whether a decoded private key belongs to a DER leaf certificate."
+  @spec private_key_matches?(binary(), tuple()) :: boolean()
+  def private_key_matches?(certificate_der, private_key) do
     {:OTPSubjectPublicKeyInfo, {:PublicKeyAlgorithm, algorithm, parameters}, public_key} =
       certificate_der
       |> :public_key.pkix_decode_cert(:otp)
       |> elem(1)
       |> elem(7)
 
-    matches? =
-      Enum.any?(
-        [public_key, {public_key, parameters}, {public_key, {:namedCurve, algorithm}}],
-        fn public_key ->
-          Enum.any?([:sha256, :none], fn digest ->
-            try do
-              signature = :public_key.sign(@key_check_message, digest, private_key)
-              :public_key.verify(@key_check_message, digest, signature, public_key)
-            rescue
-              _exception -> false
-            catch
-              _kind, _reason -> false
-            end
-          end)
-        end
-      )
+    Enum.any?(
+      [public_key, {public_key, parameters}, {public_key, {:namedCurve, algorithm}}],
+      fn public_key ->
+        Enum.any?([:sha256, :none], fn digest ->
+          try do
+            signature = :public_key.sign(@key_check_message, digest, private_key)
+            :public_key.verify(@key_check_message, digest, signature, public_key)
+          rescue
+            _exception -> false
+          catch
+            _kind, _reason -> false
+          end
+        end)
+      end
+    )
+  rescue
+    _undecodable -> false
+  end
 
-    unless matches? do
+  defp validate_private_key!(certificate_der, private_key) do
+    unless private_key_matches?(certificate_der, private_key) do
       raise ArgumentError, "TLS private key does not match leaf certificate"
     end
   end

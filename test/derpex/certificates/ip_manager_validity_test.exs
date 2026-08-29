@@ -15,6 +15,10 @@ defmodule Derpex.Certificates.IPManagerValidityTest do
   # from issuance, that is the first second at which a renewal must happen.
   @renewal_seconds @lifetime_seconds - div(@lifetime_seconds, 3) - @backdate_seconds + 1
 
+  @renew_interval_ms 60 * 60 * 1_000
+  @initial_retry_ms 60 * 1_000
+  @maximum_retry_ms 30 * 60 * 1_000
+
   setup do
     start_supervised!({Clock.Manual, monotonic_time: 0, system_time: @issued_at_ms})
     previous = Application.fetch_env!(:derpex, :clock)
@@ -28,31 +32,93 @@ defmodule Derpex.Certificates.IPManagerValidityTest do
     {:ok, directory: directory}
   end
 
-  test "reissues a certificate once two thirds of its lifetime has elapsed", context do
+  # Wall-clock moves on its own here: `set_system_time/1` ages a certificate
+  # without moving monotonic time, so no renewal timer fires and the handshake
+  # path is observed in isolation. `advance/1` is what delivers a tick.
+  test "keeps renewal off the handshake path and does it on the hourly tick", context do
     {manager, calls} = start_manager(context.directory)
 
     assert {:ok, first} = IPManager.certificate(manager, "203.0.113.7")
     assert issued(calls) == 1
 
-    :ok = Clock.Manual.advance((@renewal_seconds - 1) * 1_000)
+    # Past two thirds of the lifetime, a handshake must still be served from
+    # the certificate in hand: upstream only issues here once it has expired.
+    :ok = Clock.Manual.set_system_time(@issued_at_ms + @renewal_seconds * 1_000)
     assert IPManager.certificate(manager, "203.0.113.7") == {:ok, first}
     assert issued(calls) == 1
 
-    :ok = Clock.Manual.advance(1_000)
+    # The background tick is what renews. Advancing an hour delivers exactly
+    # one tick, because the handler reschedules from the new time.
+    :ok = Clock.Manual.advance(@renew_interval_ms)
+    :ok = await_tick(manager)
+    assert issued(calls) == 2
     assert {:ok, renewed} = IPManager.certificate(manager, "203.0.113.7")
     assert issued(calls) == 2
     refute renewed.certificate_der == first.certificate_der
     assert :ok = Manual.verify_certificate(renewed.certificate_der, "203.0.113.7")
   end
 
-  test "keeps serving a still-valid certificate when a renewal fails", context do
+  test "issues on the handshake path once the certificate has fully expired", context do
+    {manager, calls} = start_manager(context.directory)
+    assert {:ok, first} = IPManager.certificate(manager, "203.0.113.7")
+
+    :ok = Clock.Manual.set_system_time(@issued_at_ms + (@lifetime_seconds + 1) * 1_000)
+    assert {:ok, reissued} = IPManager.certificate(manager, "203.0.113.7")
+    assert issued(calls) == 2
+    refute reissued.certificate_der == first.certificate_der
+  end
+
+  test "backs a failed issuance off from one minute to thirty", context do
+    {manager, calls} = start_manager(context.directory, [{:error, :issuer_unavailable}])
+
+    assert {:error, {:issuance, :issuer_unavailable}} =
+             IPManager.certificate(manager, "203.0.113.7")
+
+    assert issued(calls) == 1
+
+    # Inside the backoff window nothing is attempted at all.
+    :ok = Clock.Manual.advance(@initial_retry_ms - 1)
+    assert {:error, {:issuance_deferred, _at}} = IPManager.certificate(manager, "203.0.113.7")
+    assert issued(calls) == 1
+
+    # Go doubles the delay after each failure and clamps it at thirty minutes.
+    for expected <- [@initial_retry_ms * 2, @initial_retry_ms * 4, @initial_retry_ms * 8] do
+      :ok = Clock.Manual.advance(1)
+
+      assert {:error, {:issuance, :issuer_unavailable}} =
+               IPManager.certificate(manager, "203.0.113.7")
+
+      :ok = Clock.Manual.advance(expected - 1)
+      assert {:error, {:issuance_deferred, _at}} = IPManager.certificate(manager, "203.0.113.7")
+    end
+
+    attempts = issued(calls)
+    :ok = Clock.Manual.advance(@maximum_retry_ms)
+
+    assert {:error, {:issuance, :issuer_unavailable}} =
+             IPManager.certificate(manager, "203.0.113.7")
+
+    assert issued(calls) == attempts + 1
+  end
+
+  test "serves the certificate in hand while a renewal backoff is pending", context do
     {manager, calls} = start_manager(context.directory, [:ok, {:error, :issuer_unavailable}])
 
     assert {:ok, first} = IPManager.certificate(manager, "203.0.113.7")
-    :ok = Clock.Manual.advance(@renewal_seconds * 1_000)
+    :ok = Clock.Manual.set_system_time(@issued_at_ms + @renewal_seconds * 1_000)
 
+    # The tick attempts the renewal, it fails, and the held certificate keeps
+    # answering handshakes without another attempt until the backoff lapses.
+    :ok = Clock.Manual.advance(@renew_interval_ms)
+    :ok = await_tick(manager)
+    assert issued(calls) == 2
     assert IPManager.certificate(manager, "203.0.113.7") == {:ok, first}
     assert issued(calls) == 2
+
+    :ok = Clock.Manual.advance(@renew_interval_ms)
+    :ok = await_tick(manager)
+    assert issued(calls) == 3
+    assert IPManager.certificate(manager, "203.0.113.7") == {:ok, first}
   end
 
   test "refuses a disk-cached certificate that has expired", context do
@@ -131,4 +197,11 @@ defmodule Derpex.Certificates.IPManagerValidityTest do
   end
 
   defp issued(calls), do: Agent.get(calls, fn {count, _outcomes} -> count end)
+
+  # `Clock.Manual.advance/1` only sends the tick; this waits for the manager to
+  # have handled it, so an issuance count is read after the tick, not during.
+  defp await_tick(manager) do
+    _state = :sys.get_state(manager)
+    :ok
+  end
 end
