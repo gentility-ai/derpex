@@ -5,6 +5,7 @@ defmodule Derpex.Admission.Gentility.Cache do
 
   @magic "DXAC"
   @journal_magic "DXAJ"
+  @journal_mode 0o600
   @version 1
   @max_record_size 4_096
 
@@ -34,9 +35,25 @@ defmodule Derpex.Admission.Gentility.Cache do
   def open_journal(path) do
     journal = journal_path(path)
 
-    with {:ok, io} <- :file.open(journal, [:append, :raw, :binary]),
+    with :ok <- Derpex.AtomicFile.ensure_directory(Path.dirname(journal)),
+         :ok <- private_target(journal),
+         {:ok, io} <- :file.open(journal, [:append, :raw, :binary]),
+         :ok <- File.chmod(journal, @journal_mode),
          :ok <- write_journal_header(journal, io) do
       {:ok, io}
+    end
+  end
+
+  # The journal names revoked nodes, so it is created inside a 0700 directory and
+  # narrowed to 0600 before a record is written to it. A path that is not a
+  # regular file is refused rather than appended to: the relay writes its own
+  # durable state and never through someone else's link.
+  defp private_target(journal) do
+    case File.lstat(journal) do
+      {:ok, %File.Stat{type: :regular}} -> :ok
+      {:ok, %File.Stat{}} -> {:error, :journal_not_a_regular_file}
+      {:error, :enoent} -> :ok
+      {:error, reason} -> {:error, {:journal, reason}}
     end
   end
 

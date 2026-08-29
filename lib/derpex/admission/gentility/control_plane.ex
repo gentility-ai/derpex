@@ -64,6 +64,11 @@ defmodule Derpex.Admission.Gentility.ControlPlane do
   and is thereafter whatever `c:next_revocation/3` last returned, including
   across a timeout. `nil` is never a stream position.
 
+  A revocation that DERPEX could not make durable is answered with
+  `{:error, :not_durable}` rather than `{:ok, :applied}`. The node is closed and
+  denied either way; the error says only that a restart may forget it, so a
+  control plane should keep replaying that record until it is acknowledged.
+
   Gentility prunes revocations older than the maximum lease lifetime
   (`DERPEX_GENTILITY_MAX_LEASE_MS`): every lease such a record could still deny
   has expired by then, so a reconciliation only has to replay that window.

@@ -385,7 +385,7 @@ defmodule Derpex.Admission.Gentility do
 
   def handle_call({:reconcile, wires}, _from, state) do
     case verify_revocations(wires, state.verification_keys, state.max_revocations) do
-      {:ok, revocations} -> apply_reconciliation(state, revocations)
+      {:ok, revocations} -> apply_reconciliation(%{state | journal_error: nil}, revocations)
       {:error, _reason} = error -> {:reply, error, state}
     end
   end
@@ -632,6 +632,7 @@ defmodule Derpex.Admission.Gentility do
          expiry_token: nil,
          load_error: nil,
          persist_error: nil,
+         journal_error: nil,
          registered?: is_atom(server),
          usage: usage
        }}
@@ -1017,10 +1018,15 @@ defmodule Derpex.Admission.Gentility do
     end
   end
 
+  # A revocation is applied in memory whatever the disk does — the node is closed
+  # and stays denied — but the answer says whether it survived a restart. A
+  # control plane told `:applied` may stop replaying it, so it is only told that
+  # once the record is durable.
   defp apply_one_revocation(state, wire, revocation) do
-    case revoke_record(state, wire, revocation) do
+    case revoke_record(%{state | journal_error: nil}, wire, revocation) do
       {:stale, state} -> {:reply, {:ok, :stale}, state}
-      {_covered_or_uncovered, state} -> {:reply, {:ok, :applied}, state}
+      {_applied, %{journal_error: nil} = state} -> {:reply, {:ok, :applied}, state}
+      {_applied, state} -> {:reply, {:error, :not_durable}, state}
     end
   end
 
@@ -1069,7 +1075,12 @@ defmodule Derpex.Admission.Gentility do
         else: state
 
     state = state |> mark_cache_dirty() |> reschedule_timers()
-    {:reply, {:ok, %{applied: applied, stale: stale}}, state}
+
+    if state.journal_error do
+      {:reply, {:error, :not_durable}, state}
+    else
+      {:reply, {:ok, %{applied: applied, stale: stale}}, state}
+    end
   end
 
   defp reconcile_revocation({wire, revocation}, {state, applied, stale, close_keys}) do
@@ -1981,11 +1992,11 @@ defmodule Derpex.Admission.Gentility do
   defp journal_revocations(state, wires) do
     case CacheWriter.append_revocations(state.cache_writer, wires, @cache_write_timeout_ms) do
       :ok ->
-        %{state | persist_error: nil}
+        %{state | persist_error: nil, journal_error: nil}
 
       {:error, reason} ->
         log_event(
-          %{state | persist_error: reason},
+          %{state | persist_error: reason, journal_error: reason},
           :cache_persist_error,
           "gentility could not make a revocation durable: #{inspect(reason)}"
         )

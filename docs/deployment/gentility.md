@@ -164,6 +164,13 @@ tens of thousands of revocations does not rewrite it on every append, and it is
 truncated the moment a snapshot subsumes it. A torn final record after a crash
 costs that record and nothing else.
 
+The journal is created inside a `0700` directory and narrowed to `0600` before
+a record reaches it, and a path that is not a regular file is refused rather
+than appended to. If a revocation cannot be made durable, `revoke/2` and
+`reconcile/2` answer `{:error, :not_durable}`: the node is still closed and
+still denied in memory, but a control plane that was told `:applied` might stop
+replaying it, so it is never told that on a lost record.
+
 When a journal holds more records than `DERPEX_GENTILITY_MAX_REVOCATIONS`, the
 **newest** are the ones recovered. A running relay evicts its oldest revocation
 when the table is full, so recovering the oldest would resurrect exactly the

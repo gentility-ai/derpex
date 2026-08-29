@@ -1124,6 +1124,58 @@ defmodule Derpex.Admission.GentilityTest do
   end
 
   @tag :tmp_dir
+  test "creates the revocation journal privately", %{tmp_dir: tmp_dir} do
+    node_key = node_key(75)
+    directory = Path.join(tmp_dir, "state")
+    path = Path.join(directory, "admission.cache")
+
+    controller =
+      start_controller(
+        authority: fn request -> {:ok, signed_lease(request.node_key)} end,
+        cache_path: path
+      )
+
+    assert {:ok, _context} = Gentility.authorize(request(node_key), Gentility.policy(controller))
+    assert Gentility.revoke(controller, signed_revocation(node_key, 10)) == {:ok, :applied}
+
+    journal = Cache.journal_path(path)
+    assert {:ok, stat} = File.stat(journal)
+    assert Bitwise.band(stat.mode, 0o777) == 0o600
+    assert {:ok, directory_stat} = File.stat(directory)
+    assert Bitwise.band(directory_stat.mode, 0o777) == 0o700
+  end
+
+  @tag :tmp_dir
+  test "says so when a revocation cannot be made durable", %{tmp_dir: tmp_dir} do
+    node_key = node_key(76)
+    path = Path.join(tmp_dir, "admission.cache")
+
+    # The journal path is not a regular file, so it must not be appended to.
+    :ok = File.mkdir_p!(Cache.journal_path(path))
+
+    controller =
+      start_controller(
+        authority: fn request -> {:ok, signed_lease(request.node_key)} end,
+        cache_path: path,
+        close_peer: fn _key -> 0 end
+      )
+
+    assert {:ok, _context} = Gentility.authorize(request(node_key), Gentility.policy(controller))
+
+    log =
+      ExUnit.CaptureLog.capture_log(fn ->
+        assert Gentility.revoke(controller, signed_revocation(node_key, 10)) ==
+                 {:error, :not_durable}
+      end)
+
+    assert log =~ "could not make a revocation durable"
+
+    # The node is still denied: durability failed, the decision did not.
+    assert Gentility.stats(controller).revocations == 1
+    assert Gentility.stats(controller).cache_entries == 0
+  end
+
+  @tag :tmp_dir
   test "a crash keeps the newest revocations, not the oldest", %{tmp_dir: tmp_dir} do
     path = Path.join(tmp_dir, "admission.cache")
     maximum = 20
