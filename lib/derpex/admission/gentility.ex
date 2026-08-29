@@ -46,6 +46,9 @@ defmodule Derpex.Admission.Gentility do
   @default_max_byte_delay_ms 30_000
   @default_budget_prune_ms 30_000
   @default_cache_persist_ms 5_000
+  @default_renewal_retry_ms 60_000
+  @renewal_fraction {4, 5}
+  @expiry_jitter_percent 10
   @cache_write_timeout_ms 2_000
   @budget_prune_chunk 1_000
   @reverify_chunk 1_000
@@ -228,7 +231,7 @@ defmodule Derpex.Admission.Gentility do
           state
           |> load_cache()
           |> purge_expired()
-          |> reschedule_expiry()
+          |> reschedule_timers()
           |> schedule_budget_prune()
 
         {:ok, state}
@@ -313,10 +316,28 @@ defmodule Derpex.Admission.Gentility do
   @impl GenServer
   def handle_info({__MODULE__, :expire, token}, %{expiry_token: token} = state) do
     state = %{state | expiry_timer: nil, expiry_token: nil}
-    {:noreply, state |> purge_expired() |> reschedule_expiry()}
+    {:noreply, state |> purge_expired() |> reschedule_timers()}
   end
 
   def handle_info({__MODULE__, :expire, _stale}, state), do: {:noreply, state}
+
+  def handle_info({__MODULE__, :renew, token}, %{renewal_token: token} = state) do
+    state = %{state | renewal_timer: nil, renewal_token: nil}
+    {:noreply, state |> renew_due() |> reschedule_renewal()}
+  end
+
+  def handle_info({__MODULE__, :renew, _stale}, state), do: {:noreply, state}
+
+  def handle_info({__MODULE__, :renewed, pid, node_key, result}, state) do
+    state = finish_renewal(state, pid)
+
+    state =
+      state
+      |> apply_renewal(node_key, result)
+      |> reschedule_timers()
+
+    {:noreply, state}
+  end
 
   def handle_info({__MODULE__, :prune_budgets, token}, %{budget_prune_token: token} = state) do
     {:noreply, step_budget_prune(%{state | budget_prune_timer: nil}, :start)}
@@ -345,10 +366,18 @@ defmodule Derpex.Admission.Gentility do
 
   def handle_info({__MODULE__, :reverify, _stale}, state), do: {:noreply, state}
 
-  def handle_info({:DOWN, monitor, :process, connection, _reason}, state) do
-    case state.claims[connection] do
-      %{monitor: ^monitor} -> {:noreply, release_connection(state, connection, false)}
-      _unknown -> {:noreply, state}
+  def handle_info({:DOWN, monitor, :process, pid, _reason}, state) do
+    cond do
+      match?(%{monitor: ^monitor}, state.renewals[pid]) ->
+        node_key = state.renewals[pid].node_key
+        state = finish_renewal(%{state | renewals: Map.delete(state.renewals, pid)}, nil)
+        {:noreply, state |> requeue_renewal_for(node_key) |> reschedule_renewal()}
+
+      match?(%{monitor: ^monitor}, state.claims[pid]) ->
+        {:noreply, release_connection(state, pid, false)}
+
+      true ->
+        {:noreply, state}
     end
   end
 
@@ -374,6 +403,7 @@ defmodule Derpex.Admission.Gentility do
   @impl GenServer
   def terminate(_reason, state) do
     cancel_expiry(state)
+    cancel_renewal(state)
     cancel_budget_prune(state)
     _flushed = flush_cache(state, :sync)
     UsageWorker.stop(state.usage)
@@ -404,6 +434,9 @@ defmodule Derpex.Admission.Gentility do
 
     cache_persist_ms =
       positive_option!(options, :cache_persist_ms, @default_cache_persist_ms)
+
+    renewal_retry_ms = positive_option!(options, :renewal_retry_ms, @default_renewal_retry_ms)
+    expiry_jitter = Keyword.get(options, :expiry_jitter, &default_expiry_jitter/1)
 
     verification_keys = Keyword.fetch!(options, :verification_keys)
     clock = Keyword.get(options, :clock, Clock)
@@ -461,6 +494,12 @@ defmodule Derpex.Admission.Gentility do
          cache_dirty: false,
          cache_writer: cache_writer,
          reverify: nil,
+         by_renewal: :gb_trees.empty(),
+         renewal_timer: nil,
+         renewal_token: nil,
+         renewal_retry_ms: renewal_retry_ms,
+         renewals: %{},
+         expiry_jitter: expiry_jitter,
          closing_connections: MapSet.new(),
          cache_full: 0,
          sequence: 0,
@@ -569,8 +608,8 @@ defmodule Derpex.Admission.Gentility do
 
   defp cached_decision(state, node_key) do
     case state.leases[node_key] do
-      nil -> {:reply, {:error, :no_cached_lease}, reschedule_expiry(state)}
-      entry -> {:reply, {:ok, context(entry.lease, :cached)}, reschedule_expiry(state)}
+      nil -> {:reply, {:error, :no_cached_lease}, reschedule_timers(state)}
+      entry -> {:reply, {:ok, context(entry.lease, :cached)}, reschedule_timers(state)}
     end
   end
 
@@ -596,7 +635,7 @@ defmodule Derpex.Admission.Gentility do
   # never evicted, so a saturated cache rejects the new admission instead of
   # closing an established peer.
   defp install_live_lease(state, wire, lease) do
-    entry = %{wire: wire, lease: lease}
+    entry = lease_entry(state, wire, lease)
 
     cond do
       Map.has_key?(state.leases, lease.node_key) ->
@@ -631,7 +670,7 @@ defmodule Derpex.Admission.Gentility do
         candidate
       end
 
-    state = candidate |> mark_cache_dirty() |> reschedule_expiry()
+    state = candidate |> mark_cache_dirty() |> reschedule_timers()
     {:reply, {:ok, context(lease, :live)}, state}
   end
 
@@ -661,6 +700,28 @@ defmodule Derpex.Admission.Gentility do
     end
   end
 
+  # A lease is closed a little before it expires rather than exactly on it, so a
+  # region's leases do not all fall due in the same millisecond. The window is
+  # taken out of the lease's own lifetime: DERPEX never serves an expired lease.
+  defp lease_entry(state, wire, lease) do
+    lifetime = max(lease.expires_at_ms - lease.issued_at_ms, 0)
+    {numerator, denominator} = @renewal_fraction
+
+    %{
+      wire: wire,
+      lease: lease,
+      close_at_ms: lease.expires_at_ms - state.expiry_jitter.(lifetime),
+      renew_at_ms: lease.issued_at_ms + div(lifetime * numerator, denominator)
+    }
+  end
+
+  defp default_expiry_jitter(lifetime) do
+    case div(lifetime * @expiry_jitter_percent, 100) do
+      0 -> 0
+      window -> :rand.uniform(window + 1) - 1
+    end
+  end
+
   defp put_lease_entry(state, node_key, entry) do
     key = expiry_key(node_key, entry)
 
@@ -668,6 +729,7 @@ defmodule Derpex.Admission.Gentility do
       state
       | leases: Map.put(state.leases, node_key, entry),
         by_expiry: :gb_trees.enter(key, true, state.by_expiry),
+        by_renewal: :gb_trees.enter(renewal_key(node_key, entry), true, state.by_renewal),
         budgets: Budgets.add_lease(state.budgets, entry.lease, now_microsecond(state))
     }
 
@@ -689,12 +751,15 @@ defmodule Derpex.Admission.Gentility do
           | leases: leases,
             by_expiry: :gb_trees.delete_any(key, state.by_expiry),
             unclaimed: :gb_trees.delete_any(key, state.unclaimed),
+            by_renewal: :gb_trees.delete_any(renewal_key(node_key, entry), state.by_renewal),
             budgets: Budgets.remove_lease(state.budgets, entry.lease, now_microsecond(state))
         }
     end
   end
 
-  defp expiry_key(node_key, entry), do: {entry.lease.expires_at_ms, node_key}
+  defp expiry_key(node_key, entry), do: {entry.close_at_ms, node_key}
+
+  defp renewal_key(node_key, entry), do: {entry.renew_at_ms, node_key}
 
   defp claimed?(state, node_key), do: Map.has_key?(state.node_claims, node_key)
 
@@ -725,7 +790,7 @@ defmodule Derpex.Admission.Gentility do
       _older_or_missing ->
         {state, close?} = put_revocation(state, wire, revocation)
         if close?, do: close_peer(state, revocation.node_key)
-        state = persist_now(state) |> reschedule_expiry()
+        state = persist_now(state) |> reschedule_timers()
         {if(close?, do: :covered, else: :uncovered), state}
     end
   end
@@ -735,7 +800,7 @@ defmodule Derpex.Admission.Gentility do
       Enum.reduce(revocations, {state, 0, 0, MapSet.new()}, &reconcile_revocation/2)
 
     Enum.each(close_keys, &close_peer(state, &1))
-    state = persist_now(state) |> reschedule_expiry()
+    state = persist_now(state) |> reschedule_timers()
     {:reply, {:ok, %{applied: applied, stale: stale}}, state}
   end
 
@@ -1086,7 +1151,7 @@ defmodule Derpex.Admission.Gentility do
   defp put_loaded_lease(state, wire, lease) do
     state
     |> drop_lease_entry(lease.node_key)
-    |> put_lease_entry(lease.node_key, %{wire: wire, lease: lease})
+    |> put_lease_entry(lease.node_key, lease_entry(state, wire, lease))
   end
 
   # Re-verifying every cached record against a rotated keyring is one Ed25519
@@ -1112,7 +1177,7 @@ defmodule Derpex.Admission.Gentility do
     %{state | reverify: nil}
     |> persist_now()
     |> purge_expired()
-    |> reschedule_expiry()
+    |> reschedule_timers()
   end
 
   defp reverify_chunk(%{reverify: %{leases: []}} = state) do
@@ -1210,6 +1275,194 @@ defmodule Derpex.Admission.Gentility do
           state
         end
     end
+  end
+
+  # Only a lease an established connection is using is worth renewing: an idle
+  # cached lease costs nothing to re-authorize on the node's next connection,
+  # and renewing the whole cache would put the fleet's reconnection load on
+  # Gentility continuously.
+  defp renew_due(state) do
+    now = now_ms(state)
+
+    if :gb_trees.is_empty(state.by_renewal) do
+      state
+    else
+      {{renew_at_ms, node_key} = key, _present} = :gb_trees.smallest(state.by_renewal)
+
+      if renew_at_ms <= now do
+        state = %{state | by_renewal: :gb_trees.delete_any(key, state.by_renewal)}
+        renew_due(start_renewal(state, node_key, key))
+      else
+        state
+      end
+    end
+  end
+
+  defp start_renewal(state, node_key, key) do
+    entry = state.leases[node_key]
+
+    cond do
+      is_nil(entry) -> state
+      renewal_key(node_key, entry) != key -> state
+      not claimed?(state, node_key) -> state
+      true -> spawn_renewal(state, node_key, entry)
+    end
+  end
+
+  defp spawn_renewal(state, node_key, entry) do
+    case reserve(state.policy.gate, state.policy.max_concurrent_requests) do
+      :ok ->
+        parent = self()
+        authority = state.policy.authority
+        request = renewal_request(node_key)
+
+        {pid, monitor} =
+          spawn_monitor(fn ->
+            result = invoke_authority(authority, request)
+            send(parent, {__MODULE__, :renewed, self(), node_key, result})
+          end)
+
+        renewal = %{monitor: monitor, node_key: node_key}
+        %{state | renewals: Map.put(state.renewals, pid, renewal)}
+
+      {:error, :admission_overloaded} ->
+        requeue_renewal(state, node_key, entry)
+    end
+  end
+
+  # A renewal carries no client info and no source IP: it re-authorizes an
+  # identity the relay already holds, and the marker lets an adapter tell it
+  # apart from a fresh connection.
+  defp renewal_request(node_key) do
+    %Request{
+      node_key: node_key,
+      client_info: nil,
+      source_ip: nil,
+      mesh_peer?: false,
+      metadata: %{renewal: true}
+    }
+  end
+
+  defp finish_renewal(state, nil), do: release_gate(state)
+
+  defp finish_renewal(state, pid) do
+    case Map.pop(state.renewals, pid) do
+      {nil, _renewals} ->
+        state
+
+      {renewal, renewals} ->
+        Process.demonitor(renewal.monitor, [:flush])
+        release_gate(%{state | renewals: renewals})
+    end
+  end
+
+  defp release_gate(state) do
+    _remaining = :atomics.sub_get(state.policy.gate, 1, 1)
+    state
+  end
+
+  defp apply_renewal(state, node_key, {:ok, wire}) when is_binary(wire) do
+    case Contract.record_type(wire) do
+      {:ok, :lease} -> renew_lease(state, node_key, wire)
+      {:ok, :revocation} -> renew_denial(state, node_key, wire)
+      {:error, _unknown} -> requeue_renewal_for(state, node_key)
+    end
+  end
+
+  defp apply_renewal(state, node_key, _failed), do: requeue_renewal_for(state, node_key)
+
+  defp renew_lease(state, node_key, wire) do
+    case verify_lease(state, wire) do
+      {:ok, %Lease{node_key: ^node_key} = lease} -> install_renewed_lease(state, wire, lease)
+      _mismatched_or_invalid -> requeue_renewal_for(state, node_key)
+    end
+  end
+
+  defp renew_denial(state, node_key, wire) do
+    case Contract.verify_revocation(wire, state.verification_keys) do
+      {:ok, %Revocation{node_key: ^node_key} = revocation} ->
+        {_outcome, state} = revoke_record(state, wire, revocation)
+        state
+
+      _mismatched_or_invalid ->
+        requeue_renewal_for(state, node_key)
+    end
+  end
+
+  # The renewed lease replaces the cached one in place. Claims are untouched, so
+  # an established connection keeps running across the renewal.
+  defp install_renewed_lease(state, wire, lease) do
+    if stale_lease?(state.leases[lease.node_key], lease) do
+      requeue_renewal_for(state, lease.node_key)
+    else
+      node_revision = Budgets.revision(state.budgets, :node, lease.node_key)
+
+      organization_revision =
+        Budgets.revision(state.budgets, :organization, lease.organization_id)
+
+      state =
+        state
+        |> drop_lease_entry(lease.node_key)
+        |> put_lease_entry(lease.node_key, lease_entry(state, wire, lease))
+        |> drop_revocation_entry(lease.node_key)
+
+      state =
+        if revised_budgets?(state, lease, node_revision, organization_revision) do
+          enforce_revised_budgets(state, lease.node_key, lease.organization_id)
+        else
+          state
+        end
+
+      mark_cache_dirty(state)
+    end
+  end
+
+  defp requeue_renewal_for(state, node_key) do
+    case state.leases[node_key] do
+      nil -> state
+      entry -> requeue_renewal(state, node_key, entry)
+    end
+  end
+
+  # A renewal that could not be attempted or did not succeed is retried while
+  # the lease still has life in it; once it does not, the lease simply expires.
+  defp requeue_renewal(state, node_key, entry) do
+    retry_at_ms = now_ms(state) + state.renewal_retry_ms
+
+    if retry_at_ms < entry.close_at_ms do
+      entry = %{entry | renew_at_ms: retry_at_ms}
+
+      %{
+        state
+        | leases: Map.put(state.leases, node_key, entry),
+          by_renewal: :gb_trees.enter(renewal_key(node_key, entry), true, state.by_renewal)
+      }
+    else
+      state
+    end
+  end
+
+  defp reschedule_timers(state), do: state |> reschedule_expiry() |> reschedule_renewal()
+
+  defp reschedule_renewal(state) do
+    state = cancel_renewal(state)
+
+    if :gb_trees.is_empty(state.by_renewal) do
+      state
+    else
+      {{renew_at_ms, _node_key}, _present} = :gb_trees.smallest(state.by_renewal)
+      delay = max(renew_at_ms - now_ms(state), 0)
+      token = make_ref()
+      timer = state.clock.send_after(self(), {__MODULE__, :renew, token}, delay)
+      %{state | renewal_timer: timer, renewal_token: token}
+    end
+  end
+
+  defp cancel_renewal(%{renewal_timer: nil} = state), do: state
+
+  defp cancel_renewal(state) do
+    _remaining = state.clock.cancel_timer(state.renewal_timer)
+    %{state | renewal_timer: nil, renewal_token: nil}
   end
 
   defp reschedule_expiry(state) do

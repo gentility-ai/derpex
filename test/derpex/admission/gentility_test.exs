@@ -152,6 +152,166 @@ defmodule Derpex.Admission.GentilityTest do
              {:error, :unknown_record_type}
   end
 
+  test "renews a claimed lease before expiry without closing its connection" do
+    parent = self()
+    node_key = node_key(40)
+
+    {:ok, authority} =
+      Agent.start_link(fn ->
+        {:ok, signed_lease(node_key, issued_at_ms: 1_000, expires_at_ms: 11_000)}
+      end)
+
+    renewed = signed_lease(node_key, issued_at_ms: 9_000, expires_at_ms: 19_000)
+
+    controller =
+      start_controller(
+        authority: fn request ->
+          send(parent, {:authorized, request.metadata})
+
+          if request.metadata[:renewal],
+            do: {:ok, renewed},
+            else: Agent.get(authority, & &1)
+        end,
+        max_lease_ms: 10_000,
+        close_peer: fn key -> send(parent, {:closed, key}) end,
+        close_connection: fn connection, reason ->
+          send(parent, {:quota_close, connection, reason})
+        end
+      )
+
+    policy = Gentility.policy(controller)
+    {:ok, context} = Gentility.authorize(request(node_key), policy)
+    assert_receive {:authorized, %{}}
+    [connection] = connections(1)
+    assert {:ok, ^context} = Gentility.claim(request(node_key), context, connection, policy)
+
+    # Only a renewal can refresh the lease from here: a fresh authorization is
+    # answered with an outage.
+    Agent.update(authority, fn _response -> {:error, :unavailable} end)
+
+    Manual.advance(8_000)
+    assert_receive {:authorized, %{renewal: true}}
+
+    eventually(fn ->
+      match?(
+        {:ok, %{gentility: %{source: :cached, lease_expires_at_ms: 19_000}}},
+        Gentility.authorize(request(node_key), policy)
+      )
+    end)
+
+    # Past the original expiry: only a renewal that replaced the lease can keep
+    # this node cached and its connection open.
+    Manual.advance(2_500)
+    refute_receive {:closed, ^node_key}
+    refute_receive {:quota_close, ^connection, _reason}
+    assert Gentility.stats(controller).cache_entries == 1
+    assert Process.alive?(connection)
+
+    Process.exit(connection, :kill)
+  end
+
+  test "a failed renewal keeps serving the lease until it expires" do
+    parent = self()
+    node_key = node_key(41)
+
+    {:ok, authority} =
+      Agent.start_link(fn ->
+        {:ok, signed_lease(node_key, issued_at_ms: 1_000, expires_at_ms: 11_000)}
+      end)
+
+    controller =
+      start_controller(
+        authority: fn request ->
+          send(parent, {:authorized, request.metadata})
+          Agent.get(authority, & &1)
+        end,
+        max_lease_ms: 10_000,
+        renewal_retry_ms: 60_000,
+        close_peer: fn key -> send(parent, {:closed, key}) end
+      )
+
+    policy = Gentility.policy(controller)
+    {:ok, context} = Gentility.authorize(request(node_key), policy)
+    assert_receive {:authorized, %{}}
+    [connection] = connections(1)
+    assert {:ok, ^context} = Gentility.claim(request(node_key), context, connection, policy)
+
+    Agent.update(authority, fn _response -> {:error, {:http, 503}} end)
+
+    Manual.advance(8_000)
+    assert_receive {:authorized, %{renewal: true}}
+    refute_receive {:closed, ^node_key}
+
+    assert {:ok, %{gentility: %{source: :cached, lease_expires_at_ms: 11_000}}} =
+             Gentility.authorize(request(node_key), policy)
+
+    Manual.advance(2_000)
+    assert_receive {:closed, ^node_key}
+    assert Gentility.stats(controller).cache_entries == 0
+
+    Process.exit(connection, :kill)
+  end
+
+  test "an idle lease is never renewed and simply expires" do
+    parent = self()
+    node_key = node_key(42)
+
+    controller =
+      start_controller(
+        authority: fn request ->
+          send(parent, {:authorized, request.metadata})
+          {:ok, signed_lease(request.node_key, issued_at_ms: 1_000, expires_at_ms: 11_000)}
+        end,
+        max_lease_ms: 10_000,
+        close_peer: fn key -> send(parent, {:closed, key}) end
+      )
+
+    policy = Gentility.policy(controller)
+    assert {:ok, _context} = Gentility.authorize(request(node_key), policy)
+    assert_receive {:authorized, %{}}
+
+    Manual.advance(8_000)
+    refute_receive {:authorized, _metadata}
+
+    Manual.advance(3_000)
+    assert_receive {:closed, ^node_key}
+  end
+
+  test "spreads expiry closes across the last tenth of the lease" do
+    parent = self()
+    count = 20
+
+    controller =
+      start_controller(
+        authority: fn request ->
+          {:ok, signed_lease(request.node_key, issued_at_ms: 1_000, expires_at_ms: 11_000)}
+        end,
+        max_lease_ms: 10_000,
+        expiry_jitter: nil,
+        close_peer: fn key -> send(parent, {:closed, key}) end
+      )
+
+    policy = Gentility.policy(controller)
+
+    for index <- 1..count do
+      assert {:ok, _context} = Gentility.authorize(request(<<index::256>>), policy)
+    end
+
+    Manual.advance(9_000)
+    assert closed_keys() == []
+
+    Manual.advance(500)
+    early = closed_keys()
+
+    Manual.advance(500)
+    late = closed_keys()
+
+    assert early != []
+    assert late != []
+    assert length(early) + length(late) == count
+    assert Gentility.stats(controller).cache_entries == 0
+  end
+
   test "active revocation is idempotent, rejects stale leases, and allows a newer revision" do
     parent = self()
     node_key = node_key(3)
@@ -1103,8 +1263,19 @@ defmodule Derpex.Admission.GentilityTest do
       verification_keys: %{@signing_key_id => @public_key},
       clock: Manual,
       max_lease_ms: 1_000,
-      max_future_skew_ms: 0
+      max_future_skew_ms: 0,
+      expiry_jitter: fn _lifetime_ms -> 0 end
     ]
+
+    # `expiry_jitter: nil` opts a test into the production jitter.
+    {defaults, options} =
+      case Keyword.fetch(options, :expiry_jitter) do
+        {:ok, nil} ->
+          {Keyword.delete(defaults, :expiry_jitter), Keyword.delete(options, :expiry_jitter)}
+
+        _set_or_absent ->
+          {defaults, options}
+      end
 
     start_supervised!({Gentility, Keyword.merge(defaults, options)})
   end
@@ -1120,7 +1291,7 @@ defmodule Derpex.Admission.GentilityTest do
       region_id: 17,
       policy_revision: Keyword.get(options, :policy_revision, 9),
       quota_revision: Keyword.get(options, :quota_revision, 3),
-      issued_at_ms: 1_000,
+      issued_at_ms: Keyword.get(options, :issued_at_ms, 1_000),
       expires_at_ms: Keyword.get(options, :expires_at_ms, 2_000),
       node_connection_limit: Keyword.get(options, :node_connection_limit, 4),
       organization_connection_limit: Keyword.get(options, :organization_connection_limit, 20),
@@ -1166,6 +1337,14 @@ defmodule Derpex.Admission.GentilityTest do
 
     {:ok, wire} = Contract.sign_lease(lease, @private_key)
     wire
+  end
+
+  defp closed_keys(keys \\ []) do
+    receive do
+      {:closed, key} -> closed_keys([key | keys])
+    after
+      50 -> keys
+    end
   end
 
   defp percentile(samples, percentile) do

@@ -15,6 +15,17 @@ defmodule Derpex.Admission.Gentility.ControlPlane do
       covers, dropping the cached lease and closing that node's established
       connections.
 
+  ## Renewals
+
+  A lease serving an established connection is re-authorized in the background
+  at 80% of its lifetime. That call arrives through the same `c:authorize/2`
+  with `metadata: %{renewal: true}`, `client_info: nil`, and `source_ip: nil`:
+  it re-authorizes an identity the relay already holds rather than a new
+  connection, so an adapter must key it on the node key alone. Answering it
+  with a lease replaces the cached one without disturbing the connection;
+  answering with an error leaves the existing lease serving until it expires;
+  answering with a revocation closes the node as any denial does.
+
   A revocation denies only leases whose policy revision it covers. Answering
   with a revocation older than the node's cached lease — or replaying one the
   relay already holds — does not deny the node: the cached lease still stands

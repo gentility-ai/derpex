@@ -57,6 +57,29 @@ connection count: the cache holds every node that may reconnect during a
 Gentility outage. All budgets are per instance and must be divided by the
 number of instances in the region.
 
+### Lease renewal
+
+A lease that an established connection is using is re-authorized in the
+background once it reaches 80% of its lifetime, through the same authority call
+as a fresh admission but marked `renewal: true` and carrying no client info or
+source IP. A successful renewal replaces the cached lease in place: budgets and
+expiry move forward and the connection is never interrupted. A failed renewal
+changes nothing — the existing lease keeps serving — and is retried every
+`renewal_retry_ms` (60 s) for as long as the lease has that much life left.
+
+Idle cached leases are not renewed. A node with no connection re-authorizes
+naturally the next time it connects, so renewing the whole cache would put the
+fleet's reconnection load on Gentility continuously for no benefit.
+
+Renewal traffic shares `DERPEX_GENTILITY_MAX_CONCURRENT_REQUESTS` with live
+admissions; a renewal that cannot get a slot is retried rather than queued, so
+renewals can never crowd out a connecting node.
+
+Leases are closed a little before they expire — a jitter of up to 10% of the
+lease lifetime, taken out of the lease's own life, never added to it. DERPEX
+therefore never serves an expired lease, and a region's leases do not all fall
+due in the same millisecond and stampede Gentility on reconnection.
+
 ### Cache durability
 
 Writing the cache rewrites the whole file, so lease admissions are debounced:
