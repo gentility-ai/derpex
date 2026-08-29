@@ -557,6 +557,62 @@ consistency(check_output)                            # /debug/check
 The Go oracle helper emits the same schema. Event comparison permits only
 explicitly documented reorderings between independent connections.
 
+`interop/go/differential_trace.go` is the single driver for both servers:
+`oracle` mode starts the pinned Go server behind the same `/debug/varz` handler
+`cmd/derper` publishes (`derpserver.Server.ExpVar` plus the package-level
+`derp_packets_dropped` map), and DERPEX mode drives the DERPEX relay and scrapes
+its token-protected `/metrics`. `test/interop/differential_test.exs` decodes
+both traces and asserts whole-structure equality; nothing in the trace is a
+literal written by the driver.
+
+The trace is a list of scenarios, each a list of steps. A step records the
+frames its clients observed and the delta of every tracked counter since the
+previous step. Three scenarios run in order:
+
+- `relay_and_drops` — relay of empty, short, and `MaxPacketSize` payloads; a
+  ping/pong exchange; a send to a never-connected key; a flood that overruns a
+  recipient which has stopped reading; and a disconnect observed by a peer.
+- `duplicate_keys` — two connections sharing one public key plus a sender,
+  covering newest-connection delivery, the older connection writing, and
+  last-writer delivery.
+- `watch_presence` — a trusted mesh watcher over the initial presence snapshot,
+  a later arrival, and a departure.
+
+The tracked counter subset, named as Go's varz exposes it, is
+`packets_sent`, `packets_received`, `packets_dropped` for all seven reasons
+crossed with both packet kinds, `peer_gone_disconnected_frames`,
+`peer_gone_not_here_frames`, `total_dup_client_conns`,
+`current_dup_client_keys`, `current_dup_client_conns`, `current_connections`,
+`unknown_frames`, `got_ping`, and `sent_pong`. A tracked counter that a server
+does not publish fails the run rather than reading as zero, so a missing
+counter cannot compare equal to a present one.
+
+Only these normalizations are applied, identically to both traces:
+
+1. Random node keys, addresses, and payload bytes become stable labels, a
+   loopback boolean, and a size plus SHA-256 digest.
+2. Metric names are canonicalized by trimming the `gauge_`/`counter_` type
+   prefixes that Go's varz strips and DERPEX's `/metrics` keeps, and by sorting
+   drop labels, which the two order differently.
+3. Steps whose magnitude depends on kernel socket buffer sizes — the flood and
+   the subsequent catch-up — are marked `saturating` and compare the sign of
+   each delta instead of its value. Every other step is `exact`.
+4. The initial presence snapshot enumerates connected peers in unspecified
+   order, so that one step's events are sorted. No other reordering is allowed.
+
+Steps synchronize before snapshotting: each waits for the server's
+`current_connections` gauge to reach the expected value, and the flood step
+round-trips a ping on the sending connection so that every frame ahead of it has
+been routed and accounted for.
+
+`unknown_frames` is tracked but exercised only as a zero-delta invariant: no
+unchanged official DERP client can emit an unknown frame type, and the upstream
+checkout may not be modified to add one. The invariant still catches a server
+that miscounts ordinary frames as unknown; a server driven to emit a real
+unknown frame belongs to the raw-socket edge suite instead. `bytes_sent`,
+`bytes_received`, and `bytes_dropped` are excluded as a byte-granularity
+restatement of the packet counters already compared.
+
 ## 6. Delivery milestones
 
 Every milestone has a hard exit gate. From Milestone 2 onward each milestone
