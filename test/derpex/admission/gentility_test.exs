@@ -337,6 +337,92 @@ defmodule Derpex.Admission.GentilityTest do
     Process.exit(connection, :kill)
   end
 
+  test "a revocation that lands during a renewal is not undone by it" do
+    parent = self()
+    node_key = node_key(57)
+
+    renewed = signed_lease(node_key, issued_at_ms: 9_000, expires_at_ms: 19_000)
+
+    controller =
+      start_controller(
+        authority: fn request ->
+          if request.metadata[:renewal] do
+            send(parent, {:renewing, self()})
+            receive do: (:release -> {:ok, renewed})
+          else
+            {:ok, signed_lease(node_key, issued_at_ms: 1_000, expires_at_ms: 11_000)}
+          end
+        end,
+        max_lease_ms: 10_000,
+        close_peer: fn key -> send(parent, {:closed, key}) end
+      )
+
+    policy = Gentility.policy(controller)
+    {:ok, context} = Gentility.authorize(request(node_key), policy)
+    [connection] = connections(1)
+    assert {:ok, ^context} = Gentility.claim(request(node_key), context, connection, policy)
+
+    Manual.advance(8_000)
+    assert_receive {:renewing, renewal}, 2_000
+
+    # The revocation lands while the renewal is still in flight.
+    assert Gentility.revoke(controller, signed_revocation(node_key, 10)) == {:ok, :applied}
+    assert_receive {:closed, ^node_key}
+    assert Gentility.stats(controller).cache_entries == 0
+    assert Gentility.stats(controller).revocations == 1
+
+    send(renewal, :release)
+
+    # The renewal reply must not resurrect the node or drop the revocation.
+    eventually(fn -> Gentility.stats(controller).renewals_in_flight == 0 end)
+    stats = Gentility.stats(controller)
+    assert stats.cache_entries == 0
+    assert stats.revocations == 1
+    assert Gentility.authorize(request(node_key), policy) == {:error, :lease_revoked}
+
+    Process.exit(connection, :kill)
+  end
+
+  test "a renewal reply that shortens the cached lease is refused as stale" do
+    parent = self()
+    node_key = node_key(58)
+    {:ok, authority} = Agent.start_link(fn -> :serve end)
+
+    controller =
+      start_controller(
+        authority: fn request ->
+          cond do
+            request.metadata[:renewal] ->
+              send(parent, {:renewing, self()})
+              {:ok, signed_lease(node_key, issued_at_ms: 1_000, expires_at_ms: 9_500)}
+
+            Agent.get(authority, & &1) == :serve ->
+              Agent.update(authority, fn _state -> :outage end)
+              {:ok, signed_lease(node_key, issued_at_ms: 1_000, expires_at_ms: 11_000)}
+
+            true ->
+              {:error, :unavailable}
+          end
+        end,
+        max_lease_ms: 10_000,
+        close_peer: fn key -> send(parent, {:closed, key}) end
+      )
+
+    policy = Gentility.policy(controller)
+    {:ok, context} = Gentility.authorize(request(node_key), policy)
+    [connection] = connections(1)
+    assert {:ok, ^context} = Gentility.claim(request(node_key), context, connection, policy)
+
+    Manual.advance(8_000)
+    assert_receive {:renewing, _worker}, 2_000
+    eventually(fn -> Gentility.stats(controller).renewals_in_flight == 0 end)
+
+    assert {:ok, %{gentility: %{source: :cached, lease_expires_at_ms: 11_000}}} =
+             Gentility.authorize(request(node_key), policy)
+
+    Process.exit(connection, :kill)
+  end
+
   test "a failed renewal keeps serving the lease until it expires" do
     parent = self()
     node_key = node_key(41)

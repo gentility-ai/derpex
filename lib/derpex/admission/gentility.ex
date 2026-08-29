@@ -920,9 +920,18 @@ defmodule Derpex.Admission.Gentility do
   defp stale_lease?(nil, _lease), do: false
 
   defp stale_lease?(%{lease: current}, lease) do
-    current.policy_revision > lease.policy_revision or
-      (current.policy_revision == lease.policy_revision and
-         current.quota_revision > lease.quota_revision)
+    cond do
+      current.policy_revision != lease.policy_revision ->
+        current.policy_revision > lease.policy_revision
+
+      current.quota_revision != lease.quota_revision ->
+        current.quota_revision > lease.quota_revision
+
+      # Same revisions: a reply that expires earlier than what is cached would
+      # shorten the lease a connection is already relying on.
+      true ->
+        current.expires_at_ms > lease.expires_at_ms
+    end
   end
 
   defp apply_one_revocation(state, wire, revocation) do
@@ -1595,31 +1604,14 @@ defmodule Derpex.Admission.Gentility do
     end
   end
 
-  # The renewed lease replaces the cached one in place. Claims are untouched, so
-  # an established connection keeps running across the renewal.
+  # A renewal is admission by another name, so it takes the same path: it cannot
+  # resurrect a node a revocation has already denied, it cannot roll a revision
+  # or an expiry backwards, and it obeys the cache bound. Claims are untouched,
+  # so an established connection keeps running across a successful renewal.
   defp install_renewed_lease(state, wire, lease) do
-    if stale_lease?(state.leases[lease.node_key], lease) do
-      requeue_renewal_for(state, lease.node_key)
-    else
-      node_revision = Budgets.revision(state.budgets, :node, lease.node_key)
-
-      organization_revision =
-        Budgets.revision(state.budgets, :organization, lease.organization_id)
-
-      state =
-        state
-        |> drop_lease_entry(lease.node_key)
-        |> put_lease_entry(lease.node_key, lease_entry(state, wire, lease))
-        |> drop_revocation_entry(lease.node_key)
-
-      state =
-        if revised_budgets?(state, lease, node_revision, organization_revision) do
-          enforce_revised_budgets(state, lease.node_key, lease.organization_id)
-        else
-          state
-        end
-
-      mark_cache_dirty(state)
+    case accept_verified_lease(state, wire, lease) do
+      {:reply, {:ok, _context}, state} -> state
+      {:reply, {:error, _denied}, state} -> requeue_renewal_for(state, lease.node_key)
     end
   end
 
