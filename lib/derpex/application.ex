@@ -80,6 +80,8 @@ defmodule Derpex.Application do
 
       with {:ok, {_public_key, private_key}} <-
              Derpex.Identity.load_or_create_keypair(identity_path) do
+        private_key = Derpex.Secret.wrap(private_key)
+
         {:ok,
          listener_children(listeners, private_key, gentility) ++
            mesh_children(
@@ -156,7 +158,7 @@ defmodule Derpex.Application do
   defp mesh_children([], _private_key, _mesh_key), do: []
 
   defp mesh_children(mesh_peers, private_key, <<mesh_key::binary-size(32)>>) do
-    [{Derpex.Mesh.Supervisor, {mesh_peers, private_key, mesh_key}}]
+    [{Derpex.Mesh.Supervisor, {mesh_peers, private_key, Derpex.Secret.wrap(mesh_key)}}]
   end
 
   defp mesh_children(_mesh_peers, _private_key, _mesh_key) do

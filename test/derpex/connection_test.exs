@@ -1,8 +1,25 @@
+defmodule Derpex.ConnectionTest.StateHolder do
+  @moduledoc false
+
+  use GenServer
+
+  def start(state), do: GenServer.start(__MODULE__, state)
+
+  @impl true
+  def init(state), do: {:ok, state}
+
+  @impl true
+  def handle_cast(:crash, state), do: {:stop, :deliberate_crash, state}
+end
+
 defmodule Derpex.ConnectionTest do
   use ExUnit.Case, async: true
 
+  import ExUnit.CaptureLog
+
   alias Derpex.ClientInfo
   alias Derpex.Connection
+  alias Derpex.ConnectionTest.StateHolder
   alias Derpex.Crypto
   alias Derpex.Frame
   alias Derpex.Handshake
@@ -199,5 +216,38 @@ defmodule Derpex.ConnectionTest do
     assert {:ok, state, []} = Connection.receive_data(state, header <> :binary.copy(<<1>>, 128))
     assert state.decoder.remaining == 0xFFFFFFFF - 128
     assert state.decoder.fragments == []
+  end
+
+  test "keeps the server private key and mesh key out of inspected state" do
+    {_server_public, server_private} = Crypto.generate_keypair()
+    mesh_key = :crypto.strong_rand_bytes(32)
+    {:ok, state, _actions} = Connection.new(server_private, mesh_key: mesh_key)
+
+    rendered = inspect(state, limit: :infinity, structs: false, binaries: :as_binaries)
+
+    refute rendered =~ Base.encode16(server_private)
+    refute rendered =~ inspect(server_private, limit: :infinity, binaries: :as_binaries)
+    refute rendered =~ Base.encode16(mesh_key)
+    refute rendered =~ inspect(mesh_key, limit: :infinity, binaries: :as_binaries)
+  end
+
+  test "keeps key material out of a crash report carrying connection state" do
+    {_server_public, server_private} = Crypto.generate_keypair()
+    mesh_key = :crypto.strong_rand_bytes(32)
+    {:ok, state, _actions} = Connection.new(server_private, mesh_key: mesh_key)
+
+    log =
+      capture_log(fn ->
+        {:ok, holder} = StateHolder.start(state)
+        reference = Process.monitor(holder)
+        GenServer.cast(holder, :crash)
+        assert_receive {:DOWN, ^reference, :process, ^holder, :deliberate_crash}, 1_000
+      end)
+
+    assert log =~ "deliberate_crash"
+    refute log =~ Base.encode16(server_private)
+    refute log =~ inspect(server_private, limit: :infinity, binaries: :as_binaries)
+    refute log =~ Base.encode16(mesh_key)
+    refute log =~ inspect(mesh_key, limit: :infinity, binaries: :as_binaries)
   end
 end

@@ -114,4 +114,19 @@ defmodule Derpex.SessionTest do
     assert IO.iodata_to_binary(response) =~ "Sec-WebSocket-Protocol: derp"
     assert Session.info(session).phase == :derp
   end
+
+  test "keeps the server private key and mesh key out of inspected state" do
+    {_server_public, server_private} = Crypto.generate_keypair()
+    mesh_key = :crypto.strong_rand_bytes(32)
+    {:ok, session, _actions} = Session.new(server_private, mesh_key: mesh_key)
+    request = "GET /derp HTTP/1.1\r\nUpgrade: DERP\r\nConnection: Upgrade\r\n\r\n"
+    {:ok, session, _actions} = Session.receive_data(session, request)
+
+    rendered = inspect(session, limit: :infinity, structs: false, binaries: :as_binaries)
+
+    refute rendered =~ Base.encode16(server_private)
+    refute rendered =~ inspect(server_private, limit: :infinity, binaries: :as_binaries)
+    refute rendered =~ Base.encode16(mesh_key)
+    refute rendered =~ inspect(mesh_key, limit: :infinity, binaries: :as_binaries)
+  end
 end

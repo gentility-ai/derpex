@@ -4,14 +4,23 @@ defmodule Derpex.Mesh.Supervisor do
   use Supervisor
 
   alias Derpex.Mesh.Client
+  alias Derpex.Secret
 
-  @spec start_link({[binary() | keyword()], binary(), binary()}) :: Supervisor.on_start()
+  @spec start_link({[binary() | keyword()], binary() | Secret.t(), binary() | Secret.t()}) ::
+          Supervisor.on_start()
   def start_link({peers, private_key, mesh_key}) do
-    Supervisor.start_link(__MODULE__, {peers, private_key, mesh_key}, name: __MODULE__)
+    Supervisor.start_link(
+      __MODULE__,
+      {peers, Secret.wrap(private_key), Secret.wrap(mesh_key)},
+      name: __MODULE__
+    )
   end
 
   @impl true
   def init({peers, private_key, mesh_key}) do
+    private_key = Secret.wrap(private_key)
+    mesh_key = Secret.wrap(mesh_key)
+
     peers
     |> Enum.with_index()
     |> Enum.map(fn {peer, index} ->

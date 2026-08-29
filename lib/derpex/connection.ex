@@ -14,13 +14,15 @@ defmodule Derpex.Connection do
   alias Derpex.Frame.Decoder
   alias Derpex.Handshake
   alias Derpex.MeshKey
+  alias Derpex.Secret
   alias Derpex.ServerInfo
 
   @handshake_timeout 10_000
   @max_client_info_length 256 * 1_024
 
+  @derive {Inspect, except: [:private_key, :mesh_key]}
   defstruct [
-    :server_private_key,
+    :private_key,
     :server_info,
     :decoder,
     :phase,
@@ -44,33 +46,33 @@ defmodule Derpex.Connection do
           | {:client_message, Body.client_message()}
 
   @opaque t :: %__MODULE__{
-            server_private_key: binary(),
+            private_key: Secret.t(),
             server_info: ServerInfo.t(),
             decoder: Decoder.t(),
             phase: phase(),
             client_public_key: nil | binary(),
             client_info: nil | ClientInfo.t(),
-            mesh_key: nil | MeshKey.t(),
+            mesh_key: nil | Secret.t(),
             can_mesh: boolean(),
             keep_alive_interval: pos_integer(),
             close_reason: nil | term()
           }
 
   @doc "Creates a connection and returns its greeting and handshake deadline actions."
-  @spec new(binary(), keyword()) :: {:ok, t(), [action()]} | {:error, atom()}
-  def new(server_private_key, options \\ []) do
+  @spec new(binary() | Secret.t(), keyword()) :: {:ok, t(), [action()]} | {:error, atom()}
+  def new(private_key, options \\ []) do
     server_info =
       Keyword.get(options, :server_info, %ServerInfo{version: Handshake.protocol_version()})
 
-    with {:ok, greeting} <- Handshake.server_key_frame(server_private_key) do
+    with {:ok, greeting} <- Handshake.server_key_frame(Secret.reveal(private_key)) do
       state = %__MODULE__{
-        server_private_key: server_private_key,
+        private_key: Secret.wrap(private_key),
         server_info: server_info,
         decoder: Decoder.new(frame_policy: &handshake_frame_policy/2),
         phase: :awaiting_client_info,
         client_public_key: nil,
         client_info: nil,
-        mesh_key: Keyword.get(options, :mesh_key),
+        mesh_key: options |> Keyword.get(:mesh_key) |> Secret.wrap(),
         can_mesh: false,
         keep_alive_interval: 60_000 + keep_alive_jitter(options),
         close_reason: nil
@@ -182,15 +184,17 @@ defmodule Derpex.Connection do
   end
 
   defp authenticate_client_info(state, body) do
+    private_key = Secret.reveal(state.private_key)
+
     with {:ok, client_public_key, client_info} <-
-           Handshake.decode_client_info(body, state.server_private_key),
+           Handshake.decode_client_info(body, private_key),
          {:ok, server_info} <-
            Handshake.server_info_frame(
-             state.server_private_key,
+             private_key,
              client_public_key,
              state.server_info
            ) do
-      can_mesh = MeshKey.trusted?(state.mesh_key, client_info.mesh_key)
+      can_mesh = MeshKey.trusted?(Secret.reveal(state.mesh_key), client_info.mesh_key)
 
       state = %{
         state
