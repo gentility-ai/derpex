@@ -47,6 +47,12 @@ const (
 	// drainIdle ends the catch-up read of the stalled recipient.
 	drainIdle = 500 * time.Millisecond
 
+	// notHereProbes over-sends a fresh connection's peer-gone allowance, which
+	// Go builds as rate.NewLimiter(rate.Every(time.Second), 3), so only
+	// notHereBurst of them are answered.
+	notHereProbes = 5
+	notHereBurst  = 3
+
 	recvBudget    = 10 * time.Second
 	settleBudget  = 10 * time.Second
 	settlePoll    = 10 * time.Millisecond
@@ -202,6 +208,7 @@ func buildTrackedCounters() []string {
 		"derp_current_connections",
 		"derp_current_dup_client_conns",
 		"derp_current_dup_client_keys",
+		"derp_current_home_connections",
 		"derp_got_ping",
 		"derp_packets_forwarded_in",
 		"derp_packets_received",
@@ -459,6 +466,19 @@ func (r *runner) connect(
 	}
 }
 
+// notePreferred marks a client as the caller's home node and snapshots the
+// counters behind a barrier ping on that same connection, so the step's
+// home-connection delta is read only after the server has acted on the frame.
+func (r *runner) notePreferred(
+	scenario *scenarioTrace,
+	name string,
+	client *derphttp.Client,
+	preferred bool,
+) {
+	client.NotePreferred(preferred)
+	scenario.add(r.step(name, nil, clients(client), nil))
+}
+
 func (r *runner) close(client *derphttp.Client) {
 	must(client.Close())
 	r.connections--
@@ -580,6 +600,41 @@ func relayAndDrops(r *runner) scenarioTrace {
 	plainUnknown := r.unknownPeer("unknown_plain")
 	must(first.Send(plainUnknown, []byte("plain packet to nobody")))
 	scenario.add(r.step("unknown_destination_plain", nil, clients(first), nil))
+
+	// Not-here replies are limited per connection, so this run uses a fresh
+	// connection whose allowance is still full. Only the first notHereBurst of
+	// notHereProbes probes are answered; the rest are dropped without a frame.
+	// The step's barrier ping reads the frame after the last reply, so a
+	// further not-here would surface there instead of the pong.
+	limited, limitedInfo := r.connect("limited", "", key.NewNode(), key.DERPMesh{}, false)
+	scenario.add(r.step("connect_rate_limited_sender", nil, nil, []traceEvent{limitedInfo}))
+
+	burstUnknown := r.unknownPeer("unknown_burst")
+	for range notHereProbes {
+		must(limited.Send(burstUnknown, discoPayload(burstUnknown, 0)))
+	}
+	notHere := []traceEvent{}
+	for range notHereBurst {
+		notHere = append(notHere, r.peerGoneEvent("limited",
+			requirePeerGone(recvTimeout(limited), burstUnknown)))
+	}
+	scenario.add(r.step("rate_limited_not_here", nil, clients(limited), notHere))
+
+	r.close(limited)
+	scenario.add(r.step("close_rate_limited_sender", nil, nil, nil))
+
+	// Home-connection accounting, walking TestSendRecv's wantActive sequence
+	// 0 -> 1 -> 1 -> 0 -> 0 -> 1. derphttp.Client suppresses a NotePreferred
+	// that repeats the value it already sent, so the repeat steps pin that the
+	// gauge does not move for a client that is already in that state — which is
+	// what the repeat is there to show — without a frame reaching the server.
+	r.notePreferred(&scenario, "home_preferred_on", first, true)
+	r.notePreferred(&scenario, "home_preferred_repeat_on", first, true)
+	r.notePreferred(&scenario, "home_preferred_off", first, false)
+	r.notePreferred(&scenario, "home_preferred_repeat_off", first, false)
+	// The second client stays preferred until it disconnects, so close_second
+	// records the gauge falling with the connection that held it.
+	r.notePreferred(&scenario, "home_second_preferred_on", second, true)
 
 	// The stalled client never reads. The ordinary flood fills its socket
 	// buffers and then overruns the ordinary send queue; with the writer stuck

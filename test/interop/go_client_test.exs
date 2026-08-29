@@ -11,14 +11,10 @@ defmodule Derpex.Interop.GoClientTest do
   alias Derpex.Secret
   alias Derpex.ServerInfo
   alias Derpex.STUN
+  alias Derpex.Test.UpstreamPin
 
   test "unchanged official derphttp.Client authenticates to DERPEX" do
-    upstream =
-      System.get_env("DERPEX_TAILSCALE_DIR") ||
-        raise "DERPEX_TAILSCALE_DIR must name the pinned Tailscale checkout"
-
-    {expected_commit, 0} = System.cmd("git", ["-C", upstream, "rev-parse", "HEAD"])
-    assert String.trim(expected_commit) == "1e69418c298b680562a2fecd7020f7f58d17d166"
+    upstream = UpstreamPin.checkout!()
 
     {server_public, server_private} = Crypto.generate_keypair()
     parent = self()
@@ -61,7 +57,7 @@ defmodule Derpex.Interop.GoClientTest do
   end
 
   test "two unchanged official Go clients relay packet boundaries and peer-gone through DERPEX" do
-    upstream = System.fetch_env!("DERPEX_TAILSCALE_DIR")
+    upstream = UpstreamPin.checkout!()
     {server_public, server_private} = Crypto.generate_keypair()
 
     {:ok, server} =
@@ -97,7 +93,7 @@ defmodule Derpex.Interop.GoClientTest do
   end
 
   test "unchanged official Go client obeys advertised send rate limits" do
-    upstream = System.fetch_env!("DERPEX_TAILSCALE_DIR")
+    upstream = UpstreamPin.checkout!()
     {server_public, server_private} = Crypto.generate_keypair()
 
     server_info = %ServerInfo{
@@ -138,7 +134,7 @@ defmodule Derpex.Interop.GoClientTest do
   end
 
   test "official DERP prober relays its bounded 100 MB transfer" do
-    upstream = System.fetch_env!("DERPEX_TAILSCALE_DIR")
+    upstream = UpstreamPin.checkout!()
     {server_public, server_private} = Crypto.generate_keypair()
 
     {:ok, server} =
@@ -172,7 +168,7 @@ defmodule Derpex.Interop.GoClientTest do
   end
 
   test "duplicate official Go clients use last-writer-active routing" do
-    upstream = System.fetch_env!("DERPEX_TAILSCALE_DIR")
+    upstream = UpstreamPin.checkout!()
     {server_public, server_private} = Crypto.generate_keypair()
 
     {:ok, server} =
@@ -206,7 +202,7 @@ defmodule Derpex.Interop.GoClientTest do
   end
 
   test "official Go client uses TLS 1.3 metacertificate fast start" do
-    upstream = System.fetch_env!("DERPEX_TAILSCALE_DIR")
+    upstream = UpstreamPin.checkout!()
     {server_public, server_private} = Crypto.generate_keypair()
     directory = Path.join(System.tmp_dir!(), "derpex-tls-#{System.unique_integer([:positive])}")
     certificate = Path.join(directory, "certificate.pem")
@@ -258,7 +254,7 @@ defmodule Derpex.Interop.GoClientTest do
   end
 
   test "official Go region client accepts a raw-IP certificate pin" do
-    upstream = System.fetch_env!("DERPEX_TAILSCALE_DIR")
+    upstream = UpstreamPin.checkout!()
     {server_public, server_private} = Crypto.generate_keypair()
 
     directory =
@@ -284,7 +280,7 @@ defmodule Derpex.Interop.GoClientTest do
   end
 
   test "official low-level client covers unknown and oversize frame edges" do
-    upstream = System.fetch_env!("DERPEX_TAILSCALE_DIR")
+    upstream = UpstreamPin.checkout!()
     {server_public, server_private} = Crypto.generate_keypair()
 
     {:ok, server} =
@@ -322,7 +318,7 @@ defmodule Derpex.Interop.GoClientTest do
   end
 
   test "unchanged official WebSocket client authenticates and pings" do
-    upstream = System.fetch_env!("DERPEX_TAILSCALE_DIR")
+    upstream = UpstreamPin.checkout!()
     {server_public, server_private} = Crypto.generate_keypair()
 
     {:ok, server} =
@@ -380,7 +376,7 @@ defmodule Derpex.Interop.GoClientTest do
   end
 
   test "official STUN client observes its XOR-mapped UDP address" do
-    upstream = System.fetch_env!("DERPEX_TAILSCALE_DIR")
+    upstream = UpstreamPin.checkout!()
     server = start_supervised!({STUN, ip: {127, 0, 0, 1}, port: 0})
     {:ok, {{127, 0, 0, 1}, port}} = STUN.local_address(server)
     helper = Path.expand("../../interop/go/stun_smoke.go", __DIR__)
@@ -397,7 +393,7 @@ defmodule Derpex.Interop.GoClientTest do
   end
 
   test "official mesh watcher observes snapshots and live presence" do
-    upstream = System.fetch_env!("DERPEX_TAILSCALE_DIR")
+    upstream = UpstreamPin.checkout!()
     {server_public, server_private} = Crypto.generate_keypair()
     mesh_key_hex = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
     mesh_key = Base.decode16!(mesh_key_hex, case: :mixed)
@@ -440,7 +436,7 @@ defmodule Derpex.Interop.GoClientTest do
   end
 
   test "official mesh client forwards asserted sources and closes duplicate peers" do
-    upstream = System.fetch_env!("DERPEX_TAILSCALE_DIR")
+    upstream = UpstreamPin.checkout!()
     {server_public, server_private} = Crypto.generate_keypair()
     mesh_key_hex = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
     mesh_key = Base.decode16!(mesh_key_hex, case: :mixed)
@@ -481,7 +477,7 @@ defmodule Derpex.Interop.GoClientTest do
   end
 
   test "official clients observe app-name admission and mesh bypass" do
-    upstream = System.fetch_env!("DERPEX_TAILSCALE_DIR")
+    upstream = UpstreamPin.checkout!()
     {server_public, server_private} = Crypto.generate_keypair()
     mesh_key_hex = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
     mesh_key = Base.decode16!(mesh_key_hex, case: :mixed)
