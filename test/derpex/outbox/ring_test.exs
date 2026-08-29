@@ -227,26 +227,29 @@ defmodule Derpex.Outbox.RingTest do
     assert_stale_producer_recovery(:after_publish, {:ok, :packet})
   end
 
-  test "a forwarding ring counts its drops under its own packet kind" do
-    ring =
-      Ring.new(1,
-        metrics: Derpex.Metrics.default_handle(),
-        metric_kind: :forward
-      )
-
+  test "a ring carrying both classes labels each drop from the packet" do
+    ring = Ring.new(1, metrics: Derpex.Metrics.default_handle(), metric_kind: :by_packet)
+    disco = <<0x54, 0x53, 0xF0, 0x9F, 0x92, 0xAC>> <> :binary.copy(<<7>>, 56)
     before = Derpex.Metrics.snapshot()
-    assert Ring.enqueue(ring, {:forward_packet, <<0::256>>, <<1::256>>, "first"}) == {:ok, :wake}
 
-    assert Ring.enqueue(ring, {:forward_packet, <<0::256>>, <<1::256>>, "second"}) ==
+    assert Ring.enqueue(ring, {:forward_packet, <<0::256>>, <<1::256>>, disco}) == {:ok, :wake}
+
+    assert Ring.enqueue(ring, {:forward_packet, <<0::256>>, <<1::256>>, "plain"}) ==
+             {:ok, :replaced}
+
+    assert Ring.enqueue(ring, {:forward_packet, <<0::256>>, <<1::256>>, "again"}) ==
              {:ok, :replaced}
 
     current = Derpex.Metrics.snapshot()
 
-    assert current[{:packets_dropped, :queue_head, :forward}] -
-             before[{:packets_dropped, :queue_head, :forward}] == 1
+    assert current[{:packets_dropped, :queue_head, :disco}] -
+             before[{:packets_dropped, :queue_head, :disco}] == 1
 
-    assert current[{:bytes_dropped, :queue_head, :forward}] -
-             before[{:bytes_dropped, :queue_head, :forward}] == 5
+    assert current[{:packets_dropped, :queue_head, :other}] -
+             before[{:packets_dropped, :queue_head, :other}] == 1
+
+    assert current[{:bytes_dropped, :queue_head, :disco}] -
+             before[{:bytes_dropped, :queue_head, :disco}] == byte_size(disco)
   end
 
   test "a ring that refuses replacement keeps the item it already holds" do

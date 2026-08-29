@@ -17,6 +17,7 @@ defmodule Derpex.Outbox.Ring do
   """
 
   alias Derpex.Clock
+  alias Derpex.Disco
   alias Derpex.Metrics
   alias Derpex.Outbox.Lock
 
@@ -48,7 +49,7 @@ defmodule Derpex.Outbox.Ring do
             wake_message: atom(),
             test_hook: nil | (atom() -> term()),
             metrics: Metrics.handle() | nil,
-            metric_kind: :disco | :other | :forward | nil
+            metric_kind: :disco | :other | :by_packet | nil
           }
 
   @type enqueue_result :: {:ok, :wake | :coalesced | :replaced} | {:dropped, atom()}
@@ -444,8 +445,23 @@ defmodule Derpex.Outbox.Ring do
   defp record_drop(%{metric_kind: nil}, _item, _reason), do: :ok
 
   defp record_drop(ring, item, reason) do
-    Metrics.add_drop(ring.metrics, reason, ring.metric_kind, packet_size(item))
+    Metrics.add_drop(ring.metrics, reason, drop_kind(ring, item), packet_size(item))
   end
+
+  # A ring that carries one class of traffic labels its drops with that class.
+  # A forwarding ring carries both, so it labels each drop the way Go does,
+  # from the packet itself.
+  defp drop_kind(%{metric_kind: :by_packet}, item), do: packet_kind(item)
+  defp drop_kind(ring, _item), do: ring.metric_kind
+
+  defp packet_kind({:recv_packet, _source, packet}), do: packet_kind(packet)
+  defp packet_kind({:forward_packet, _source, _destination, packet}), do: packet_kind(packet)
+
+  defp packet_kind(packet) when is_binary(packet) do
+    if Disco.looks_like_wrapper?(packet), do: :disco, else: :other
+  end
+
+  defp packet_kind(_non_packet), do: :other
 
   defp packet_size({:recv_packet, _source, packet}) when is_binary(packet), do: byte_size(packet)
 

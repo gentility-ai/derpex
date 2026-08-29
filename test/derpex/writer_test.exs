@@ -413,7 +413,7 @@ defmodule Derpex.WriterTest do
     assert ordinary_frames_before(frames, disco_position) <= 2
   end
 
-  defp disco_packet, do: <<0x64, 0x65, 0x87, 0xB0, 0x8E, 0xF5>> <> :binary.copy(<<7>>, 26)
+  defp disco_packet, do: <<0x54, 0x53, 0xF0, 0x9F, 0x92, 0xAC>> <> :binary.copy(<<7>>, 56)
 
   defp ordinary_frames_before(frames, position) do
     disco = disco_packet()

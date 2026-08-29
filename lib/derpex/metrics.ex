@@ -24,6 +24,7 @@ defmodule Derpex.Metrics do
     :peer_gone_disconnected_frames,
     :peer_gone_not_here_frames,
     :packets_forwarded_out,
+    :packets_forwarded_dropped,
     :packets_forwarded_in,
     :remove_forwarder_other,
     :home_moves_in,
@@ -42,7 +43,7 @@ defmodule Derpex.Metrics do
     :write_error,
     :dup_client
   ]
-  @packet_kinds [:disco, :other, :forward]
+  @packet_kinds [:disco, :other]
   @tcp_rtt_buckets [
     {10_000, "10ms"},
     {20_000, "20ms"},

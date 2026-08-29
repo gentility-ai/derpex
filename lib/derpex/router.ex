@@ -773,12 +773,22 @@ defmodule Derpex.Router do
         # measures forwarding attempts. Counting only successes here would make
         # DERPEX's series disagree with the oracle's on every dropped forward.
         Metrics.add(Metrics.default_handle(), :packets_forwarded_out, 1)
-        safe_enqueue(ring, {:forward_packet, source, destination, packet})
+        record_forwarded(safe_enqueue(ring, {:forward_packet, source, destination, packet}))
 
       [] ->
         {:dropped, :unknown_destination}
     end
   end
+
+  # The kind/reason matrix already carries a forwarding drop under the packet's
+  # own class. This counter is the one thing that matrix cannot say: that the
+  # packet was on its way to another region.
+  defp record_forwarded({:dropped, _reason} = result) do
+    Metrics.add(Metrics.default_handle(), :packets_forwarded_dropped, 1)
+    result
+  end
+
+  defp record_forwarded(result), do: result
 
   defp publish_preferred_forwarder(key, []) do
     true = :ets.delete(@forwarders_table, key)

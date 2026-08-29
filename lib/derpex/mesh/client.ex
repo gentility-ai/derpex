@@ -493,12 +493,13 @@ defmodule Derpex.Mesh.Client do
 
   defp new_ring(state) do
     # Packets bound for another region are dropped under the same rules as any
-    # other queue, so they are counted under their own kind.
+    # other queue. Each drop is labelled from the packet, the way Go labels a
+    # drop it makes on behalf of a forwarder.
     Ring.new(state.queue_capacity,
       notifier: self(),
       wake_message: @wake_message,
       metrics: state.metrics,
-      metric_kind: :forward
+      metric_kind: :by_packet
     )
   end
 
