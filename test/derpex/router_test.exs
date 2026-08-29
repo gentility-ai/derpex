@@ -366,6 +366,24 @@ defmodule Derpex.RouterTest do
     Process.exit(destination, :kill)
   end
 
+  # Go's `handleFrameSendPacket` increments `packetsForwardedOut` before it calls
+  # `ForwardPacket`, so the counter measures forwarding attempts, not deliveries.
+  test "forwarding counts the attempt even when the forwarder ring refuses it" do
+    source = :crypto.strong_rand_bytes(32)
+    destination = :crypto.strong_rand_bytes(32)
+    forwarder_ring = Ring.new(1)
+
+    assert Router.add_forwarder(destination, :closed, forwarder_ring) == :ok
+    Ring.close(forwarder_ring)
+
+    before = Metrics.snapshot()[:packets_forwarded_out]
+
+    assert {:dropped, _reason} = Router.route(source, destination, "refused")
+    assert Metrics.snapshot()[:packets_forwarded_out] == before + 1
+
+    assert Router.remove_forwarder(destination, :closed) == :ok
+  end
+
   test "removing an unregistered forwarder identity leaves the registered path alone" do
     source = :crypto.strong_rand_bytes(32)
     sender = :crypto.strong_rand_bytes(32)

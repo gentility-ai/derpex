@@ -155,13 +155,30 @@ defmodule Derpex.BootstrapDNS do
   end
 
   defp note_query(state, query) do
-    queried_domains = MapSet.put(state.queried_domains, query)
+    queried_domains = MapSet.put(state.queried_domains, retained_query(query))
 
     queried_domains =
       if MapSet.size(queried_domains) > 500, do: MapSet.new(), else: queried_domains
 
     %{state | queried_domains: queried_domains}
   end
+
+  # Go's `handleBootstrapDNS` stores the raw `q` parameter and bounds only the
+  # entry count (`bootstrapLookupMap.Len() > 500` clears the map). The query is
+  # attacker-chosen and unbounded in length, so those 500 entries can retain
+  # megabytes. DERPEX keeps Go's entry bound and additionally caps each retained
+  # name, which bounds the set at 500 * @max_retained_query bytes. A DNS name
+  # cannot exceed 253 bytes, so no real query is truncated, and the lookup
+  # itself still uses the untruncated query against both caches.
+  @max_retained_query 256
+
+  defp retained_query(query) when byte_size(query) > @max_retained_query do
+    # A sub-binary would keep the whole oversized query alive, so copy the
+    # prefix out. Without this the cap would retain nothing.
+    :binary.copy(binary_part(query, 0, @max_retained_query))
+  end
+
+  defp retained_query(query), do: query
 
   defp new_state(published, unpublished, percentages) do
     zero_metrics()

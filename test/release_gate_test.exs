@@ -5,6 +5,8 @@ defmodule Derpex.ReleaseGateTest do
   @ci Path.join(@root, ".github/workflows/ci.yml")
   @release Path.join(@root, ".github/workflows/release.yml")
   @test_helper Path.join(@root, "test/test_helper.exs")
+  @manifest_step "Require a published checksum manifest on a stable tag"
+  @manifest "checksum-Elixir.Derpex.Crypto.Native.exs"
 
   describe "mix aliases" do
     setup do
@@ -90,6 +92,36 @@ defmodule Derpex.ReleaseGateTest do
     end
   end
 
+  describe "the empty-checksum-manifest gate" do
+    setup do
+      {:ok, script: step_script(Map.fetch!(jobs(@release), "version"), @manifest_step)}
+    end
+
+    test "refuses an empty manifest on a stable tag", %{script: script} do
+      assert {status, output} = run_gate(script, "refs/tags/v1.4.0", "1.4.0", "%{}\n")
+
+      assert status != 0
+      assert output =~ "checksum-Elixir.Derpex.Crypto.Native.exs"
+    end
+
+    test "accepts an empty manifest on a prerelease tag", %{script: script} do
+      assert {0, output} = run_gate(script, "refs/tags/v1.4.0-rc.1", "1.4.0-rc.1", "%{}\n")
+
+      assert output =~ "source"
+    end
+
+    test "accepts a populated manifest on a stable tag", %{script: script} do
+      manifest =
+        ~s(%{\n  "libderpex_crypto-v1.4.0-nif-2.15-x86_64-unknown-linux-gnu.so.tar.gz" =>\n    "sha256:abc"\n})
+
+      assert {0, _output} = run_gate(script, "refs/tags/v1.4.0", "1.4.0", manifest)
+    end
+
+    test "leaves a manual dispatch off a tag ungated", %{script: script} do
+      assert {0, _output} = run_gate(script, "refs/heads/main", "1.4.0", "%{}\n")
+    end
+  end
+
   describe "the workflow parser" do
     test "reads scalar, inline, and block dependency lists" do
       path =
@@ -119,6 +151,58 @@ defmodule Derpex.ReleaseGateTest do
       assert needs(parsed["inline"]) == ["gate", "version"]
       assert needs(parsed["block"]) == ["gate", "version"]
     end
+  end
+
+  # Runs one workflow step's shell body the way Actions does (`bash -e`), in a
+  # scratch directory holding the manifest under test, so the gate is exercised
+  # rather than merely grepped for.
+  defp run_gate(script, github_ref, version, manifest) do
+    directory = Path.join(System.tmp_dir!(), "derpex-gate-#{System.unique_integer([:positive])}")
+    File.mkdir_p!(directory)
+    on_exit(fn -> File.rm_rf!(directory) end)
+
+    File.write!(Path.join(directory, @manifest), manifest)
+    File.write!(Path.join(directory, "step.sh"), script)
+
+    {output, status} =
+      System.cmd("bash", ["-e", "step.sh"],
+        cd: directory,
+        stderr_to_stdout: true,
+        env: [{"GITHUB_REF", github_ref}, {"VERSION", version}]
+      )
+
+    {status, output}
+  end
+
+  # Extracts a named step's `run: |` body from a job, dedented so it runs
+  # standalone. Requires the step to interpolate nothing: `${{ }}` belongs in
+  # the step's `env:` block so the body stays executable outside Actions.
+  defp step_script(job, name) do
+    lines =
+      job
+      |> String.split("\n")
+      |> Enum.drop_while(&(String.trim(&1) != "- name: " <> name))
+      |> Enum.drop(1)
+      |> Enum.take_while(&(not String.starts_with?(String.trim(&1), "- name:")))
+      |> Enum.drop_while(&(String.trim(&1) != "run: |"))
+      |> Enum.drop(1)
+
+    assert lines != [], "the version job has no `run: |` step named #{inspect(name)}"
+
+    refute Enum.any?(lines, &String.contains?(&1, "${{")),
+           "step #{inspect(name)} interpolates in its body, so it cannot be run or tested alone"
+
+    dedent(lines)
+  end
+
+  defp dedent(lines) do
+    indent =
+      lines
+      |> Enum.reject(&(String.trim(&1) == ""))
+      |> Enum.map(&(byte_size(&1) - byte_size(String.trim_leading(&1))))
+      |> Enum.min()
+
+    Enum.map_join(lines, "\n", &String.slice(&1, indent..-1//1))
   end
 
   # `jobs/1` and `needs/1` are deliberately minimal: they read job names and

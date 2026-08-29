@@ -110,6 +110,7 @@ version = "0.1.0"
 dependencies = [
  "crypto_box",
  "rustler",
+ "zeroize",
 ]
 
 [[package]]
