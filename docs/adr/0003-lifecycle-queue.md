@@ -37,10 +37,30 @@ not care which one they hold).
 A frame that loses the queue's lock is never dropped. The router parks it in
 arrival order and retries it on its own timer, counting `derp_lifecycle_contention`,
 because a presence change that vanishes leaves a watcher's view wrong with
-nothing to correct it. The snapshot a new watcher is owed is streamed in chunks
-of 1024 rather than sent inside the `watch` call: a region-sized snapshot would
-otherwise hold the router for tens of thousands of frames and overflow a
-watcher that is merely behind.
+nothing to correct it. That includes the reverse-path `peer_gone` a destination
+is owed when a source it was relaying to leaves: it is the one frame that
+cannot be reconstructed, because `ReversePaths.take/1` has already removed the
+row naming the destination. The parked frames of one watcher never hold up
+another's: a queue whose lock is held is skipped to the next connection, and
+each connection's own frames keep their arrival order.
+
+The snapshot a new watcher is owed is streamed in chunks of 1024 rather than
+sent inside the `watch` call: a region-sized snapshot would otherwise hold the
+router for tens of thousands of frames and overflow a watcher that is merely
+behind. A snapshot may fill at most half the queue, and its chunk is never
+larger than that half; the rest stays free for the presence changes that keep
+arriving while it streams. Without that reserve a snapshot of a region larger
+than the soft cap filled the queue to the cap and the next arrival overflowed
+it, so a watcher was closed for connecting to a region that was too big.
+
+Presence in a chunk is read when the chunk is sent, not when the watch began.
+A peer that leaves while its chunk is still unsent is therefore skipped, and
+its `peer_gone` — already broadcast — reaches the watcher without a matching
+`peer_present`. That is the intended direction of the two errors: removing a
+peer the watcher never added is a no-op on its view, while announcing a peer
+that has already left would leave it believing in a peer nothing will ever
+retract. Go, which sends its snapshot synchronously under the lock, has neither
+case.
 
 There is a **soft cap** of 65,536 frames. Beyond it the queue refuses the frame,
 counts `derp_lifecycle_queue_overflows`, and tells its owner — the connection —

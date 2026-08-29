@@ -696,11 +696,16 @@ defmodule Derpex.Router do
   defp note_peer_gone_from_region(_key, true = _still_reachable?), do: :ok
   defp note_peer_gone_from_region(key, false = _still_reachable?), do: notify_peer_gone(key)
 
+  # `take/1` has already deleted the rows, so nothing can retry this frame from
+  # the reverse-path index: a peer-gone that loses the queue's lock has to be
+  # parked like any other presence change, or the destination is left believing
+  # a peer it was relaying to is still there.
   defp notify_peer_gone(key) do
     key
     |> ReversePaths.take()
-    |> Enum.each(fn {_destination_connection, lifecycle} ->
-      _enqueue_result = notify_enqueue(lifecycle, {:peer_gone, key, 0x00})
+    |> Enum.each(fn {destination_connection, lifecycle} ->
+      _enqueue_result =
+        notify_enqueue(lifecycle, {:peer_gone, key, 0x00}, destination_connection)
     end)
   end
 
@@ -742,8 +747,10 @@ defmodule Derpex.Router do
   end
 
   defp send_snapshot_chunk(state, connection, lifecycle, keys) do
-    if room_for_snapshot_chunk?(lifecycle) do
-      {chunk, rest} = Enum.split(keys, @snapshot_chunk)
+    chunk_size = snapshot_chunk_size(lifecycle)
+
+    if room_for_snapshot_chunk?(lifecycle, chunk_size) do
+      {chunk, rest} = Enum.split(keys, chunk_size)
 
       state.routes
       |> snapshot_presence(chunk)
@@ -761,12 +768,31 @@ defmodule Derpex.Router do
       _timer = Process.send_after(self(), {:snapshot_chunk, connection}, @snapshot_pause_ms)
       state
     end
+  rescue
+    # The queue dies with its connection, and the DOWN that ends the watch can
+    # be behind the chunk message being handled. A watcher that left mid
+    # snapshot ends its own stream; it does not take the router with it.
+    ArgumentError -> %{state | snapshots: Map.delete(state.snapshots, connection)}
   end
 
-  defp room_for_snapshot_chunk?(%LifecycleQueue{} = queue),
-    do: LifecycleQueue.room_for?(queue, @snapshot_chunk)
+  # A snapshot may fill half the queue; the other half stays free for the
+  # presence changes that keep arriving while it streams. Filling the queue to
+  # the cap left the next broadcast to overflow it, so a region larger than the
+  # soft cap could not onboard a watcher at all — it was closed for connecting.
+  # The chunk is capped by the same allowance, so a queue smaller than a chunk
+  # is streamed in pieces it can hold rather than waiting for room it can never
+  # have.
+  defp snapshot_chunk_size(%LifecycleQueue{} = queue),
+    do: max(min(@snapshot_chunk, snapshot_allowance(queue)), 1)
 
-  defp room_for_snapshot_chunk?(_ring), do: true
+  defp snapshot_chunk_size(_ring), do: @snapshot_chunk
+
+  defp room_for_snapshot_chunk?(%LifecycleQueue{} = queue, chunk_size),
+    do: LifecycleQueue.size(queue) + chunk_size <= snapshot_allowance(queue)
+
+  defp room_for_snapshot_chunk?(_ring, _chunk_size), do: true
+
+  defp snapshot_allowance(queue), do: max(div(LifecycleQueue.soft_cap(queue), 2), 1)
 
   defp snapshot_presence(routes, keys) do
     routes
@@ -848,16 +874,12 @@ defmodule Derpex.Router do
   # A presence change is state, and ADR 0003 promises a watcher's view is
   # complete or absent, so a frame that loses the lock is parked and retried in
   # order, and a watcher whose parked frames pass the soft cap is closed.
-  defp notify_enqueue(ring, message), do: notify_enqueue(ring, message, nil)
-
-  defp notify_enqueue(ring, message, nil), do: safe_enqueue(ring, message, wait: false)
-
   defp notify_enqueue(ring, message, connection) do
     if parked?(connection) do
-      park(connection, ring, message)
+      park(connection, ring, message, :already_parked)
     else
       case safe_enqueue(ring, message, wait: false) do
-        {:dropped, :contention} -> park(connection, ring, message)
+        {:dropped, :contention} -> park(connection, ring, message, :newly_parked)
         result -> result
       end
     end
@@ -870,39 +892,60 @@ defmodule Derpex.Router do
     end
   end
 
-  defp park(connection, ring, message) do
+  # The flush is already on its way for a connection that is already parked, so
+  # only the frame that parks it asks for one: a backlog of a thousand frames
+  # would otherwise put a thousand flush messages in the router's mailbox for a
+  # backlog it is already draining.
+  defp park(connection, ring, message, parked_state) do
     :ok = Metrics.add(Metrics.default_handle(), :lifecycle_contention, 1)
     sequence = :erlang.unique_integer([:positive, :monotonic])
     true = :ets.insert(@pending_table, {{connection, sequence}, ring, message})
-    send(self(), :derpex_flush_lifecycle)
+    if parked_state == :newly_parked, do: send(self(), :derpex_flush_lifecycle)
     {:ok, :parked}
   end
 
   # One bounded pass per message, so flushing a backlog never holds the router.
-  defp flush_parked(0) do
+  # A connection whose queue is still locked is skipped to the next connection
+  # rather than ending the pass: the table is shared and ordered by pid, so
+  # stopping at the first locked queue let one watcher's writer hold up the
+  # presence frames of every watcher that sorts after it. Each connection's own
+  # frames stay in order, because the skip is to the next connection.
+  defp flush_parked(budget), do: flush_parked(:ets.first(@pending_table), budget, false)
+
+  defp flush_parked(:"$end_of_table", _budget, contended?), do: end_flush(contended?)
+
+  defp flush_parked(_key, 0, contended?), do: end_flush(contended?, :more_to_do)
+
+  defp flush_parked({connection, _sequence} = key, budget, contended?) do
+    [{^key, ring, message}] = :ets.lookup(@pending_table, key)
+
+    case safe_enqueue(ring, message, wait: false) do
+      {:dropped, :contention} ->
+        flush_parked(
+          :ets.next(@pending_table, {connection, :end_of_connection}),
+          budget - 1,
+          true
+        )
+
+      _delivered_or_closed ->
+        true = :ets.delete(@pending_table, key)
+        flush_parked(:ets.next(@pending_table, key), budget - 1, contended?)
+    end
+  end
+
+  defp end_flush(contended?, remaining \\ :done)
+
+  defp end_flush(true, _remaining) do
+    _timer = Process.send_after(self(), :derpex_flush_lifecycle, @flush_retry_ms)
+    :ok
+  end
+
+  defp end_flush(false, :more_to_do) do
     send(self(), :derpex_flush_lifecycle)
     :ok
   end
 
-  defp flush_parked(budget) do
-    case :ets.first(@pending_table) do
-      :"$end_of_table" ->
-        :ok
-
-      key ->
-        [{^key, ring, message}] = :ets.lookup(@pending_table, key)
-
-        case safe_enqueue(ring, message, wait: false) do
-          {:dropped, :contention} ->
-            _timer = Process.send_after(self(), :derpex_flush_lifecycle, @flush_retry_ms)
-            :ok
-
-          _delivered_or_closed ->
-            true = :ets.delete(@pending_table, key)
-            flush_parked(budget - 1)
-        end
-    end
-  end
+  defp end_flush(false, :done), do: :ok
 
   defp forget_parked(connection) do
     :ets.select_delete(@pending_table, [{{{connection, :_}, :_, :_}, [], [true]}])

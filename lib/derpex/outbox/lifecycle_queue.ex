@@ -265,13 +265,21 @@ defmodule Derpex.Outbox.LifecycleQueue do
   end
 
   @doc """
-  True when `count` more frames fit under the soft cap.
+  True when `count` more frames fit below the soft cap.
 
   A producer that can wait asks first rather than overflowing a watcher that is
-  merely behind.
+  merely behind. The test is strict, because `enqueue/3` refuses a frame at the
+  cap rather than above it: a caller told there was room for exactly the cap
+  filled the queue and left the next frame to overflow it. A caller streaming a
+  backlog wants headroom rather than the last slot, and asks against
+  `soft_cap/1` instead.
   """
   @spec room_for?(t(), pos_integer()) :: boolean()
-  def room_for?(%__MODULE__{} = queue, count), do: size(queue) + count <= queue.soft_cap
+  def room_for?(%__MODULE__{} = queue, count), do: size(queue) + count < queue.soft_cap
+
+  @doc "The depth at which the queue refuses a frame and asks its owner to close."
+  @spec soft_cap(t()) :: pos_integer()
+  def soft_cap(%__MODULE__{} = queue), do: queue.soft_cap
 
   @doc "True once the queue has been closed. One atomic read, no lock."
   @spec closed?(t()) :: boolean()

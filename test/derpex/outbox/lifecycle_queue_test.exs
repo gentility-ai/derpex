@@ -67,6 +67,21 @@ defmodule Derpex.Outbox.LifecycleQueueTest do
     assert LifecycleQueue.take(queue) == {:ok, 1}
   end
 
+  # The queue refuses a frame at the cap, not above it, so a caller told there
+  # was room for exactly the cap would fill it and leave the next frame — one it
+  # is not asking about — to overflow.
+  test "room_for? answers about frames that fit below the cap" do
+    queue = LifecycleQueue.new(soft_cap: 4, owner: self())
+
+    assert LifecycleQueue.soft_cap(queue) == 4
+    assert LifecycleQueue.room_for?(queue, 3)
+    refute LifecycleQueue.room_for?(queue, 4)
+
+    assert {:ok, _wake} = LifecycleQueue.enqueue(queue, :first)
+    assert LifecycleQueue.room_for?(queue, 2)
+    refute LifecycleQueue.room_for?(queue, 3)
+  end
+
   test "close releases every retained frame and refuses more" do
     queue = LifecycleQueue.new()
     assert {:ok, :wake} = LifecycleQueue.enqueue(queue, :first)

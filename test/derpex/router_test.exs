@@ -654,6 +654,50 @@ defmodule Derpex.RouterTest do
     end
   end
 
+  # A watcher whose queue is smaller than the region cannot be given the whole
+  # snapshot at once, so the stream waits for room. What it must not do is take
+  # every last slot: the next presence change then overflows the queue and the
+  # watcher is closed for having connected to a region that is too big.
+  test "a stalled snapshot leaves room for the presence changes that follow it" do
+    parent = self()
+    connection = spawn(fn -> Process.sleep(:infinity) end)
+    ring = Ring.new(1)
+    soft_cap = 2_048
+    peers = for _index <- 1..3_000, do: :crypto.strong_rand_bytes(32)
+    late_peer = :crypto.strong_rand_bytes(32)
+
+    # The queue's table belongs to the watcher, as a connection's does, so it
+    # goes away with the watcher rather than with this test process.
+    watcher =
+      spawn(fn ->
+        send(parent, {:queue, LifecycleQueue.new(owner: parent, soft_cap: soft_cap)})
+        Process.sleep(:infinity)
+      end)
+
+    assert_receive {:queue, lifecycle}
+
+    on_exit(fn ->
+      Enum.each([late_peer | peers], &Router.unregister(&1, connection))
+      Process.exit(connection, :kill)
+      Process.exit(watcher, :kill)
+    end)
+
+    Enum.each(peers, &(:ok = Router.register(&1, connection, ring)))
+    assert Router.watch(watcher, lifecycle) == :ok
+
+    # The watcher never drains, so the snapshot stalls partway through.
+    assert_eventually(fn -> LifecycleQueue.size(lifecycle) > 0 end, 500)
+    Process.sleep(50)
+    stalled = LifecycleQueue.size(lifecycle)
+    assert stalled < soft_cap
+
+    # A peer arriving while the snapshot waits is a frame the watcher is owed,
+    # not a reason to close it.
+    assert Router.register(late_peer, connection, ring) == :ok
+    refute_receive {:derpex_lifecycle_overflow, _size}, 200
+    assert LifecycleQueue.size(lifecycle) <= soft_cap
+  end
+
   test "a presence change that loses the queue lock is delivered, not dropped" do
     watcher = spawn(fn -> Process.sleep(:infinity) end)
     connection = spawn(fn -> Process.sleep(:infinity) end)
@@ -684,6 +728,87 @@ defmodule Derpex.RouterTest do
     assert_eventually(fn -> LifecycleQueue.size(queue) == 1 end, 200)
 
     assert {:ok, {:peer_present, ^key, _ip, _port, _flags, _app}} = LifecycleQueue.take(queue)
+  end
+
+  # A reverse-path peer-gone is the one presence frame that cannot be retried:
+  # `take/1` has already deleted the row that names the destination. Losing the
+  # queue's lock therefore left the destination believing a peer it had been
+  # relaying to was still there, with nothing to correct it.
+  test "a reverse-path peer gone that loses the queue lock is parked, not dropped" do
+    source = :crypto.strong_rand_bytes(32)
+    destination = :crypto.strong_rand_bytes(32)
+    source_connection = spawn(fn -> Process.sleep(:infinity) end)
+    destination_connection = spawn(fn -> Process.sleep(:infinity) end)
+
+    lifecycle =
+      LifecycleQueue.new(notifier: destination_connection, owner: destination_connection)
+
+    on_exit(fn ->
+      Router.unregister(destination, destination_connection)
+      Process.exit(source_connection, :kill)
+      Process.exit(destination_connection, :kill)
+    end)
+
+    assert Router.register(source, source_connection, Ring.new(1)) == :ok
+
+    assert Router.register(
+             destination,
+             destination_connection,
+             Ring.new(1),
+             Ring.new(1),
+             lifecycle
+           ) ==
+             :ok
+
+    assert Router.note_send(source, destination_connection, lifecycle) == :ok
+
+    # Held the way the destination's own writer holds it mid-drain.
+    {:ok, token} = Lock.acquire_producer(lifecycle.table, false, nil)
+    assert Router.unregister(source, source_connection) == :ok
+
+    assert_eventually(fn -> :ets.info(Derpex.Router.PendingLifecycle, :size) > 0 end, 200)
+    Lock.release(lifecycle.table, token)
+
+    assert_eventually(fn -> LifecycleQueue.size(lifecycle) == 1 end, 500)
+    assert LifecycleQueue.take(lifecycle) == {:ok, {:peer_gone, source, 0x00}}
+  end
+
+  # The parked table is shared and ordered by connection, so stopping the flush
+  # at the first locked queue let one watcher hold up the presence frames of
+  # every watcher that sorts after it.
+  test "a parked frame is not held up by another watcher's locked queue" do
+    first = spawn(fn -> Process.sleep(:infinity) end)
+    second = spawn(fn -> Process.sleep(:infinity) end)
+    connection = spawn(fn -> Process.sleep(:infinity) end)
+    key = :crypto.strong_rand_bytes(32)
+
+    # The table is keyed by pid, and the held queue has to sort first for its
+    # lock to be able to hold anything up.
+    [held_watcher, free_watcher] = Enum.sort([first, second])
+    held = LifecycleQueue.new(notifier: held_watcher, owner: held_watcher)
+    free = LifecycleQueue.new(notifier: free_watcher, owner: free_watcher)
+
+    on_exit(fn ->
+      Router.unregister(key, connection)
+      Enum.each([first, second, connection], &Process.exit(&1, :kill))
+    end)
+
+    assert Router.watch(held_watcher, held) == :ok
+    assert Router.watch(free_watcher, free) == :ok
+
+    {:ok, held_token} = Lock.acquire_producer(held.table, false, nil)
+    {:ok, free_token} = Lock.acquire_producer(free.table, false, nil)
+    assert Router.register(key, connection, Ring.new(1)) == :ok
+    assert_eventually(fn -> :ets.info(Derpex.Router.PendingLifecycle, :size) == 2 end, 500)
+
+    # Only the free watcher's queue is released: its frame must not wait for the
+    # other watcher's writer.
+    Lock.release(free.table, free_token)
+    assert_eventually(fn -> LifecycleQueue.size(free) == 1 end, 500)
+    assert {:ok, {:peer_present, ^key, _ip, _port, _flags, _app}} = LifecycleQueue.take(free)
+
+    Lock.release(held.table, held_token)
+    assert_eventually(fn -> LifecycleQueue.size(held) == 1 end, 500)
   end
 
   test "a stalled watcher still learns about every peer that arrived" do

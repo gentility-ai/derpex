@@ -88,6 +88,12 @@ defmodule Derpex.Writer do
     transport = Keyword.fetch!(options, :transport)
     socket = Keyword.fetch!(options, :socket)
 
+    # The owner links the writer and ends an ordinary connection with
+    # {:shutdown, _} — a closed peer, a drain deadline, a lifecycle overflow.
+    # An untrapped signal kills the writer where it stands, so terminate/2 never
+    # runs and the reverse paths it recorded outlive the queue they name.
+    Process.flag(:trap_exit, true)
+
     {:ok,
      %{
        owner: owner,
@@ -151,6 +157,15 @@ defmodule Derpex.Writer do
   def handle_info({:DOWN, monitor, :process, _owner, reason}, %{owner_monitor: monitor} = state) do
     {:stop, {:owner_down, reason}, state}
   end
+
+  # An orderly stop, so terminate/2 runs and the reverse paths go with it.
+  def handle_info({:EXIT, owner, reason}, %{owner: owner} = state) do
+    {:stop, {:shutdown, {:owner_exit, reason}}, state}
+  end
+
+  def handle_info({:EXIT, _linked, :normal}, state), do: {:noreply, state}
+
+  def handle_info({:EXIT, _linked, reason}, state), do: {:stop, reason, state}
 
   # The writer is the last part of a connection to stop, so it is the last
   # thing that can record a reverse path for it. Forgetting them here means a

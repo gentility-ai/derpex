@@ -386,6 +386,43 @@ defmodule Derpex.WriterTest do
     assert reverse_paths_for(source) == 0
   end
 
+  # The handler links the writer and ends an ordinary connection with
+  # {:shutdown, _} — a closed peer, a drain deadline, a lifecycle overflow. An
+  # untrapped exit signal kills the writer where it stands, so the sweep in
+  # terminate/2 never runs and the reverse paths outlive the queue they name.
+  test "a writer whose owner shuts down still forgets its reverse paths" do
+    parent = self()
+
+    owner =
+      spawn(fn ->
+        {:ok, writer} =
+          Writer.start_link(
+            owner: self(),
+            transport: ControlledTransport,
+            socket: {parent, :shutdown_owner, :open}
+          )
+
+        send(parent, {:writer, writer})
+
+        receive do
+          :stop -> exit({:shutdown, :close_peer})
+        end
+      end)
+
+    assert_receive {:writer, writer}
+    rings = rings(writer)
+    source = :crypto.strong_rand_bytes(32)
+
+    enqueue_until_accepted(rings.ordinary, {:recv_packet, source, "packet"})
+    assert_receive {:write_finished, :shutdown_owner, _frame}
+    assert reverse_paths_for(source) == 1
+
+    monitor = Process.monitor(writer)
+    send(owner, :stop)
+    assert_receive {:DOWN, ^monitor, :process, ^writer, _reason}
+    assert reverse_paths_for(source) == 0
+  end
+
   test "a source is noted once until it goes away and comes back" do
     {:ok, writer} =
       Writer.start_link(
