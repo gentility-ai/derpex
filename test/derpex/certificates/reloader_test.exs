@@ -1,6 +1,8 @@
 defmodule Derpex.Certificates.ReloaderTest do
   use ExUnit.Case, async: false
 
+  import ExUnit.CaptureLog
+
   alias Derpex.Certificates.Manual
   alias Derpex.Certificates.Reloader
   alias Derpex.Crypto
@@ -30,8 +32,7 @@ defmodule Derpex.Certificates.ReloaderTest do
 
     File.write!(active.key_path, original_key_pem)
 
-    assert {:error, "TLS private key does not match leaf certificate"} =
-             Reloader.reload(reloader)
+    assert Reloader.reload(reloader) == {:error, :private_key_mismatch}
 
     assert current_leaf(snapshot_key) == replacement.certificate_der
     assert %{reloads: 2, failures: 1, last_error: last_error} = Reloader.stats(reloader)
@@ -39,6 +40,40 @@ defmodule Derpex.Certificates.ReloaderTest do
 
     GenServer.stop(reloader)
     assert Reloader.current_options(snapshot_key) == :undefined
+  end
+
+  test "logs a fixed reason atom and never certificate or key bytes" do
+    {active, replacement} = certificate_pair_directories()
+    snapshot_key = {__MODULE__, make_ref()}
+
+    {:ok, reloader} =
+      Reloader.start_link(
+        snapshot_key: snapshot_key,
+        certificate_path: active.certificate_path,
+        key_path: active.key_path,
+        server_public_key: :crypto.strong_rand_bytes(32),
+        interval_ms: 60_000
+      )
+
+    on_exit(fn -> if Process.alive?(reloader), do: GenServer.stop(reloader) end)
+
+    File.cp!(replacement.key_path, active.key_path)
+    assert Reloader.reload(reloader) == {:error, :private_key_mismatch}
+
+    File.write!(active.key_path, <<0, 1, 2, 3, 0xFF>>)
+
+    log =
+      capture_log(fn ->
+        send(reloader, :derpex_reload_certificate)
+        assert Reloader.reload(reloader) == {:error, :invalid_private_key}
+      end)
+
+    assert log =~ "DERP TLS certificate reload failed: invalid_private_key"
+    refute log =~ "<<"
+    assert %{last_error: :invalid_private_key} = Reloader.stats(reloader)
+
+    File.rm!(active.certificate_path)
+    assert Reloader.reload(reloader) == {:error, :missing_certificate_file}
   end
 
   test "new SNI handshakes use a rotated certificate without restarting the listener" do
