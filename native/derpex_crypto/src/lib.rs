@@ -127,9 +127,12 @@ fn open_box(
 
 /// Copies a 32 byte key out of a NIF binary.
 ///
-/// The copy is wrapped in `Zeroizing` so a private key never outlives the call
-/// as readable bytes on the stack: without it the array is left behind for the
-/// next frame to expose in a core dump or an adjacent allocation.
+/// The copy is wrapped in `Zeroizing` so this array is wiped when it drops.
+/// That narrows, but does not close, the exposure window: `SecretKey::from`
+/// takes the array by value, and crypto_box 0.9.1's `Drop for SecretKey`
+/// zeroizes only the derived scalar, not the raw bytes it was given. Closing
+/// that gap needs an upstream change; until then the second copy lives for
+/// the duration of one seal/open call.
 fn key_bytes(bytes: &[u8]) -> Result<Zeroizing<[u8; KEY_LENGTH]>, CryptoError> {
     bytes
         .try_into()
