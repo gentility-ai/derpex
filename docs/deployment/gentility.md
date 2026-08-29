@@ -108,9 +108,11 @@ Idle cached leases are not renewed. A node with no connection re-authorizes
 naturally the next time it connects, so renewing the whole cache would put the
 fleet's reconnection load on Gentility continuously for no benefit.
 
-Renewal traffic shares `DERPEX_GENTILITY_MAX_CONCURRENT_REQUESTS` with live
-admissions; a renewal that cannot get a slot is retried rather than queued, so
-renewals can never crowd out a connecting node.
+Renewals share `DERPEX_GENTILITY_MAX_CONCURRENT_REQUESTS` with live admissions
+but may hold at most half of it, so a connecting node always has slots to take.
+A renewal that cannot get one is retried rather than queued. Renewal times are
+jittered the same way expiry is, so a fleet that reconnected together does not
+return to Gentility together one lease later.
 
 A lease's deadline is held on two clocks: the wall clock it was issued against
 and the monotonic clock the relay runs on. Whichever says the lifetime is over
@@ -255,6 +257,21 @@ Warnings are rate limited per kind (one per minute per controller) so a
 persistent condition cannot flood the log: authority unavailable and serving
 cached, revocation applied, eviction, cache full, key rotation, and cache
 load/write failures. The counters behind them stay exact regardless.
+
+## Revocation stream metrics
+
+The event consumer reports its own health, all fixed-cardinality:
+`derpex_gentility_events_connected` (streaming), `_reconciling`, `_retrying`,
+`_reconciliations_total` and `_reconciliation_pages` (completed passes and the
+pages they took), `_revocations_total` (records applied from the stream),
+`_early_timeouts_total` and `_worker_timeouts_total` (a control plane returning
+long polls too fast, or not at all).
+
+Alert on `connected` staying 0: while it is, revocations are only arriving
+through reconciliation, and if that is failing too they are not arriving at all.
+`derpex_gentility_stalled` is published when the controller could not answer a
+metrics scrape at all; the shedding and close-failure counters are still exported
+beside it because they are read without touching the process.
 
 ## Usage export
 

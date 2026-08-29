@@ -348,9 +348,11 @@ if config_env() == :prod do
             end
 
           events =
-            if System.get_env("DERPEX_GENTILITY_EVENTS") == "0",
-              do: nil,
-              else: [adapter: adapter]
+            case System.get_env("DERPEX_GENTILITY_EVENTS", "1") do
+              "1" -> [adapter: adapter]
+              "0" -> nil
+              _invalid -> raise "DERPEX_GENTILITY_EVENTS must be 0 or 1"
+            end
 
           max_cache_entries =
             parse_bounded_integer.("DERPEX_GENTILITY_MAX_CACHE_ENTRIES", 100_000, 1, 100_000_000)
