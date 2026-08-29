@@ -20,7 +20,9 @@ proxy or load balancer.
   Gentility-owned integration, while leases, revocations, reconciliation, and
   usage batches use DERPEX contract v1.
 - Admission cache and usage spool live on persistent encrypted storage with
-  mode `0600`. Event reconciliation and usage export are mandatory; exhausting
+  mode `0600`. Both are refused at startup if the path is not a regular file or
+  is larger than its configured bounds could ever produce, so a replaced or
+  symlinked path fails closed instead of being read. Event reconciliation and usage export are mandatory; exhausting
   the bounded spool sheds relay packets rather than losing the billing ledger.
 - Global and per-source pre-authentication rate limits plus a per-source open
   connection cap are configured on every public listener. Source tracking is
@@ -110,6 +112,12 @@ Renewal traffic shares `DERPEX_GENTILITY_MAX_CONCURRENT_REQUESTS` with live
 admissions; a renewal that cannot get a slot is retried rather than queued, so
 renewals can never crowd out a connecting node.
 
+A lease's deadline is held on two clocks: the wall clock it was issued against
+and the monotonic clock the relay runs on. Whichever says the lifetime is over
+closes the lease, so stepping the system clock backwards — by NTP, by a
+hypervisor, or by hand — cannot extend a lease past the lifetime Gentility
+granted it.
+
 Leases are closed a little before they expire — a jitter of up to 10% of the
 lease lifetime, taken out of the lease's own life, never added to it. DERPEX
 therefore never serves an expired lease, and a region's leases do not all fall
@@ -197,6 +205,11 @@ until the control plane answers with no position — so a backlog of tens of
 thousands of records never depends on one oversized response. A pass is bounded
 by page count as well as by records and bytes per page, so a control plane that
 never finishes a pass is abandoned and retried instead of looping.
+
+A revocation closes a node two ways at once, because a connection is claimed
+before the router knows about it: the router is asked to close the peer, and
+every connection holding a claim on that node key is told to close directly.
+A revocation that lands in the moment between the two therefore still lands.
 
 Gentility prunes revocations older than `DERPEX_GENTILITY_MAX_LEASE_MS`. Every
 lease such a record could still deny has expired by then, which is what keeps
