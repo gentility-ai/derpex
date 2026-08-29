@@ -107,7 +107,7 @@ defmodule Derpex.Outbox.Ring do
 
     case Lock.acquire_producer(ring.table, wait?, ring.metrics) do
       {:ok, lock_token} ->
-        {result, pending_drop} =
+        {result, pending_drop, wake} =
           try do
             recover(ring)
             enqueue_locked(ring, item, enqueued_at, lock_token)
@@ -115,6 +115,13 @@ defmodule Derpex.Outbox.Ring do
             Lock.release(ring.table, lock_token)
           end
 
+        # Waking the writer while still holding the lock hands it a collision:
+        # it wakes, misses, and waits for its retry timer, which is
+        # milliseconds where the overlap was microseconds. The wakeup is sent
+        # after release, and sent before the flag is set, so a producer that
+        # dies mid-signal leaves a flag that says "not yet woken" rather than
+        # one that says "already woken" with nothing on its way.
+        result = signal_after_release(ring, result, wake)
         record_pending_drop(ring, pending_drop)
         result
 
@@ -253,7 +260,7 @@ defmodule Derpex.Outbox.Ring do
 
   defp enqueue_locked(ring, item, enqueued_at, lock_token) do
     if atomic_get(ring, @closed) == 1 do
-      {{:dropped, :closed}, {item, :gone_disconnected}}
+      {{:dropped, :closed}, {item, :gone_disconnected}, :coalesced}
     else
       enqueue_open_locked(ring, item, enqueued_at, lock_token)
     end
@@ -265,7 +272,7 @@ defmodule Derpex.Outbox.Ring do
       # already waiting: the client is pinging faster than it is being answered,
       # and the answer it is owed is the older one.
       :atomics.add_get(ring.state, @tail_drops, 1)
-      {{:dropped, :queue_full}, nil}
+      {{:dropped, :queue_full}, nil, :coalesced}
     else
       publish_locked(ring, item, enqueued_at, lock_token)
     end
@@ -276,7 +283,6 @@ defmodule Derpex.Outbox.Ring do
   end
 
   defp publish_locked(ring, item, enqueued_at, lock_token) do
-    wake = signal_writer(ring)
     {full?, index, head, size, head_drops} = slot_plan(ring)
     operation_token = unique_token()
 
@@ -289,7 +295,11 @@ defmodule Derpex.Outbox.Ring do
     run_hook(ring, :after_commit)
     :ets.delete(ring.table, :journal)
 
-    {enqueue_result(full?, wake), replaced}
+    if full? do
+      {{:ok, :replaced}, replaced, :replace}
+    else
+      {{:ok, :published}, replaced, :publish}
+    end
   end
 
   # The slot to publish into, with the head, size and head-drop count that
@@ -305,10 +315,6 @@ defmodule Derpex.Outbox.Ring do
       {false, rem(head + size, ring.capacity), head, size + 1, head_drops}
     end
   end
-
-  defp enqueue_result(true, _wake), do: {:ok, :replaced}
-  defp enqueue_result(false, :wake), do: {:ok, :wake}
-  defp enqueue_result(false, :coalesced), do: {:ok, :coalesced}
 
   defp take_locked(ring, lock_token) do
     cond do
@@ -344,15 +350,26 @@ defmodule Derpex.Outbox.Ring do
     {:ok, item, enqueued_at}
   end
 
-  defp signal_writer(ring) do
+  defp signal_after_release(ring, {:ok, _published}, :publish) do
     if atomic_get(ring, @wake_pending) == 0 do
       send(ring.notifier, ring.wake_message)
       :atomics.put(ring.state, @wake_pending, 1)
-      :wake
+      {:ok, :wake}
     else
-      :coalesced
+      {:ok, :coalesced}
     end
   end
+
+  defp signal_after_release(ring, {:ok, :replaced} = result, :replace) do
+    if atomic_get(ring, @wake_pending) == 0 do
+      send(ring.notifier, ring.wake_message)
+      :atomics.put(ring.state, @wake_pending, 1)
+    end
+
+    result
+  end
+
+  defp signal_after_release(_ring, result, _wake), do: result
 
   defp journal(ring, lock_token, operation_token, index, head, size, head_drops) do
     true =

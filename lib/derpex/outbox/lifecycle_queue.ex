@@ -109,6 +109,10 @@ defmodule Derpex.Outbox.LifecycleQueue do
             Lock.release(queue.table, lock_token)
           end
 
+        # Claimed under the lock, sent after it: a writer woken while the lock
+        # is still held would collide and wait for its retry timer.
+        with {:ok, :wake} <- result, do: send(queue.notifier, queue.wake_message)
+
         report_overflow(queue, result)
 
       :busy ->
@@ -288,9 +292,9 @@ defmodule Derpex.Outbox.LifecycleQueue do
     :ok
   end
 
+  # Claims the wakeup under the lock; the message itself is sent after release.
   defp signal_writer(queue) do
     if atomic_get(queue, @wake_pending) == 0 do
-      send(queue.notifier, queue.wake_message)
       :atomics.put(queue.state, @wake_pending, 1)
       :wake
     else

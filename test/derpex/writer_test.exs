@@ -1,6 +1,7 @@
 defmodule Derpex.WriterTest do
   use ExUnit.Case, async: true
 
+  alias Derpex.Outbox.LifecycleQueue
   alias Derpex.Outbox.Ring
   alias Derpex.Router
   alias Derpex.Writer
@@ -399,17 +400,25 @@ defmodule Derpex.WriterTest do
         socket: {self(), :fair, :open}
       )
 
-    rings = rings(writer)
     source = :crypto.strong_rand_bytes(32)
 
-    # Fill the ordinary ring before the writer can drain it, so every ordinary
-    # packet is older than the pong and the disco packet that follow.
+    rings = %{
+      ordinary: Ring.new(32, notifier: writer, wake_message: Writer.wake_message()),
+      disco: Ring.new(32, notifier: writer, wake_message: Writer.wake_message()),
+      pong: Ring.new(1, notifier: writer, wake_message: Writer.wake_message(), full: :reject),
+      lifecycle: LifecycleQueue.new(notifier: writer, wake_message: Writer.wake_message())
+    }
+
+    # Everything is queued before the writer is given the rings, so every
+    # ordinary packet is older than the pong and the disco packet, and none of
+    # them can be written before the comparison starts.
     for sequence <- 1..32 do
       enqueue_until_accepted(rings.ordinary, {:recv_packet, source, <<sequence::32>>})
     end
 
     enqueue_until_accepted(rings.pong, {:pong, "12345678"})
     enqueue_until_accepted(rings.disco, {:recv_packet, source, disco_packet()})
+    :ok = Writer.attach(writer, rings)
 
     frames = collect_frames(20)
     pong_position = Enum.find_index(frames, &match?({:pong, _payload}, &1))
