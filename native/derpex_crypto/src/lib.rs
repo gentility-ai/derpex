@@ -1,5 +1,6 @@
 use crypto_box::{PublicKey, SalsaBox, SecretKey, aead::Aead};
 use rustler::{Atom, Binary, Env, OwnedBinary};
+use zeroize::Zeroizing;
 
 const KEY_LENGTH: usize = 32;
 const NONCE_LENGTH: usize = 24;
@@ -80,7 +81,7 @@ fn open<'a>(
 
 fn derive_public_key(private_key: &[u8]) -> Result<[u8; KEY_LENGTH], CryptoError> {
     let private_key = key_bytes(private_key)?;
-    Ok(*SecretKey::from(private_key).public_key().as_bytes())
+    Ok(*SecretKey::from(*private_key).public_key().as_bytes())
 }
 
 fn seal_box(
@@ -93,8 +94,8 @@ fn seal_box(
     let peer_public_key = key_bytes(peer_public_key)?;
     let nonce: [u8; NONCE_LENGTH] = nonce.try_into().map_err(|_| CryptoError::BadNonceSize)?;
     let cipher = SalsaBox::new(
-        &PublicKey::from(peer_public_key),
-        &SecretKey::from(private_key),
+        &PublicKey::from(*peer_public_key),
+        &SecretKey::from(*private_key),
     );
     let ciphertext = cipher
         .encrypt(&nonce.into(), plaintext)
@@ -116,16 +117,24 @@ fn open_box(
         .split_at_checked(NONCE_LENGTH)
         .ok_or(CryptoError::BadNonceSize)?;
     let cipher = SalsaBox::new(
-        &PublicKey::from(peer_public_key),
-        &SecretKey::from(private_key),
+        &PublicKey::from(*peer_public_key),
+        &SecretKey::from(*private_key),
     );
     cipher
         .decrypt(nonce.into(), ciphertext)
         .map_err(|_| CryptoError::AuthenticationFailed)
 }
 
-fn key_bytes(bytes: &[u8]) -> Result<[u8; KEY_LENGTH], CryptoError> {
-    bytes.try_into().map_err(|_| CryptoError::BadKeySize)
+/// Copies a 32 byte key out of a NIF binary.
+///
+/// The copy is wrapped in `Zeroizing` so a private key never outlives the call
+/// as readable bytes on the stack: without it the array is left behind for the
+/// next frame to expose in a core dump or an adjacent allocation.
+fn key_bytes(bytes: &[u8]) -> Result<Zeroizing<[u8; KEY_LENGTH]>, CryptoError> {
+    bytes
+        .try_into()
+        .map(Zeroizing::new)
+        .map_err(|_| CryptoError::BadKeySize)
 }
 
 fn encode_binary<'a>(env: Env<'a>, bytes: &[u8]) -> Result<Binary<'a>, Atom> {
@@ -139,6 +148,7 @@ rustler::init!("Elixir.Derpex.Crypto.Native");
 #[cfg(test)]
 mod tests {
     use super::*;
+    use zeroize::Zeroize;
 
     const SENDER_PRIVATE_KEY: [u8; KEY_LENGTH] = [7; KEY_LENGTH];
     const RECIPIENT_PRIVATE_KEY: [u8; KEY_LENGTH] = [9; KEY_LENGTH];
@@ -167,6 +177,17 @@ mod tests {
             open_box(&RECIPIENT_PRIVATE_KEY, &sender_public_key(), &boxed),
             Ok(b"derpex".to_vec())
         );
+    }
+
+    #[test]
+    fn zeroizes_the_key_copy() {
+        let mut key: Zeroizing<[u8; KEY_LENGTH]> = key_bytes(&SENDER_PRIVATE_KEY).expect("key");
+
+        assert_eq!(key[..], SENDER_PRIVATE_KEY[..]);
+
+        key.zeroize();
+
+        assert_eq!(key[..], [0u8; KEY_LENGTH][..]);
     }
 
     #[test]
