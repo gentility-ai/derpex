@@ -574,6 +574,58 @@ defmodule Derpex.Listener.HandlerTest do
     header <> mask <> :crypto.exor(binary_part(repeated, 0, length), payload)
   end
 
+  test "a crashing mesh connection does not print the peer's mesh key" do
+    {server_public, server_private} = Crypto.generate_keypair()
+    mesh_key = :crypto.strong_rand_bytes(32)
+    parent = self()
+
+    event_handler = fn event ->
+      send(parent, {:handler_event, self(), event})
+      :ok
+    end
+
+    {:ok, server} =
+      ThousandIsland.start_link(
+        port: 0,
+        transport_options: [ip: {127, 0, 0, 1}],
+        num_acceptors: 1,
+        handler_module: Handler,
+        handler_options: [
+          server_private_key: Secret.wrap(server_private),
+          server_public_key: server_public,
+          mesh_key: Secret.wrap(mesh_key),
+          event_handler: event_handler
+        ]
+      )
+
+    stop_server_on_exit(server)
+    {:ok, {_ip, port}} = ThousandIsland.listener_info(server)
+    {_mesh_public, mesh_private} = Crypto.generate_keypair()
+
+    socket =
+      connect_and_send_info(port, server_public, mesh_private, %ClientInfo{
+        version: 2,
+        mesh_key: mesh_key
+      })
+
+    assert_receive {:handler_event, handler, {:authenticated, _key, %ClientInfo{}}}, 2_000
+    monitor = Process.monitor(handler)
+
+    # An unmatched message crashes the handler, and a crash report prints the
+    # process state - which holds the peer's ClientInfo.
+    log =
+      ExUnit.CaptureLog.capture_log(fn ->
+        send(handler, :derpex_unmatched_message)
+        assert_receive {:DOWN, ^monitor, :process, ^handler, _reason}, 2_000
+      end)
+
+    assert log =~ "terminating"
+    refute log =~ Base.encode16(mesh_key)
+    refute log =~ Base.encode16(mesh_key, case: :lower)
+    refute log =~ inspect(mesh_key, limit: :infinity, binaries: :as_binaries)
+    :gen_tcp.close(socket)
+  end
+
   test "accept limiting closes excess sockets before HTTP session allocation" do
     limiter = start_supervised!({AcceptLimiter, name: nil, config: {0, 1}})
     {server_public, server_private} = Crypto.generate_keypair()
