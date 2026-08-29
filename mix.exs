@@ -34,6 +34,7 @@ defmodule Derpex.MixProject do
         quality: :test,
         "test.diff": :test,
         "test.interop": :test,
+        "test.system": :test,
         "test.all": :test,
         "release.check": :test
       ]
@@ -70,11 +71,17 @@ defmodule Derpex.MixProject do
         "cmd bash -n scripts/runtime_smoke.sh",
         "cmd rustfmt --check --edition 2024 interop/rust/client_smoke.rs",
         "cmd cargo fmt --manifest-path native/derpex_crypto/Cargo.toml -- --check",
-        "cmd cargo clippy --manifest-path native/derpex_crypto/Cargo.toml --all-targets -- -D warnings",
-        "test"
+        "cmd cargo clippy --manifest-path native/derpex_crypto/Cargo.toml --all-targets -- -D warnings"
       ],
-      "test.all": ["test"],
-      "release.check": ["quality", "test.all"]
+      "test.system": ["test test/system --include system"],
+      "test.all": [
+        "test --include system --include go_interop --include rust_interop"
+      ],
+      "release.check": [
+        "quality",
+        "test.all",
+        "cmd env MIX_ENV=prod mix artifact.check"
+      ]
     ]
   end
 

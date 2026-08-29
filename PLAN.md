@@ -470,14 +470,31 @@ mix test.system          # TLS, WebSocket, STUN, signals, external services
 mix test.gentility       # authorization, revocation, quotas, accounting
 mix test.all             # all release-blocking correctness gates
 mix bench                # non-blocking benchmark suite
-mix quality              # format, compile warnings, static analysis, mix test
+mix quality              # format, compile warnings, static analysis; no tests
 mix artifact.check       # boot and inspect compiler-free release artifacts
-mix release.check        # mix quality + test.all; the release gate
+mix release.check        # mix quality + test.all + artifact.check; the release gate
 ```
+
+`mix quality` is the fast pre-commit gate: formatting, warnings-as-errors
+compilation, Credo, `rustfmt`, and Clippy. It deliberately runs no tests, so
+nothing that runs it may claim the suite passed. Tests under `test/system`
+carry `@moduletag :system`, which `test/test_helper.exs` excludes by default,
+so they run under `mix test.system` rather than a plain `mix test`. `mix
+test.all` opts every tagged gate back in (`--include system --include
+go_interop --include rust_interop`) and needs `DERPEX_TAILSCALE_DIR` and
+`DERPEX_TAILSCALE_RS_DIR` pointing at the pinned checkouts. `mix release.check` runs `artifact.check` under `MIX_ENV=prod` in a
+child Mix invocation, because the surrounding gate runs in `MIX_ENV=test`.
 
 Fast pull-request CI runs unit tests and a compact Go interop slice. Full
 differential, system, race-heavy, fuzz, and soak jobs run on main/nightly and
 before release. No nightly-only failure may be waived for a release.
+
+The release workflow cannot publish around those gates. `release.yml` calls
+`ci.yml` as a reusable workflow in a job named `gate`, and every job that
+builds, packages, or publishes an artifact lists `gate` in its `needs:`, so a
+red quality, unit, Go interop, Rust interop, or runtime-boundary job blocks the
+tag's release outright. `ci.yml` ignores `v*` tag pushes on its own trigger so
+that gate is the tag's only run of the suite.
 
 Go conformance jobs run in an isolated CI job and exchange only semantic test
 results with the Elixir jobs. Go checkouts, caches, binaries, and toolchains are

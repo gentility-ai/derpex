@@ -10,8 +10,10 @@ defmodule Derpex.Interop.RustClientTest do
 
   setup_all do
     upstream =
-      System.get_env("DERPEX_TAILSCALE_RS_DIR") ||
-        raise "DERPEX_TAILSCALE_RS_DIR must name the pinned tailscale-rs checkout"
+      case System.get_env("DERPEX_TAILSCALE_RS_DIR") do
+        nil -> raise "DERPEX_TAILSCALE_RS_DIR must name the pinned tailscale-rs checkout"
+        directory -> Path.expand(directory)
+      end
 
     expected_commit =
       Path.expand("../../interop/upstream.lock", __DIR__)
