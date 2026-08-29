@@ -64,8 +64,26 @@ jobs:
       - name: Run Rust tests
         run: cargo test --locked --manifest-path native/derpex_crypto/Cargo.toml --all-targets
 
+      # This is the gate the TestLookupDestHashTrieNoAlloc inventory row cites,
+      # and the three thresholds are not equal in strength.
+      #
+      # queue_replacements=0 is the regression gate: it is deterministic, and a
+      # healthy flow that has to overwrite a queued packet has regressed.
+      #
+      # The other two are leak and stall detectors sized for a shared runner.
+      # Measured locally over four runs at --packets 2000 (Apple M-series):
+      # per-flow memory_delta_bytes 28.8 KB - 212 KB, p99 latency 124 - 1301 us.
+      # 1 MiB is about five times the worst local memory delta and is crossed
+      # by as little as 512 B retained per packet at 2000 packets, which is the
+      # allocation invariant the upstream test protects. 25 ms p99 is about
+      # nineteen times the worst local latency: loose enough to survive runner
+      # scheduling noise, tight enough to catch a stalled writer.
       - name: Smoke relay benchmark harness
-        run: mix bench -- --packets 50 --sizes 64,1200 --slow-packets 200 --slow-delay-ms 50
+        run: >-
+          mix bench -- --packets 2000 --sizes 64,1200 --slow-packets 2000 --slow-delay-ms 50
+          --fail-on queue_replacements=0
+          --fail-on memory_delta_bytes=1048576
+          --fail-on latency_p99_us=25000
 
   go-interop:
     name: Official Go client interoperability
@@ -110,6 +128,14 @@ jobs:
         run: |
           diff="$(gofmt -d interop/go)"
           test -z "$diff" || { printf '%s\n' "$diff"; exit 1; }
+
+      # The generator refuses to write a row that cites a file this repository
+      # does not have, so regenerating proves both that COVERAGE.md is current
+      # for the pinned commit and that every disposition still has evidence.
+      - name: Regenerate the upstream compatibility inventory
+        run: |
+          elixir scripts/upstream_inventory.exs "$DERPEX_TAILSCALE_DIR" --output interop/COVERAGE.md
+          git diff --exit-code -- interop/COVERAGE.md
 
       - name: Run pinned upstream oracle packages
         working-directory: upstream/tailscale

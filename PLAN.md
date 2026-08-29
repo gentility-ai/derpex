@@ -82,6 +82,17 @@ The separate Linux XDP package is not part of the current `cmd/derper` request
 path; its tests are recorded as implementation-specific unless later evidence
 shows an observable server requirement.
 
+ACME (RFC 8555) is **pending, not excepted**. The `letsencrypt` and `gcp`
+certificate modes and ACME-issued IP certificates are still required for
+compatibility; DERPEX has simply not written the client yet, so
+`DERPEX_CERT_MODE=letsencrypt` and `DERPEX_CERT_MODE=gcp` are rejected at boot
+with an error naming this section rather than silently downgraded to a
+self-signed certificate. `Derpex.Certificates.IPManager` is reachable only
+behind `DERPEX_IP_CERT_ISSUER=self`, which issues persistent self-signed per-IP
+certificates and contacts no certificate authority. The `TestIPCertManager` and
+`TestIPCertManagerNextProvider` inventory rows stay `pending` — release-blocking
+— until Milestone 9 lands the client and its fake-ACME tests.
+
 The following are recorded as explicit, user-approved compatibility exceptions
 so they are not implemented by accident:
 

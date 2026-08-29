@@ -12,10 +12,12 @@ defmodule Derpex.ListenerSupervisor do
 
   alias Derpex.Admission.Gentility
   alias Derpex.Certificates
+  alias Derpex.Certificates.IPManager
   alias Derpex.Certificates.Reloader
   alias Derpex.Crypto
   alias Derpex.Listener.Handler
   alias Derpex.Listener.Transports
+  alias Derpex.MetaCertificate
   alias Derpex.Secret
   alias Derpex.SocketOptions
 
@@ -56,6 +58,7 @@ defmodule Derpex.ListenerSupervisor do
 
   defp listener_child(options, index, private_key, public_key) do
     {socket_options, options} = Keyword.pop(options, :socket_options, [])
+    {certificate_manager, options} = Keyword.pop(options, :ip_certificate_manager)
 
     handler_options =
       options
@@ -69,7 +72,7 @@ defmodule Derpex.ListenerSupervisor do
       options
       |> Keyword.put(:handler_module, Handler)
       |> Keyword.put(:handler_options, handler_options)
-      |> configure_tls(public_key)
+      |> configure_tls(public_key, certificate_manager)
       |> configure_socket(socket_options)
       |> configure_transport()
 
@@ -141,7 +144,26 @@ defmodule Derpex.ListenerSupervisor do
     Keyword.put(options, :transport_options, transport_options)
   end
 
-  defp configure_tls(options, server_public_key) do
+  # `DERPEX_IP_CERT_ISSUER=self` replaces the file-backed certificate with one
+  # the manager issues for this listener's own IP address. The manager is
+  # started before this supervisor, so the certificate exists by the time the
+  # listen socket is opened, and `sni_fun` keeps every named hello answering
+  # from the same manager.
+  defp configure_tls(options, server_public_key, {manager, hostname}) do
+    unless Keyword.get(options, :transport_module) == ThousandIsland.Transports.SSL do
+      raise "DERPEX_IP_CERT_ISSUER=self requires a TLS listener"
+    end
+
+    transport_options =
+      options
+      |> Keyword.get(:transport_options, [])
+      |> drop_transport_options([:certfile, :keyfile, :certs_keys, :sni_fun])
+      |> Kernel.++(managed_certificate_options(manager, hostname, server_public_key))
+
+    Keyword.put(options, :transport_options, transport_options)
+  end
+
+  defp configure_tls(options, server_public_key, nil) do
     if Keyword.get(options, :transport_module) == ThousandIsland.Transports.SSL do
       transport_options = Keyword.get(options, :transport_options, [])
 
@@ -158,6 +180,25 @@ defmodule Derpex.ListenerSupervisor do
       end
     else
       options
+    end
+  end
+
+  # The metacertificate carries only the server node key, so it is generated
+  # once here and shared by the bound options and every SNI answer. Generating
+  # an RSA key pair per hello would cost more than the DERP handshake it
+  # advertises.
+  defp managed_certificate_options(manager, hostname, server_public_key) do
+    meta_certificate = MetaCertificate.generate(server_public_key)
+
+    case IPManager.certs_keys(manager, hostname, "", meta_certificate) do
+      {:ok, certs_keys} ->
+        [
+          certs_keys: [certs_keys],
+          sni_fun: IPManager.sni_fun(manager, hostname, meta_certificate)
+        ]
+
+      {:error, reason} ->
+        raise "could not issue an IP certificate for #{hostname}: #{inspect(reason)}"
     end
   end
 

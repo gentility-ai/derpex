@@ -116,6 +116,35 @@ files leave the last good certificate active. Set
 polling. Raw-IP clients do not send SNI and continue to use the startup manual
 certificate, which is the intended stable pinned-certificate path.
 
+### Certificate modes
+
+`DERPEX_CERT_MODE` selects the certificate provider and defaults to `manual`,
+the file-backed listener above. `letsencrypt` and `gcp` need an RFC 8555 ACME
+client, which DERPEX has not implemented yet, so both are **rejected at boot**
+with an error naming PLAN.md section 2.3 rather than silently downgraded.
+
+`DERPEX_IP_CERT_ISSUER=self` is the one alternative: with
+`DERPEX_CERT_DIR=/var/lib/derpex/certs` and `DERPEX_CERT_HOSTNAME` set to a bare
+IP address, the relay issues and caches a persistent self-signed certificate for
+that address (key `0600`, certificate `0644`) and serves it to SNI and no-SNI
+hellos alike. It contacts no certificate authority. Any other value of
+`DERPEX_IP_CERT_ISSUER` is rejected at boot, as is combining it with
+`DERPEX_TLS_CERTFILE` or `DERPEX_TLS_KEYFILE`: two certificate sources for one
+listener is an operator mistake with a silent outcome, so it is refused rather
+than resolved by precedence.
+
+A certificate is served while it is inside its validity window and is renewed in
+the background once less than a third of its lifetime remains, so no handshake
+ever waits on an issuance unless there is nothing valid to serve. A failed
+issuance backs off from one minute to thirty, and the certificate already in hand
+keeps answering throughout. An SNI naming a different IP address, or a DNS name,
+is refused with a TLS `unrecognized_name` alert rather than answered with the
+listener's own certificate.
+
+The certificate plan is resolved before anything else starts, whether or not
+`DERPEX_LISTEN_PORT` is set, so a configuration mistake stops the boot rather
+than surfacing later.
+
 The server identity is created atomically with mode `0600` and is stable across
 restarts. The UDP STUN service listens on port `3478` by default whenever the
 DERP listener is enabled. Set `DERPEX_STUN_PORT` to change it or

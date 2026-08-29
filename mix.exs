@@ -68,6 +68,7 @@ defmodule Derpex.MixProject do
       quality: [
         "format --check-formatted",
         "compile --warnings-as-errors",
+        "run --no-start scripts/dependency_closure.exs",
         "credo --strict",
         "cmd bash -n scripts/runtime_smoke.sh",
         "cmd rustfmt --check --edition 2024 interop/rust/client_smoke.rs",
