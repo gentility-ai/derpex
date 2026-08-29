@@ -42,6 +42,7 @@ defmodule Derpex.Admission.Gentility do
   @default_max_future_skew_ms 30_000
   @default_max_byte_delay_ms 30_000
   @default_budget_prune_ms 30_000
+  @default_cache_persist_ms 5_000
   defmodule Policy do
     @moduledoc "An immutable, lock-free admission handle obtained from a running controller."
 
@@ -212,6 +213,9 @@ defmodule Derpex.Admission.Gentility do
 
   @impl GenServer
   def init(options) do
+    # Trapping exits is what makes the final cache write on shutdown possible.
+    Process.flag(:trap_exit, true)
+
     with {:ok, state} <- initial_state(options) do
       state =
         state
@@ -288,7 +292,7 @@ defmodule Derpex.Admission.Gentility do
     case validate_verification_keys(keys) do
       :ok ->
         state = reverify_records(%{state | verification_keys: keys})
-        state = persist_or_note_error(state)
+        state = persist_now(state)
         {:reply, :ok, state |> purge_expired() |> reschedule_expiry()}
 
       {:error, _reason} = error ->
@@ -312,6 +316,12 @@ defmodule Derpex.Admission.Gentility do
 
   def handle_info({__MODULE__, :prune_budgets, _stale}, state), do: {:noreply, state}
 
+  def handle_info({__MODULE__, :persist_cache, token}, %{cache_persist_token: token} = state) do
+    {:noreply, flush_cache(%{state | cache_persist_timer: nil, cache_persist_token: nil})}
+  end
+
+  def handle_info({__MODULE__, :persist_cache, _stale}, state), do: {:noreply, state}
+
   def handle_info({:DOWN, monitor, :process, connection, _reason}, state) do
     case state.claims[connection] do
       %{monitor: ^monitor} -> {:noreply, release_connection(state, connection, false)}
@@ -319,10 +329,21 @@ defmodule Derpex.Admission.Gentility do
     end
   end
 
+  # The usage worker is linked, so its exit still takes the controller down.
+  # Trapping exits only converts that signal into a message.
+  def handle_info({:EXIT, pid, reason}, state) do
+    if state.usage && state.usage.server == pid do
+      {:stop, reason, state}
+    else
+      {:noreply, state}
+    end
+  end
+
   @impl GenServer
   def terminate(_reason, state) do
     cancel_expiry(state)
     cancel_budget_prune(state)
+    _flushed = flush_cache(state)
     UsageWorker.stop(state.usage)
     :ok
   end
@@ -347,6 +368,10 @@ defmodule Derpex.Admission.Gentility do
       positive_option!(options, :max_byte_delay_ms, @default_max_byte_delay_ms)
 
     budget_prune_ms = positive_option!(options, :budget_prune_ms, @default_budget_prune_ms)
+
+    cache_persist_ms =
+      positive_option!(options, :cache_persist_ms, @default_cache_persist_ms)
+
     verification_keys = Keyword.fetch!(options, :verification_keys)
     clock = Keyword.get(options, :clock, Clock)
 
@@ -392,6 +417,10 @@ defmodule Derpex.Admission.Gentility do
          budget_prune_ms: budget_prune_ms,
          budget_prune_timer: nil,
          budget_prune_token: nil,
+         cache_persist_ms: cache_persist_ms,
+         cache_persist_timer: nil,
+         cache_persist_token: nil,
+         cache_dirty: false,
          closing_connections: MapSet.new(),
          cache_full: 0,
          sequence: 0,
@@ -562,15 +591,8 @@ defmodule Derpex.Admission.Gentility do
         candidate
       end
 
-    case persist(candidate) do
-      :ok ->
-        state = %{candidate | persist_error: nil} |> reschedule_expiry()
-        {:reply, {:ok, context(lease, :live)}, state}
-
-      {:error, reason} ->
-        state = %{candidate | persist_error: reason} |> reschedule_expiry()
-        {:reply, {:error, {:cache_persist, reason}}, state}
-    end
+    state = candidate |> mark_cache_dirty() |> reschedule_expiry()
+    {:reply, {:ok, context(lease, :live)}, state}
   end
 
   defp evict_lease(state, nil), do: state
@@ -663,7 +685,7 @@ defmodule Derpex.Admission.Gentility do
       _older_or_missing ->
         {state, close?} = put_revocation(state, wire, revocation)
         if close?, do: close_peer(state, revocation.node_key)
-        state = persist_or_note_error(state) |> reschedule_expiry()
+        state = persist_now(state) |> reschedule_expiry()
         {if(close?, do: :covered, else: :uncovered), state}
     end
   end
@@ -673,7 +695,7 @@ defmodule Derpex.Admission.Gentility do
       Enum.reduce(revocations, {state, 0, 0, MapSet.new()}, &reconcile_revocation/2)
 
     Enum.each(close_keys, &close_peer(state, &1))
-    state = persist_or_note_error(state) |> reschedule_expiry()
+    state = persist_now(state) |> reschedule_expiry()
     {:reply, {:ok, %{applied: applied, stale: stale}}, state}
   end
 
@@ -993,7 +1015,7 @@ defmodule Derpex.Admission.Gentility do
   defp purge_expired(state) do
     case purge_expired_leases(state, now_ms(state), false) do
       {state, false} -> state
-      {state, true} -> persist_or_note_error(state)
+      {state, true} -> mark_cache_dirty(state)
     end
   end
 
@@ -1057,11 +1079,46 @@ defmodule Derpex.Admission.Gentility do
     %{state | budget_prune_timer: nil, budget_prune_token: nil}
   end
 
-  defp persist_or_note_error(state) do
+  # Lease churn is debounced: a burst of reconnections costs one write, and a
+  # crash loses at most `cache_persist_ms` of admissions, which nodes recover by
+  # re-authorizing. Revocation is the security-relevant path and is never
+  # deferred.
+  defp mark_cache_dirty(%{cache_path: nil} = state), do: state
+
+  defp mark_cache_dirty(%{cache_persist_timer: timer} = state) when not is_nil(timer),
+    do: %{state | cache_dirty: true}
+
+  defp mark_cache_dirty(state) do
+    token = make_ref()
+
+    timer =
+      state.clock.send_after(
+        self(),
+        {__MODULE__, :persist_cache, token},
+        state.cache_persist_ms
+      )
+
+    %{state | cache_dirty: true, cache_persist_timer: timer, cache_persist_token: token}
+  end
+
+  defp persist_now(state), do: state |> Map.put(:cache_dirty, true) |> flush_cache()
+
+  defp flush_cache(%{cache_dirty: false} = state), do: state
+
+  defp flush_cache(state) do
+    state = cancel_cache_persist(state)
+
     case persist(state) do
-      :ok -> %{state | persist_error: nil}
-      {:error, reason} -> %{state | persist_error: reason}
+      :ok -> %{state | cache_dirty: false, persist_error: nil}
+      {:error, reason} -> mark_cache_dirty(%{state | persist_error: reason})
     end
+  end
+
+  defp cancel_cache_persist(%{cache_persist_timer: nil} = state), do: state
+
+  defp cancel_cache_persist(state) do
+    _remaining = state.clock.cancel_timer(state.cache_persist_timer)
+    %{state | cache_persist_timer: nil, cache_persist_token: nil}
   end
 
   defp persist(%{cache_path: nil}), do: :ok

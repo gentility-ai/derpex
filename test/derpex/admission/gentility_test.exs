@@ -212,6 +212,69 @@ defmodule Derpex.Admission.GentilityTest do
   end
 
   @tag :tmp_dir
+  test "debounces lease writes and persists a revocation immediately", %{tmp_dir: tmp_dir} do
+    path = Path.join(tmp_dir, "admission.cache")
+
+    controller =
+      start_controller(
+        authority: fn request -> {:ok, signed_lease(request.node_key, expires_at_ms: 11_000)} end,
+        max_lease_ms: 10_000,
+        cache_path: path,
+        cache_persist_ms: 5_000
+      )
+
+    policy = Gentility.policy(controller)
+
+    for index <- 1..1_000 do
+      assert {:ok, _context} = Gentility.authorize(request(<<index::256>>), policy)
+    end
+
+    assert Gentility.stats(controller).cache_entries == 1_000
+    refute File.exists?(path)
+
+    assert Gentility.revoke(controller, signed_revocation(<<1::256>>, 10)) == {:ok, :applied}
+    assert File.exists?(path)
+    revoked_size = File.stat!(path).size
+
+    assert {:ok, _context} = Gentility.authorize(request(<<1_001::256>>), policy)
+    assert File.stat!(path).size == revoked_size
+
+    Manual.advance(5_000)
+    eventually(fn -> File.stat!(path).size > revoked_size end)
+
+    assert :ok = stop_supervised(Gentility)
+
+    recovered =
+      start_controller(
+        authority: fn _request -> {:error, :unavailable} end,
+        max_lease_ms: 10_000,
+        cache_path: path
+      )
+
+    assert Gentility.stats(recovered).cache_entries == 1_000
+    assert Gentility.stats(recovered).revocations == 1
+  end
+
+  @tag :tmp_dir
+  test "writes the lease cache when the controller shuts down", %{tmp_dir: tmp_dir} do
+    path = Path.join(tmp_dir, "admission.cache")
+    node_key = node_key(38)
+
+    controller =
+      start_controller(
+        authority: fn _request -> {:ok, signed_lease(node_key)} end,
+        cache_path: path,
+        cache_persist_ms: 600_000
+      )
+
+    assert {:ok, _context} = Gentility.authorize(request(node_key), Gentility.policy(controller))
+    refute File.exists?(path)
+
+    assert :ok = stop_supervised(Gentility)
+    assert File.exists?(path)
+  end
+
+  @tag :tmp_dir
   test "corrupt durable state fails closed without preventing startup", %{tmp_dir: tmp_dir} do
     path = Path.join(tmp_dir, "admission.cache")
     File.write!(path, "not a cache")

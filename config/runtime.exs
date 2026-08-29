@@ -328,6 +328,9 @@ if config_env() == :prod do
           max_byte_delay_ms =
             parse_bounded_integer.("DERPEX_GENTILITY_MAX_BYTE_DELAY_MS", 30_000, 1, 0xFFFF_FFFF)
 
+          cache_persist_ms =
+            parse_bounded_integer.("DERPEX_GENTILITY_CACHE_PERSIST_MS", 5_000, 1, 0xFFFF_FFFF)
+
           [
             authority: adapter,
             verification_keys: verification_keys,
@@ -339,6 +342,7 @@ if config_env() == :prod do
             max_lease_ms: max_lease_ms,
             max_future_skew_ms: max_future_skew_ms,
             max_byte_delay_ms: max_byte_delay_ms,
+            cache_persist_ms: cache_persist_ms,
             usage: [
               instance_id: instance_id,
               region_id: region_id,

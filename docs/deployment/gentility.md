@@ -49,12 +49,32 @@ than silently reverting to its default.
 | `DERPEX_GENTILITY_MAX_LEASE_MS` | `900000` | Longest lease lifetime accepted, and so the worst-case missed-revocation window. |
 | `DERPEX_GENTILITY_MAX_FUTURE_SKEW_MS` | `30000` | Clock skew allowed on a lease issue time. It never extends expiry. |
 | `DERPEX_GENTILITY_MAX_BYTE_DELAY_MS` | `30000` | Pacing delay above which a connection is closed instead of paced. |
+| `DERPEX_GENTILITY_CACHE_PERSIST_MS` | `5000` | Longest a newly cached lease may go unwritten to disk. |
 
 Size `DERPEX_GENTILITY_MAX_CACHE_ENTRIES` above the number of distinct nodes an
 instance expects to serve within one lease lifetime, not above its concurrent
 connection count: the cache holds every node that may reconnect during a
 Gentility outage. All budgets are per instance and must be divided by the
 number of instances in the region.
+
+### Cache durability
+
+Writing the cache rewrites the whole file, so lease admissions are debounced:
+a change marks the cache dirty and the file is written at most once per
+`DERPEX_GENTILITY_CACHE_PERSIST_MS`, and again when the controller shuts down.
+A burst of reconnections therefore costs one write rather than one per node.
+
+Revocations, reconciliation batches, and verification-key rotation are never
+deferred — they are the security-relevant writes, and each flushes the file
+synchronously before replying.
+
+Worst case, an unclean crash (SIGKILL, power loss, or a VM halt that skips
+shutdown) loses the leases admitted in the last `DERPEX_GENTILITY_CACHE_PERSIST_MS`
+and nothing else. Those nodes simply re-authorize against Gentility on their
+next connection; a lost lease can never admit a node that should be denied. No
+revocation is ever lost this way. The cost of a longer window is a slightly
+larger set of nodes that must reach Gentility after a crash that coincides with
+a control-plane outage; lower it only if that combination is a real concern.
 
 ### Cache eviction
 
