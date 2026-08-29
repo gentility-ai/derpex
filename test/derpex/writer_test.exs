@@ -56,6 +56,22 @@ defmodule Derpex.WriterTest do
     def secure?(_socket), do: false
   end
 
+  defmodule FailingTransport do
+    @behaviour Derpex.Transport
+
+    @impl true
+    def send(_socket, _data), do: {:error, :closed}
+
+    @impl true
+    def close(_socket), do: :ok
+
+    @impl true
+    def peername(_socket), do: {:ok, :test}
+
+    @impl true
+    def secure?(_socket), do: false
+  end
+
   test "a stalled socket write cannot accumulate packet messages in the writer mailbox" do
     {:ok, writer} = Writer.start_link(owner: self(), transport: BlockingTransport, socket: self())
     Process.unlink(writer)
@@ -249,6 +265,28 @@ defmodule Derpex.WriterTest do
 
     assert_receive {:write_finished, :early, frame}
     assert frame =~ "early"
+  end
+
+  @tag :capture_log
+  test "attach reports the write error its own drain runs into" do
+    {:ok, writer} =
+      Writer.start_link(owner: self(), transport: FailingTransport, socket: :socket)
+
+    Process.unlink(writer)
+    monitor = Process.monitor(writer)
+    ordinary = Ring.new(32, notifier: writer, wake_message: Writer.wake_message())
+    source = :crypto.strong_rand_bytes(32)
+
+    assert Ring.enqueue(ordinary, {:recv_packet, source, "early"}) == {:ok, :wake}
+
+    assert Writer.attach(writer, %{
+             ordinary: ordinary,
+             disco: Ring.new(32, notifier: writer, wake_message: Writer.wake_message()),
+             pong: Ring.new(1, notifier: writer, wake_message: Writer.wake_message()),
+             lifecycle: Ring.new(32, notifier: writer, wake_message: Writer.wake_message())
+           }) == {:error, :closed}
+
+    assert_receive {:DOWN, ^monitor, :process, ^writer, {:write_error, :closed}}
   end
 
   test "counts distinct non-zero sources only after their packets are written" do

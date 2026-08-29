@@ -369,7 +369,13 @@ defmodule Derpex.RouterTest do
         watcher_ring = Ring.new(2, test_hook: holding_hook(parent))
         watcher = spawn(fn -> Process.sleep(:infinity) end)
         assert Router.watch(watcher, watcher_ring) == :ok
-        holder = spawn(fn -> Ring.enqueue(watcher_ring, :held) end)
+
+        holder =
+          spawn(fn ->
+            Process.put(:hold_ring_lock, true)
+            Ring.enqueue(watcher_ring, :held)
+          end)
+
         assert_receive {:holding, ^holder}
         {watcher, holder}
       end)
@@ -389,12 +395,25 @@ defmodule Derpex.RouterTest do
 
     # Napping on each held lock would cost milliseconds per watcher.
     assert elapsed_microseconds < 5_000
+
+    # Held locks make every later broadcast slow, so this test hands the router
+    # back clean rather than leaving the teardown to run beside the next test.
+    Enum.each(watchers, fn {watcher, holder} ->
+      send(holder, :release)
+      Process.exit(watcher, :kill)
+    end)
+
+    assert Router.unregister(key, connection) == :ok
+    assert_eventually(fn -> Router.stats().watchers == 0 end)
   end
 
+  # Only the process that marked itself the holder parks inside the lock. The
+  # router runs this same hook whenever it publishes into one of these rings,
+  # and parking it there would wedge the singleton for every other test.
   defp holding_hook(parent) do
     fn
       :after_journal ->
-        if self() != parent do
+        if Process.get(:hold_ring_lock) do
           send(parent, {:holding, self()})
 
           receive do

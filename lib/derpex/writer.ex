@@ -32,8 +32,13 @@ defmodule Derpex.Writer do
     GenServer.start_link(__MODULE__, options)
   end
 
-  @doc "Attaches fixed rings before the connection is registered for routing."
-  @spec attach(pid(), rings()) :: :ok
+  @doc """
+  Attaches fixed rings before the connection is registered for routing.
+
+  The attaching call drains whatever the rings already hold, so it reports a
+  failed socket write rather than reporting success and stopping silently.
+  """
+  @spec attach(pid(), rings()) :: :ok | {:error, term()}
   def attach(writer, rings), do: GenServer.call(writer, {:attach, rings})
 
   @doc "Writes bounded handshake/HTTP control data in call order."
@@ -85,7 +90,7 @@ defmodule Derpex.Writer do
     # drain happens here rather than waiting for a wakeup that never comes.
     case drain(%{state | rings: rings}) do
       {:ok, state} -> {:reply, :ok, state}
-      {:error, reason, state} -> {:stop, {:write_error, reason}, :ok, state}
+      {:error, reason, state} -> {:stop, {:write_error, reason}, {:error, reason}, state}
     end
   end
 
@@ -113,11 +118,14 @@ defmodule Derpex.Writer do
 
   def handle_info(@wake_message, state), do: {:noreply, state}
 
-  def handle_info(@retry_message, %{rings: rings} = state) when is_map(rings) do
-    drain_or_stop(%{state | retry_timer: nil})
+  # The reference makes a message from an already-cancelled timer identifiable,
+  # so it cannot clear the bookkeeping of the timer that replaced it.
+  def handle_info({@retry_message, reference}, %{retry_timer: {reference, _timer}} = state) do
+    state = %{state | retry_timer: nil}
+    if is_map(state.rings), do: drain_or_stop(state), else: {:noreply, state}
   end
 
-  def handle_info(@retry_message, state), do: {:noreply, %{state | retry_timer: nil}}
+  def handle_info({@retry_message, _stale_reference}, state), do: {:noreply, state}
 
   def handle_info({:DOWN, monitor, :process, _owner, reason}, %{owner_monitor: monitor} = state) do
     {:stop, {:owner_down, reason}, state}
@@ -161,7 +169,9 @@ defmodule Derpex.Writer do
   # a wakeup is only guaranteed when the flag was clear; when it was already set
   # by the wakeup being handled right now, this timer is the one that comes back.
   defp schedule_retry(%{retry_timer: nil} = state) do
-    %{state | retry_timer: Process.send_after(self(), @retry_message, @retry_interval_ms)}
+    reference = make_ref()
+    timer = Process.send_after(self(), {@retry_message, reference}, @retry_interval_ms)
+    %{state | retry_timer: {reference, timer}}
   end
 
   defp schedule_retry(state), do: state
@@ -170,10 +180,10 @@ defmodule Derpex.Writer do
   # at most one outstanding retry and never accumulates timer messages.
   defp cancel_retry(%{retry_timer: nil} = state), do: state
 
-  defp cancel_retry(%{retry_timer: timer} = state) do
+  defp cancel_retry(%{retry_timer: {reference, timer}} = state) do
     if Process.cancel_timer(timer) == false do
       receive do
-        @retry_message -> :ok
+        {@retry_message, ^reference} -> :ok
       after
         0 -> :ok
       end

@@ -4,6 +4,12 @@ defmodule Derpex.Outbox.RingTest do
   alias Derpex.Outbox.Ring
 
   @enqueue_results [{:ok, :wake}, {:ok, :coalesced}, {:ok, :replaced}, {:dropped, :contention}]
+  # Roughly two hundred microseconds of work between packets, so that eight
+  # senders keep the schedulers busy without saturating them.
+  @pacing_iterations 100_000
+  # The ring's own acquisition budget and the number of naps that fit in it.
+  @acquire_budget_microseconds 4_000
+  @producer_naps 4
 
   test "coalesces wakeups and replaces the oldest item at fixed capacity" do
     ring = Ring.new(2, wake_message: :ready)
@@ -65,7 +71,7 @@ defmodule Derpex.Outbox.RingTest do
     {contender, contender_monitor} =
       spawn_monitor(fn -> send(parent, {:attempted, contend_many(ring, attempts)}) end)
 
-    assert_receive {:attempted, results}, 5_000
+    assert_receive {:attempted, {_latencies, results}}, 5_000
     assert_receive {:DOWN, ^contender_monitor, :process, ^contender, :normal}
     assert results == %{{:dropped, :contention} => attempts}
 
@@ -79,6 +85,7 @@ defmodule Derpex.Outbox.RingTest do
   # Saturating fan-in is the worst case for a single ring lock: eight producers
   # that never pause exhaust their retry budgets and take counted tail drops.
   # What must hold is that nothing is lost silently.
+  @tag timeout: 30_000
   test "concurrent producers keep every item delivered or counted" do
     parent = self()
     producer_count = 8
@@ -107,7 +114,7 @@ defmodule Derpex.Outbox.RingTest do
     stats = Ring.stats(ring)
 
     results =
-      Enum.reduce(outcomes, %{}, fn counts, tally ->
+      Enum.reduce(outcomes, %{}, fn {_latencies, counts}, tally ->
         Map.merge(tally, counts, fn _result, left, right -> left + right end)
       end)
 
@@ -115,6 +122,81 @@ defmodule Derpex.Outbox.RingTest do
     assert Map.get(results, {:dropped, :contention}, 0) == stats.tail_drops
     assert delivered + stats.head_drops + stats.tail_drops == sent
     assert delivered > 0
+  end
+
+  # The relay's ordinary case: one sender filling one destination's ring while
+  # its writer drains, with fewer packets in flight than the ring has slots.
+  # Nothing may be dropped or reordered there, which is exactly what the Go
+  # prober checks over its hundred megabytes.
+  @tag timeout: 30_000
+  test "one producer and one consumer deliver every item in order without drops" do
+    parent = self()
+    total = 10_000
+    window = 24
+    consumer = spawn_link(fn -> await_ordered_ring(parent, total) end)
+    ring = Ring.new(32, notifier: consumer, wake_message: :ready)
+    send(consumer, {:ring, ring})
+
+    outstanding =
+      Enum.reduce(1..total, 0, fn sequence, outstanding ->
+        outstanding = await_credit(outstanding, window)
+        # Retrying a contention drop keeps the sequence intact: the item was
+        # never published, and this is the only producer.
+        assert enqueue_until_accepted(ring, sequence) in [:wake, :coalesced]
+        outstanding + 1
+      end)
+
+    _drained = await_credit(outstanding, 1)
+    assert_receive {:verified, ^total}, 5_000
+    refute_received {:out_of_order, _expected, _item}
+
+    stats = Ring.stats(ring)
+    assert stats.head_drops == 0
+    assert stats.size == 0
+    # Losing the lock to the writer stays exceptional even on a loaded machine.
+    assert stats.tail_drops < div(total, 100)
+  end
+
+  # Eight senders sharing one destination wait for its ring lock; what they must
+  # not do is wait for it indefinitely.
+  @tag timeout: 30_000
+  test "an enqueue stays inside the acquisition budget under concurrent producers" do
+    parent = self()
+    producer_count = 8
+    per_producer = 200
+    consumer = spawn_link(&await_ring/0)
+    ring = Ring.new(32, notifier: consumer, wake_message: :ready)
+    send(consumer, {:ring, ring})
+
+    producers =
+      Enum.map(1..producer_count, fn index ->
+        spawn_monitor(fn ->
+          {latencies, _results} = contend_many(ring, per_producer, index, @pacing_iterations)
+          send(parent, {:latencies, self(), latencies})
+        end)
+      end)
+
+    # A one-millisecond nap costs a millisecond only on an idle node; behind a
+    # busy run queue it costs whatever rescheduling costs. Calibrating against
+    # that same load while the producers run keeps the ceiling a statement
+    # about the ring — its four-millisecond budget and the naps that fit in it
+    # — rather than about the machine.
+    nap_cost = Enum.max(for _sample <- 1..25, do: elem(:timer.tc(&Process.sleep/1, [1]), 0))
+    ceiling = @acquire_budget_microseconds + @producer_naps * nap_cost
+
+    latencies =
+      Enum.flat_map(producers, fn {producer, monitor} ->
+        assert_receive {:latencies, ^producer, samples}, 30_000
+        assert_receive {:DOWN, ^monitor, :process, ^producer, :normal}, 5_000
+        samples
+      end)
+
+    send(consumer, {:stop, self()})
+    assert_receive {:consumed, _delivered}, 5_000
+
+    assert percentile(latencies, 0.999) <= ceiling
+    # The typical enqueue does not cost even one nap.
+    assert percentile(latencies, 0.5) <= nap_cost
   end
 
   test "a producer killed while contending never wedges the consumer" do
@@ -194,15 +276,81 @@ defmodule Derpex.Outbox.RingTest do
     end
   end
 
-  defp contend_many(ring, count, index \\ 0) do
-    Enum.reduce(1..count, %{}, fn sequence, results ->
-      Map.update(results, Ring.enqueue(ring, {index, sequence}), 1, &(&1 + 1))
+  # Returns how each attempt ended and how long each one took. `pace` is the
+  # work a producer does between packets; zero saturates the schedulers.
+  defp contend_many(ring, count, index \\ 0, pace \\ 0) do
+    Enum.map_reduce(1..count, %{}, fn sequence, results ->
+      spin(pace)
+      {microseconds, result} = :timer.tc(fn -> Ring.enqueue(ring, {index, sequence}) end)
+      {microseconds, Map.update(results, result, 1, &(&1 + 1))}
     end)
+  end
+
+  defp spin(0), do: :ok
+  defp spin(iterations), do: spin(iterations - 1)
+
+  defp enqueue_until_accepted(ring, item) do
+    case Ring.enqueue(ring, item) do
+      {:ok, wake_state} -> wake_state
+      {:dropped, :contention} -> enqueue_until_accepted(ring, item)
+    end
+  end
+
+  defp percentile(samples, fraction) do
+    sorted = Enum.sort(samples)
+    index = min(round(length(sorted) * fraction), length(sorted) - 1)
+    Enum.at(sorted, index)
   end
 
   defp await_ring do
     receive do
       {:ring, ring} -> consume(ring, 0)
+    end
+  end
+
+  defp await_credit(outstanding, window) when outstanding < window, do: outstanding
+
+  defp await_credit(outstanding, window) do
+    receive do
+      {:consumed, count} -> await_credit(outstanding - count, window)
+    after
+      5_000 -> flunk("the consumer stopped taking items")
+    end
+  end
+
+  defp await_ordered_ring(parent, total) do
+    receive do
+      {:ring, ring} -> consume_in_order(ring, parent, total, 1)
+    end
+  end
+
+  defp consume_in_order(_ring, parent, total, expected) when expected > total do
+    send(parent, {:verified, total})
+  end
+
+  defp consume_in_order(ring, parent, total, expected) do
+    receive do
+      :ready ->
+        expected = take_in_order(ring, parent, expected, 0)
+        consume_in_order(ring, parent, total, expected)
+    end
+  end
+
+  defp take_in_order(ring, parent, expected, taken) do
+    case Ring.take(ring) do
+      {:ok, ^expected} ->
+        take_in_order(ring, parent, expected + 1, taken + 1)
+
+      {:ok, item} ->
+        send(parent, {:out_of_order, expected, item})
+        expected
+
+      :busy ->
+        take_in_order(ring, parent, expected, taken)
+
+      _empty_or_closed ->
+        if taken > 0, do: send(parent, {:consumed, taken})
+        expected
     end
   end
 
@@ -230,14 +378,20 @@ defmodule Derpex.Outbox.RingTest do
   # producer spends nearly all of its time against a lock that is never
   # released. Waiting for the parked state keeps that deterministic without
   # depending on how long a retry takes.
-  defp await_parked(producer, attempts \\ 500)
-  defp await_parked(_producer, 0), do: :ok
+  defp await_parked(producer, attempts \\ 10_000)
+
+  defp await_parked(_producer, 0) do
+    flunk("the producer never parked inside its retry budget")
+  end
 
   defp await_parked(producer, attempts) do
+    # Sampling on a millisecond timer aliases with the producer's own
+    # millisecond naps and reports it runnable every time; yielding samples the
+    # gaps too.
     if Process.info(producer, :status) == {:status, :waiting} do
       :ok
     else
-      Process.sleep(1)
+      :erlang.yield()
       await_parked(producer, attempts - 1)
     end
   end
