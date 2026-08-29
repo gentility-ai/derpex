@@ -223,6 +223,17 @@ Cached leases and usage batches are atomically persisted with mode `0600`.
 Unknown and expired nodes fail closed during outage. A full usage spool stops
 packet admission instead of dropping accounting data or growing memory.
 
+The lease TTL (`DERPEX_GENTILITY_MAX_LEASE_MS`, 15 minutes by default) is the
+worst-case window in which a revoked node can still connect if both revocation
+push and reconciliation are unavailable, and it is also how long the relay
+keeps serving without Gentility. Leases backing live connections are renewed at
+80% of their lifetime, so an outage darkens the relay one TTL after the last
+successful renewal, node by node as each lease expires. Alert on
+`derpex_gentility_nearest_lease_expiry_seconds`: it is the only warning that
+arrives before connections start dropping. Lease budgets are enforced per
+instance, so Gentility must divide each intended limit by the number of
+instances that may serve a node. `docs/deployment/gentility.md` is the runbook.
+
 Graceful regional withdrawal is controlled through `Derpex.Drain.begin_drain/2`
 and `Derpex.Drain.cancel/1`. A drain rejects new home transitions, leaves mesh
 peers and probes available, sends bounded-jitter `FrameRestarting` notices only

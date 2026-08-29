@@ -33,6 +33,41 @@ proxy or load balancer.
   `/debug/check` remain nonexistent until `DERPEX_OPERATIONS_TOKEN` is set and
   then require its bearer credential on every request.
 
+## Lease TTL and outage semantics
+
+One number governs how this relay behaves when Gentility is unreachable:
+`DERPEX_GENTILITY_MAX_LEASE_MS`, 15 minutes by default.
+
+**It is the worst-case window in which a revoked node can still connect.** A
+revocation reaches a relay two ways — pushed on the event stream, and replayed
+by reconciliation — but if both are unavailable, the only thing that stops a
+revoked node is its cached lease expiring. That is at most one lease lifetime
+from the moment the lease was issued. Shortening the TTL shortens that window
+and lengthens nothing except how often Gentility is asked to renew.
+
+**An outage longer than one TTL darkens the relay.** Leases for connected nodes
+are renewed at 80% of their lifetime, so the clock that matters is the last
+*successful* renewal, not the start of the outage. Once a lease expires the node
+is closed, and a node with no unexpired cached lease is refused. In practice a
+15-minute TTL means: an outage under ~3 minutes is invisible (the next renewal
+succeeds), an outage under 15 minutes closes nothing, and beyond that the relay
+drains node by node as each lease reaches its expiry — a few minutes early,
+spread by jitter.
+
+**Alert on `derpex_gentility_nearest_lease_expiry_seconds`.** Falling toward
+zero while `derpex_gentility_authorize_total{outcome="cached"}` climbs is the
+signature of an outage about to darken the relay, and it is the only warning
+that arrives before connections start dropping. Page on it well before it
+reaches zero — a threshold of a third of the TTL gives an on-call responder the
+remaining two-thirds to restore Gentility.
+
+**Budgets are per instance, not per fleet.** Every connection and byte
+allocation in a lease is enforced by the instance holding it. Gentility must
+therefore divide each organization's and node's intended limit by the number of
+instances that may serve it, or the fleet's effective limit becomes that number
+times the intended one. Adding an instance to a region without redividing
+raises every organization's real ceiling.
+
 ## Admission lease tuning
 
 The lease controller is configured entirely from the environment. Every value
