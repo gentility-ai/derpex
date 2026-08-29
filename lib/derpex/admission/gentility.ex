@@ -51,6 +51,7 @@ defmodule Derpex.Admission.Gentility do
   @renewal_fraction {4, 5}
   @expiry_jitter_percent 10
   @renewal_chunk 1_000
+  @purge_chunk 1_000
   @default_log_interval_ms 60_000
   @denial_reasons [
     :no_cached_lease,
@@ -64,7 +65,7 @@ defmodule Derpex.Admission.Gentility do
     :other
   ]
   @close_peer_causes [:expiry, :revocation, :eviction, :key_rotation]
-  @cache_write_timeout_ms 2_000
+  @cache_write_timeout_ms 1_500
   @budget_prune_chunk 1_000
   @reverify_chunk 1_000
   defmodule Policy do
@@ -241,6 +242,8 @@ defmodule Derpex.Admission.Gentility do
   @spec revoke(GenServer.server(), binary()) :: {:ok, :applied | :stale} | {:error, term()}
   def revoke(server, signed_revocation) when is_binary(signed_revocation) do
     GenServer.call(server, {:revoke, signed_revocation})
+  catch
+    :exit, _reason -> {:error, :admission_unavailable}
   end
 
   @doc "Applies a reconciliation batch of signed revocations in one durable update."
@@ -248,12 +251,38 @@ defmodule Derpex.Admission.Gentility do
           {:ok, %{applied: non_neg_integer(), stale: non_neg_integer()}} | {:error, term()}
   def reconcile(server, signed_revocations) when is_list(signed_revocations) do
     GenServer.call(server, {:reconcile, signed_revocations})
+  catch
+    :exit, _reason -> {:error, :admission_unavailable}
   end
 
   @doc "Replaces the bounded verification keyring and invalidates records it can no longer verify."
   @spec update_verification_keys(GenServer.server(), map()) :: :ok | {:error, term()}
   def update_verification_keys(server, keys) when is_map(keys) do
     GenServer.call(server, {:update_verification_keys, keys})
+  end
+
+  @doc """
+  Returns the counters a stalled controller can still answer for.
+
+  Metrics that matter most during an incident are the ones a controller stuck in
+  a long call cannot report, so the shedding and failure counters are published
+  where they can be read without touching the process.
+  """
+  @spec counters() :: map()
+  def counters do
+    case :persistent_term.get({__MODULE__, :counters}, nil) do
+      nil ->
+        %{}
+
+      refs ->
+        %{
+          authorize_overloaded_total: :atomics.get(refs.counters, @overloaded_counter),
+          authorize_unavailable_total: :atomics.get(refs.counters, @unavailable_counter),
+          usage_shed_total: :atomics.get(refs.counters, @usage_shed_counter),
+          byte_pacing_capped_total: :atomics.get(refs.counters, @pacing_capped_counter),
+          close_peer_failures: :atomics.get(refs.close_failures, 1)
+        }
+    end
   end
 
   @doc "Returns bounded controller state suitable for health checks and assertions."
@@ -270,6 +299,8 @@ defmodule Derpex.Admission.Gentility do
 
     case initial_state(options) do
       {:ok, state} ->
+        publish_counters(state)
+
         state =
           state
           |> load_cache()
@@ -309,6 +340,10 @@ defmodule Derpex.Admission.Gentility do
       usage_shed_total: :atomics.get(state.policy.counters, @usage_shed_counter),
       close_peer_failures: :atomics.get(state.close_failures, 1),
       byte_pacing_capped_total: :atomics.get(state.policy.counters, @pacing_capped_counter),
+      expiring_leases: :gb_trees.size(state.by_expiry),
+      elapsing_leases: :gb_trees.size(state.by_monotonic),
+      unclaimed_leases: :gb_trees.size(state.unclaimed),
+      renewal_queue: :gb_trees.size(state.by_renewal),
       cache_load_error: state.load_error != nil,
       cache_persist_error: state.persist_error != nil,
       load_error: state.load_error,
@@ -453,7 +488,7 @@ defmodule Derpex.Admission.Gentility do
   def handle_info({:EXIT, pid, reason}, state) do
     cond do
       state.usage && state.usage.server == pid -> {:stop, reason, state}
-      state.cache_writer == pid -> {:stop, reason, state}
+      state.cache_writer == pid -> restart_cache_writer(state, reason)
       state.closer == pid -> restart_closer(state, reason)
       true -> unexpected_exit(state, pid, reason)
     end
@@ -509,8 +544,10 @@ defmodule Derpex.Admission.Gentility do
     close_peer = Keyword.get(options, :close_peer, &Router.close_peer/1)
     close_failures = :atomics.new(1, signed: false)
 
+    cache_table = :ets.new(__MODULE__.Cache, [:ordered_set, :public, read_concurrency: true])
+
     with :ok <- validate_verification_keys(verification_keys),
-         {:ok, cache_writer} <- initial_cache_writer(cache_path),
+         {:ok, cache_writer} <- initial_cache_writer(cache_path, cache_table),
          {:ok, closer} <- Closer.start_link(close_peer: close_peer, failures: close_failures),
          {:ok, usage} <- initial_usage(Keyword.get(options, :usage), clock) do
       budgets = Budgets.new()
@@ -565,6 +602,7 @@ defmodule Derpex.Admission.Gentility do
          cache_persist_token: nil,
          cache_dirty: false,
          cache_writer: cache_writer,
+         cache_table: cache_table,
          reverify: nil,
          by_renewal: :gb_trees.empty(),
          renewal_timer: nil,
@@ -583,6 +621,7 @@ defmodule Derpex.Admission.Gentility do
          expiry_token: nil,
          load_error: nil,
          persist_error: nil,
+         registered?: is_atom(server),
          usage: usage
        }}
     end
@@ -886,7 +925,11 @@ defmodule Derpex.Admission.Gentility do
       # because of it. The same deadline is therefore also held on the monotonic
       # clock, and whichever expires first closes the lease.
       monotonic_close_at_ms: now_monotonic_ms(state) + max(close_at_ms - now_ms(state), 0),
-      renew_at_ms: lease.issued_at_ms + div(lifetime * numerator, denominator)
+      # Renewal is jittered like expiry: a fleet that reconnected together must
+      # not come back to Gentility together a lease later.
+      renew_at_ms:
+        lease.issued_at_ms + div(lifetime * numerator, denominator) -
+          state.expiry_jitter.(lifetime)
     }
   end
 
@@ -899,6 +942,8 @@ defmodule Derpex.Admission.Gentility do
 
   defp put_lease_entry(state, node_key, entry) do
     key = expiry_key(node_key, entry)
+
+    true = :ets.insert(state.cache_table, {{:lease, node_key}, entry.wire})
 
     state = %{
       state
@@ -921,6 +966,7 @@ defmodule Derpex.Admission.Gentility do
 
       {entry, leases} ->
         key = expiry_key(node_key, entry)
+        true = :ets.delete(state.cache_table, {:lease, node_key})
 
         %{
           state
@@ -978,6 +1024,7 @@ defmodule Derpex.Admission.Gentility do
 
       _older_or_missing ->
         {state, close?} = put_revocation(state, wire, revocation)
+        state = journal_revocations(state, [wire])
 
         state =
           if close?,
@@ -987,7 +1034,7 @@ defmodule Derpex.Admission.Gentility do
         state =
           log_event(state, :revocation, "gentility revocation applied; node closed: #{close?}")
 
-        state = persist_now(state) |> reschedule_timers()
+        state = state |> mark_cache_dirty() |> reschedule_timers()
         {if(close?, do: :covered, else: :uncovered), state}
     end
   end
@@ -997,6 +1044,7 @@ defmodule Derpex.Admission.Gentility do
       Enum.reduce(revocations, {state, 0, 0, MapSet.new()}, &reconcile_revocation/2)
 
     state = close_peers(state, MapSet.to_list(close_keys), :revocation)
+    state = journal_revocations(state, Enum.map(revocations, &elem(&1, 0)))
 
     state =
       if applied > 0,
@@ -1009,7 +1057,7 @@ defmodule Derpex.Admission.Gentility do
           ),
         else: state
 
-    state = persist_now(state) |> reschedule_timers()
+    state = state |> mark_cache_dirty() |> reschedule_timers()
     {:reply, {:ok, %{applied: applied, stale: stale}}, state}
   end
 
@@ -1051,6 +1099,7 @@ defmodule Derpex.Admission.Gentility do
   # tree lookup rather than a scan.
   defp put_revocation_entry(state, node_key, entry) do
     state = drop_revocation_entry(state, node_key)
+    true = :ets.insert(state.cache_table, {{:revocation, node_key}, entry.wire})
 
     state = %{
       state
@@ -1073,6 +1122,8 @@ defmodule Derpex.Admission.Gentility do
         state
 
       {entry, revocations} ->
+        true = :ets.delete(state.cache_table, {:revocation, node_key})
+
         %{
           state
           | revocations: revocations,
@@ -1499,8 +1550,8 @@ defmodule Derpex.Admission.Gentility do
   # Expiry order is maintained incrementally, so purging walks only the leases
   # that have actually expired rather than the whole cache.
   defp purge_expired(state) do
-    {state, closed} = purge_expired_leases(state, now_ms(state), [])
-    {state, closed} = purge_elapsed_leases(state, now_monotonic_ms(state), closed)
+    {state, closed} = purge_expired_leases(state, now_ms(state), [], @purge_chunk)
+    {state, closed} = purge_elapsed_leases(state, now_monotonic_ms(state), closed, @purge_chunk)
 
     case closed do
       [] -> state
@@ -1510,7 +1561,9 @@ defmodule Derpex.Admission.Gentility do
 
   # The monotonic backstop: a lease whose lifetime has elapsed is closed even if
   # the wall clock has been stepped backwards and still calls it valid.
-  defp purge_elapsed_leases(state, now, closed) do
+  defp purge_elapsed_leases(state, _now, closed, 0), do: {state, closed}
+
+  defp purge_elapsed_leases(state, now, closed, remaining) do
     if :gb_trees.is_empty(state.by_monotonic) do
       {state, closed}
     else
@@ -1519,7 +1572,7 @@ defmodule Derpex.Admission.Gentility do
       if deadline <= now do
         state = %{state | by_monotonic: :gb_trees.delete_any(key, state.by_monotonic)}
         {state, closed} = elapse_lease(state, node_key, key, closed)
-        purge_elapsed_leases(state, now, closed)
+        purge_elapsed_leases(state, now, closed, remaining - 1)
       else
         {state, closed}
       end
@@ -1542,7 +1595,9 @@ defmodule Derpex.Admission.Gentility do
 
   # The popped key leaves both indexes before anything else happens, so the walk
   # terminates even if an index key ever outlived the entry that created it.
-  defp purge_expired_leases(state, now, closed) do
+  defp purge_expired_leases(state, _now, closed, 0), do: {state, closed}
+
+  defp purge_expired_leases(state, now, closed, remaining) do
     if :gb_trees.is_empty(state.by_expiry) do
       {state, closed}
     else
@@ -1556,7 +1611,7 @@ defmodule Derpex.Admission.Gentility do
         }
 
         {state, closed} = expire_lease(state, node_key, key, closed)
-        purge_expired_leases(state, now, closed)
+        purge_expired_leases(state, now, closed, remaining - 1)
       else
         {state, closed}
       end
@@ -1618,8 +1673,13 @@ defmodule Derpex.Admission.Gentility do
     end
   end
 
+  # Renewals take at most half the admission slots. A node connecting now is
+  # answering a person waiting on a connection; a renewal has until its lease
+  # expires, so it yields.
+  defp renewal_limit(state), do: max(div(state.policy.max_concurrent_requests, 2), 1)
+
   defp spawn_renewal(state, node_key, entry) do
-    case reserve(state.policy.gate, state.policy.max_concurrent_requests) do
+    case reserve(state.policy.gate, renewal_limit(state)) do
       :ok ->
         parent = self()
         authority = state.policy.authority
@@ -1788,9 +1848,19 @@ defmodule Derpex.Admission.Gentility do
 
       delay ->
         token = make_ref()
-        timer = state.clock.send_after(self(), {__MODULE__, :expire, token}, delay)
-        %{state | expiry_timer: timer, expiry_token: token}
+        %{state | expiry_timer: expiry_timer(state, token, delay), expiry_token: token}
     end
+  end
+
+  # A sweep that still has work left continues on the next message rather than
+  # in a zero-delay timer, which is what bounds one purge to one chunk.
+  defp expiry_timer(_state, token, 0) do
+    send(self(), {__MODULE__, :expire, token})
+    nil
+  end
+
+  defp expiry_timer(state, token, delay) do
+    state.clock.send_after(self(), {__MODULE__, :expire, token}, delay)
   end
 
   # Whichever deadline comes first decides when the sweep runs.
@@ -1879,6 +1949,25 @@ defmodule Derpex.Admission.Gentility do
 
   defp persist_now(state), do: state |> Map.put(:cache_dirty, true) |> flush_cache(:sync)
 
+  # A revocation is durable before the caller is told it was applied, without
+  # waiting for a snapshot of every cached lease. The snapshot still follows on
+  # its own timer and subsumes the journal.
+  defp journal_revocations(%{cache_writer: nil} = state, _wires), do: state
+
+  defp journal_revocations(state, wires) do
+    case CacheWriter.append_revocations(state.cache_writer, wires, @cache_write_timeout_ms) do
+      :ok ->
+        %{state | persist_error: nil}
+
+      {:error, reason} ->
+        log_event(
+          %{state | persist_error: reason},
+          :cache_persist_error,
+          "gentility could not make a revocation durable: #{inspect(reason)}"
+        )
+    end
+  end
+
   defp flush_cache(state, mode \\ :async)
 
   defp flush_cache(%{cache_dirty: false} = state, _mode), do: state
@@ -1913,34 +2002,26 @@ defmodule Derpex.Admission.Gentility do
   # view of controller state; only the write itself leaves the process.
   defp persist(%{cache_writer: nil}, _mode), do: :ok
 
-  defp persist(state, :async), do: CacheWriter.write(state.cache_writer, cache_snapshot(state))
+  defp persist(state, :async), do: CacheWriter.write(state.cache_writer)
 
   defp persist(state, :sync) do
-    CacheWriter.write_sync(state.cache_writer, cache_snapshot(state), @cache_write_timeout_ms)
-  end
-
-  defp cache_snapshot(state) do
-    leases =
-      state.leases |> Enum.sort_by(&elem(&1, 0)) |> Enum.map(fn {_key, entry} -> entry.wire end)
-
-    revocations =
-      state.revocations
-      |> Enum.sort_by(&elem(&1, 0))
-      |> Enum.map(fn {_key, entry} -> entry.wire end)
-
-    Cache.encode(leases, revocations)
+    CacheWriter.write_sync(state.cache_writer, @cache_write_timeout_ms)
   end
 
   # A router that cannot answer must not take the controller with it: one close
   # is isolated here exactly as a batch is inside the closer.
   defp close_peer(state, key, cause) when cause in @close_peer_causes do
     _connection_count = state.close_peer.(key)
-    :ok
+    state
   catch
     kind, reason ->
       :atomics.add(state.close_failures, 1, 1)
-      Logger.warning("gentility could not close a peer: #{inspect(kind)} #{inspect(reason)}")
-      :ok
+
+      log_event(
+        state,
+        :close_peer_failed,
+        "gentility could not close a peer: #{inspect(kind)} #{inspect(reason)}"
+      )
   end
 
   # Closing through the router only reaches a connection the router knows about,
@@ -1977,9 +2058,8 @@ defmodule Derpex.Admission.Gentility do
   defp close_peers(state, [], _cause), do: state
 
   defp close_peers(state, [key], cause) do
-    close_peer(state, key, cause)
-
     state
+    |> close_peer(key, cause)
     |> close_claimed_connections([key], cause)
     |> count_close_peer(cause)
   end
@@ -1993,7 +2073,7 @@ defmodule Derpex.Admission.Gentility do
         count_close_peer(state, cause, length(keys))
 
       {:error, :no_closer} ->
-        :atomics.add(state.close_failures, length(keys), 1)
+        :atomics.add(state.close_failures, 1, length(keys))
 
         log_event(
           state,
@@ -2034,6 +2114,18 @@ defmodule Derpex.Admission.Gentility do
     {:noreply, ensure_closer(%{state | closer: nil})}
   end
 
+  # The writer holds no state the controller cannot rebuild: the records live in
+  # a table the controller owns, so a fresh writer picks up exactly where the
+  # last one left off.
+  defp restart_cache_writer(state, reason) do
+    Logger.warning("gentility cache writer exited: #{inspect(reason)}; restarting it")
+
+    case initial_cache_writer(state.cache_path, state.cache_table) do
+      {:ok, writer} -> {:noreply, mark_cache_dirty(%{state | cache_writer: writer})}
+      {:error, _unavailable} -> {:noreply, %{state | cache_writer: nil}}
+    end
+  end
+
   defp unexpected_exit(state, pid, reason) do
     Logger.warning(
       "gentility admission controller ignoring exit from #{inspect(pid)}: #{inspect(reason)}"
@@ -2042,13 +2134,13 @@ defmodule Derpex.Admission.Gentility do
     {:noreply, state}
   end
 
-  defp initial_cache_writer(nil), do: {:ok, nil}
+  defp initial_cache_writer(nil, _table), do: {:ok, nil}
 
-  defp initial_cache_writer(path) when is_binary(path) do
-    CacheWriter.start_link(path: path, owner: self())
+  defp initial_cache_writer(path, table) when is_binary(path) do
+    CacheWriter.start_link(path: path, owner: self(), table: table)
   end
 
-  defp initial_cache_writer(_path), do: {:error, :invalid_cache_path}
+  defp initial_cache_writer(_path, _table), do: {:error, :invalid_cache_path}
 
   defp initial_usage(nil, _clock), do: {:ok, nil}
 
@@ -2108,6 +2200,15 @@ defmodule Derpex.Admission.Gentility do
       {{close_at_ms, _node_key}, _present} = :gb_trees.smallest(state.by_expiry)
       div(max(close_at_ms - now_ms(state), 0), 1_000)
     end
+  end
+
+  defp publish_counters(%{registered?: false}), do: :ok
+
+  defp publish_counters(state) do
+    :persistent_term.put(
+      {__MODULE__, :counters},
+      %{counters: state.policy.counters, close_failures: state.close_failures}
+    )
   end
 
   defp now_ms(state), do: state.clock.system_time(:millisecond)

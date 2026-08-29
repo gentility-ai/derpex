@@ -108,9 +108,11 @@ Idle cached leases are not renewed. A node with no connection re-authorizes
 naturally the next time it connects, so renewing the whole cache would put the
 fleet's reconnection load on Gentility continuously for no benefit.
 
-Renewal traffic shares `DERPEX_GENTILITY_MAX_CONCURRENT_REQUESTS` with live
-admissions; a renewal that cannot get a slot is retried rather than queued, so
-renewals can never crowd out a connecting node.
+Renewals share `DERPEX_GENTILITY_MAX_CONCURRENT_REQUESTS` with live admissions
+but may hold at most half of it, so a connecting node always has slots to take.
+A renewal that cannot get one is retried rather than queued. Renewal times are
+jittered the same way expiry is, so a fleet that reconnected together does not
+return to Gentility together one lease later.
 
 A lease's deadline is held on two clocks: the wall clock it was issued against
 and the monotonic clock the relay runs on. Whichever says the lifetime is over
@@ -152,15 +154,21 @@ a change marks the cache dirty and the file is written at most once per
 `DERPEX_GENTILITY_CACHE_PERSIST_MS`, and again when the controller shuts down.
 A burst of reconnections therefore costs one write rather than one per node.
 
-Revocations and reconciliation batches are never deferred — they are the
-security-relevant writes, and each flushes the file synchronously before the
-call returns, so a revocation is durable by the time Gentility is told it was
-applied. Verification-key rotation flushes when its sweep completes.
+Revocations are never deferred, and they do not wait for a snapshot of every
+cached lease either. Each one is appended to a small journal beside the
+snapshot — `<cache path>.revocations` — and flushed before the call returns, so
+a revocation is durable by the time Gentility is told it was applied and that
+cost does not grow with the size of the lease cache. The journal is rewritten
+from the live record set once it outgrows what a snapshot would hold, and a
+torn final record after a crash costs that record and nothing else.
+Verification-key rotation still flushes a full snapshot when its sweep
+completes.
 
-The write itself runs in a dedicated writer process, so the controller pays
-only for encoding the snapshot, never for the disk. At most one write is in
-flight and queued snapshots replace one another, so lease churn cannot build a
-backlog of writes.
+The controller keeps its durable records in a shared ordered table; the sort,
+the encode and the fsync all happen in a dedicated writer process, so a
+hundred-thousand-lease cache costs the controller nothing per revocation. At
+most one snapshot write is in flight and queued requests collapse into one, so
+lease churn cannot build a backlog of writes.
 
 Verification-key rotation re-verifies every cached record, one signature check
 each, in bounded chunks between other messages. A rotation therefore is not
@@ -250,6 +258,21 @@ persistent condition cannot flood the log: authority unavailable and serving
 cached, revocation applied, eviction, cache full, key rotation, and cache
 load/write failures. The counters behind them stay exact regardless.
 
+## Revocation stream metrics
+
+The event consumer reports its own health, all fixed-cardinality:
+`derpex_gentility_events_connected` (streaming), `_reconciling`, `_retrying`,
+`_reconciliations_total` and `_reconciliation_pages` (completed passes and the
+pages they took), `_revocations_total` (records applied from the stream),
+`_early_timeouts_total` and `_worker_timeouts_total` (a control plane returning
+long polls too fast, or not at all).
+
+Alert on `connected` staying 0: while it is, revocations are only arriving
+through reconciliation, and if that is failing too they are not arriving at all.
+`derpex_gentility_stalled` is published when the controller could not answer a
+metrics scrape at all; the shedding and close-failure counters are still exported
+beside it because they are read without touching the process.
+
 ## Usage export
 
 Each fixed window is exported as one or more batches with the same window
@@ -265,6 +288,12 @@ counted in `derpex_gentility_usage_dropped_rows`, and deleted, because a row
 that can never be encoded would otherwise block the spool and shed every
 relayed packet behind it. Every other row sharing its window is still
 exported. Any increase in that counter is an accounting loss and must alert.
+
+A spool file the relay cannot read — corrupt, truncated, replaced, or over its
+configured bounds — is moved aside as `<path>.corrupt-<timestamp>`, logged, and
+flagged by `derpex_gentility_usage_spool_load_error`; accounting then restarts
+empty. The ledger for that window is lost and the kept file is what to recover
+from, but a relay never refuses to boot over one unreadable file.
 
 `derpex_gentility_usage_dropped_rows` counts since the usage worker started, so
 a restart resets it to zero. Alert on an increase rather than an absolute

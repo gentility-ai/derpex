@@ -698,7 +698,7 @@ defmodule Derpex.Admission.GentilityTest do
         eventually(fn -> Gentility.stats(controller).close_peer_failures == 1 end)
       end)
 
-    assert log =~ "could not close a peer"
+    assert log =~ "could not close 1 of 3 peers"
 
     # Every peer in the batch was attempted, and the controller kept answering.
     # The batch runs outside the controller call, so waiting on the failure
@@ -749,6 +749,40 @@ defmodule Derpex.Admission.GentilityTest do
 
     assert_receive {:closed, ^node_key}
     assert_receive {:admission_close, ^connection, :revocation}, 2_000
+  end
+
+  test "a mass close that can find no closer is counted, not fatal" do
+    parent = self()
+    keys = [node_key(70), node_key(71), node_key(72)]
+
+    controller =
+      start_controller(
+        authority: fn request -> {:ok, signed_lease(request.node_key)} end,
+        close_peer: fn key -> send(parent, {:closed, key}) end
+      )
+
+    policy = Gentility.policy(controller)
+
+    Enum.each(keys, fn key ->
+      assert {:ok, _context} = Gentility.authorize(request(key), policy)
+    end)
+
+    # No closer, and none can be started: the batch has nowhere to go.
+    :sys.replace_state(controller, fn state ->
+      Closer.stop(state.closer)
+      %{state | closer: nil, close_peer: :not_a_function}
+    end)
+
+    log =
+      ExUnit.CaptureLog.capture_log(fn ->
+        assert Gentility.reconcile(controller, Enum.map(keys, &signed_revocation(&1, 10))) ==
+                 {:ok, %{applied: 3, stale: 0}}
+      end)
+
+    assert log =~ "no peer closer"
+    assert Process.alive?(controller)
+    assert Gentility.stats(controller).close_peer_failures == 3
+    assert Gentility.stats(controller).cache_entries == 0
   end
 
   test "a mass close without a closer is counted rather than reported as done" do
@@ -901,15 +935,18 @@ defmodule Derpex.Admission.GentilityTest do
     assert Gentility.stats(controller).cache_entries == 1_000
     refute File.exists?(path)
 
+    # A revocation is durable before the call returns, in its own journal rather
+    # than in a snapshot of every cached lease.
+    journal = Cache.journal_path(path)
     assert Gentility.revoke(controller, signed_revocation(<<1::256>>, 10)) == {:ok, :applied}
-    assert File.exists?(path)
-    revoked_size = File.stat!(path).size
+    assert File.exists?(journal)
+    refute File.exists?(path)
 
     assert {:ok, _context} = Gentility.authorize(request(<<1_001::256>>), policy)
-    assert File.stat!(path).size == revoked_size
+    refute File.exists?(path)
 
     Manual.advance(5_000)
-    eventually(fn -> File.stat!(path).size > revoked_size end)
+    eventually(fn -> File.exists?(path) end)
 
     assert :ok = stop_supervised(Gentility)
 
@@ -988,6 +1025,47 @@ defmodule Derpex.Admission.GentilityTest do
                {Gentility,
                 authority: fn _request -> {:error, :unavailable} end, verification_keys: %{}}
              )
+  end
+
+  @tag :tmp_dir
+  test "a corrupt usage spool is moved aside and accounting restarts empty", %{tmp_dir: tmp_dir} do
+    parent = self()
+    node_key = node_key(73)
+    spool_path = Path.join(tmp_dir, "usage.spool")
+    File.write!(spool_path, :binary.copy(<<0xEE>>, 19))
+
+    exporter = fn id, wire ->
+      send(parent, {:usage_export, id, wire})
+      :ok
+    end
+
+    log =
+      ExUnit.CaptureLog.capture_log(fn ->
+        controller =
+          start_controller(
+            authority: fn request -> {:ok, signed_lease(request.node_key)} end,
+            usage: usage_options(tmp_dir, exporter)
+          )
+
+        policy = Gentility.policy(controller)
+        assert {:ok, context} = Gentility.authorize(request(node_key), policy)
+
+        # The relay boots and keeps accounting rather than looping on the file.
+        assert Gentility.stats(controller).usage.spool_load_error
+        assert Gentility.stats(controller).usage.spool_batches == 0
+        assert Gentility.record_usage(context, 64, :accepted, policy) == :ok
+
+        Manual.advance(100)
+        assert_receive {:usage_export, _id, _wire}, 5_000
+      end)
+
+    assert log =~ "could not be loaded"
+    assert log =~ "starting empty"
+
+    # The unreadable file is kept for recovery, not deleted.
+    aside = Path.wildcard(Path.join(tmp_dir, "usage.spool.corrupt-*"))
+    assert [kept] = aside
+    assert File.read!(kept) == :binary.copy(<<0xEE>>, 19)
   end
 
   @tag :tmp_dir
@@ -1282,6 +1360,76 @@ defmodule Derpex.Admission.GentilityTest do
 
     assert authorize_p99 < 3_000,
            "authorize p99 was #{authorize_p99} us over #{entries} admissions with a cache_path"
+  end
+
+  @tag :tmp_dir
+  @tag timeout: 600_000
+  test "revocation latency stays flat as the cache grows", %{tmp_dir: tmp_dir} do
+    sizes =
+      if System.get_env("DERPEX_SLOW_TESTS") == "1",
+        do: [5_000, 20_000, 50_000],
+        else: [1_000, 5_000]
+
+    now = System.system_time(:millisecond)
+
+    controller =
+      start_supervised!(
+        {Gentility,
+         [
+           authority: fn request -> {:ok, perf_lease(request.node_key, now)} end,
+           verification_keys: %{@signing_key_id => @public_key},
+           clock: Derpex.Clock.System,
+           max_lease_ms: 900_000,
+           max_future_skew_ms: 30_000,
+           max_cache_entries: 100_000,
+           max_revocations: 100_000,
+           cache_path: Path.join(tmp_dir, "admission.cache"),
+           close_peer: fn _key -> 0 end
+         ]}
+      )
+
+    policy = Gentility.policy(controller)
+
+    # Warm the journal so the first size does not pay for creating it.
+    assert Gentility.revoke(controller, perf_revocation(<<9_999_999::256>>, now)) ==
+             {:ok, :applied}
+
+    {_admitted, timings} =
+      Enum.reduce(sizes, {0, []}, fn size, {admitted, timings} ->
+        for index <- (admitted + 1)..size do
+          assert {:ok, _context} = Gentility.authorize(request(<<index::256>>), policy)
+        end
+
+        assert Gentility.stats(controller).cache_entries == size
+
+        # Revoking is what must not scale with the cache: it makes the record
+        # durable before it answers, and that cost is one flush, not one
+        # snapshot of every cached lease.
+        samples =
+          Enum.map(1..3, fn attempt ->
+            key = <<size + 1_000_000 * attempt::256>>
+
+            {microseconds, {:ok, :applied}} =
+              :timer.tc(fn -> Gentility.revoke(controller, perf_revocation(key, now)) end)
+
+            microseconds
+          end)
+
+        {size, [{size, samples |> Enum.sort() |> Enum.at(1)} | timings]}
+      end)
+
+    timings = Enum.reverse(timings)
+    {_smallest, at_smallest} = List.first(timings)
+    {_largest, at_largest} = List.last(timings)
+
+    # Flat, not fast: the floor here is one fsync, which costs what the
+    # filesystem costs. What must not happen is growth with the cache — a
+    # snapshot per revocation shows up as an order of magnitude between the
+    # smallest cache and the largest.
+    assert at_largest < 3 * at_smallest + 5_000,
+           "revocation cost grew with the cache: #{inspect(timings)}"
+
+    assert at_largest < 50_000, "revoking took #{at_largest} us (#{inspect(timings)})"
   end
 
   test "reclaims byte-budget rows on the prune timer, not on the admission path" do
@@ -1833,6 +1981,46 @@ defmodule Derpex.Admission.GentilityTest do
   end
 
   @tag :tmp_dir
+  @tag :tmp_dir
+  test "survives losing its cache writer and its closer", %{tmp_dir: tmp_dir} do
+    parent = self()
+    node_key = node_key(74)
+    path = Path.join(tmp_dir, "admission.cache")
+
+    controller =
+      start_controller(
+        authority: fn request -> {:ok, signed_lease(request.node_key)} end,
+        cache_path: path,
+        close_peer: fn key -> send(parent, {:closed, key}) end
+      )
+
+    policy = Gentility.policy(controller)
+    assert {:ok, _context} = Gentility.authorize(request(node_key), policy)
+
+    %{cache_writer: writer, closer: closer} = :sys.get_state(controller)
+
+    log =
+      ExUnit.CaptureLog.capture_log(fn ->
+        Process.exit(writer, :kill)
+        Process.exit(closer, :kill)
+
+        eventually(fn ->
+          match?(%{cache_writer: pid} when pid != writer, :sys.get_state(controller))
+        end)
+      end)
+
+    assert log =~ "cache writer exited"
+    assert Process.alive?(controller)
+
+    # Both replacements do their job: the revocation is durable and the peer is
+    # closed through a fresh closer.
+    assert Gentility.revoke(controller, signed_revocation(node_key, 10)) == {:ok, :applied}
+    assert_receive {:closed, ^node_key}, 2_000
+    assert File.exists?(Cache.journal_path(path))
+    assert Gentility.stats(controller).cache_entries == 0
+  end
+
+  @tag :tmp_dir
   test "a stalled usage worker cannot delay revocation or controller telemetry", %{
     tmp_dir: tmp_dir
   } do
@@ -1963,6 +2151,19 @@ defmodule Derpex.Admission.GentilityTest do
 
     :ets.delete(table)
     rounds |> Enum.sort() |> Enum.at(10)
+  end
+
+  defp perf_revocation(node_key, now_ms) do
+    revocation = %Revocation{
+      key_id: @signing_key_id,
+      node_key: node_key,
+      policy_revision: 10,
+      revoked_at_ms: now_ms,
+      reason: "node-disabled"
+    }
+
+    {:ok, wire} = Signer.sign_revocation(revocation, @private_key)
+    wire
   end
 
   defp percentile(samples, percentile) do

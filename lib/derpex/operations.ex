@@ -300,8 +300,22 @@ defmodule Derpex.Operations do
   defp merge_live_gentility(metrics) do
     case safe(fn -> Gentility.stats(Gentility) end) do
       {:ok, values} -> merge_gentility_snapshot(metrics, values)
-      _unavailable -> metrics
+      _unavailable -> merge_stalled_gentility(metrics)
     end
+  end
+
+  # A controller stuck in a long call still has to report why: these counters
+  # live outside the process precisely so an incident does not also go dark.
+  defp merge_stalled_gentility(metrics) do
+    names = %{
+      usage_shed_total: "derpex_gentility_usage_shed_total",
+      byte_pacing_capped_total: "derpex_gentility_byte_pacing_capped_total",
+      close_peer_failures: "derpex_gentility_close_peer_failed_total"
+    }
+
+    metrics
+    |> Map.put("derpex_gentility_stalled", 1)
+    |> merge_values(Gentility.counters(), names)
   end
 
   defp merge_usage_metrics(metrics, usage) do
@@ -314,7 +328,8 @@ defmodule Derpex.Operations do
       blocked?: "derpex_gentility_usage_blocked",
       shed_total: "derpex_gentility_usage_shed_total",
       exporting?: "derpex_gentility_usage_exporting",
-      dropped_rows: "derpex_gentility_usage_dropped_rows"
+      dropped_rows: "derpex_gentility_usage_dropped_rows",
+      spool_load_error: "derpex_gentility_usage_spool_load_error"
     }
 
     merge_values(metrics, usage, names)

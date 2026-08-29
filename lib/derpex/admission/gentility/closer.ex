@@ -39,7 +39,7 @@ defmodule Derpex.Admission.Gentility.Closer do
   def stop(nil), do: :ok
 
   def stop(server) do
-    GenServer.stop(server, :shutdown, 1_000)
+    GenServer.stop(server, :shutdown, 500)
   catch
     :exit, _reason -> :ok
   end
@@ -73,33 +73,39 @@ defmodule Derpex.Admission.Gentility.Closer do
   def handle_cast({:close, keys}, state) do
     # Every close is bounded: a router that stops answering costs one deadline
     # per peer, not a closer that never returns to the next batch.
-    keys
-    |> Task.async_stream(fn key -> close_one(state, key) end,
-      max_concurrency: state.max_concurrency,
-      ordered: false,
-      timeout: state.close_timeout_ms,
-      on_timeout: :kill_task
-    )
-    |> Enum.each(&record_result(state, &1))
+    failed =
+      keys
+      |> Task.async_stream(fn key -> close_one(state, key) end,
+        max_concurrency: state.max_concurrency,
+        ordered: false,
+        timeout: state.close_timeout_ms,
+        on_timeout: :kill_task
+      )
+      |> Enum.count(&failed?(state, &1))
+
+    # One line per batch, not per peer: a router that is failing every close
+    # must not also fill the log.
+    if failed > 0 do
+      Logger.warning("gentility could not close #{failed} of #{length(keys)} peers")
+    end
 
     {:noreply, state}
   end
 
-  defp record_result(_state, {:ok, _result}), do: :ok
+  defp failed?(_state, {:ok, :ok}), do: false
+  defp failed?(_state, {:ok, :error}), do: true
 
-  defp record_result(state, {:exit, reason}) do
+  defp failed?(state, {:exit, _reason}) do
     :atomics.add(state.failures, 1, 1)
-    Logger.warning("gentility peer close did not finish: #{inspect(reason)}")
-    :ok
+    true
   end
 
   defp close_one(state, key) do
     _connection_count = state.close_peer.(key)
     :ok
   catch
-    kind, reason ->
+    _kind, _reason ->
       :atomics.add(state.failures, 1, 1)
-      Logger.warning("gentility could not close a peer: #{inspect(kind)} #{inspect(reason)}")
       :error
   end
 end
