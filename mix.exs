@@ -46,7 +46,8 @@ defmodule Derpex.MixProject do
       {:rustler, "~> 0.38.0", optional: true, runtime: false},
       {:rustler_precompiled, "~> 0.9.0", runtime: false},
       {:thousand_island, "~> 1.5.0"},
-      {:credo, "~> 1.7", only: [:dev, :test], runtime: false}
+      {:credo, "~> 1.7", only: [:dev, :test], runtime: false},
+      {:stream_data, "~> 1.4.0", only: :test}
     ]
   end
 
