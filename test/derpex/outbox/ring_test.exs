@@ -1,15 +1,13 @@
 defmodule Derpex.Outbox.RingTest do
   use ExUnit.Case, async: true
 
+  alias Derpex.Outbox.Lock
   alias Derpex.Outbox.Ring
 
   @enqueue_results [{:ok, :wake}, {:ok, :coalesced}, {:ok, :replaced}, {:dropped, :contention}]
   # Roughly two hundred microseconds of work between packets, so that eight
   # senders keep the schedulers busy without saturating them.
   @pacing_iterations 100_000
-  # The ring's own acquisition budget and the number of naps that fit in it.
-  @acquire_budget_microseconds 4_000
-  @producer_naps 4
 
   test "coalesces wakeups and replaces the oldest item at fixed capacity" do
     ring = Ring.new(2, wake_message: :ready)
@@ -180,10 +178,11 @@ defmodule Derpex.Outbox.RingTest do
     # A one-millisecond nap costs a millisecond only on an idle node; behind a
     # busy run queue it costs whatever rescheduling costs. Calibrating against
     # that same load while the producers run keeps the ceiling a statement
-    # about the ring — its four-millisecond budget and the naps that fit in it
-    # — rather than about the machine.
-    nap_cost = Enum.max(for _sample <- 1..25, do: elem(:timer.tc(&Process.sleep/1, [1]), 0))
-    ceiling = @acquire_budget_microseconds + 2 * @producer_naps * nap_cost
+    # about the ring — its budget and the naps that fit in it — rather than
+    # about the machine. A hundred samples rather than a handful, because it is
+    # the tail of that cost the ceiling has to cover.
+    nap_cost = Enum.max(for _sample <- 1..100, do: elem(:timer.tc(&Process.sleep/1, [1]), 0))
+    ceiling = Lock.budget_microseconds() + Lock.nap_allowance() * nap_cost
 
     latencies =
       Enum.flat_map(producers, fn {producer, monitor} ->

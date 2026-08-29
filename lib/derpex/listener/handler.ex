@@ -366,28 +366,20 @@ defmodule Derpex.Listener.Handler do
   # Finishing the paced frame can pace again on the next one, and the data that
   # arrived just before the socket went passive is parsed here rather than
   # thrown away.
+  # Finishing the paced frame can pace again on the next one, and the data that
+  # arrived just before the socket went passive is parsed here rather than
+  # thrown away.
   defp resume_reads(socket, state, pending_actions) do
-    case execute_actions(socket, state, pending_actions) do
-      {:ok, state} ->
-        resume_paced_data(socket, state)
-
-      {:pace, delay, state, pending} ->
-        {:noreply, {socket, pace(state, delay, pending)}}
-
-      {:error, {:admission, _reason}, state} ->
-        {:stop, {:shutdown, :admission}, {socket, state}}
-
-      {:error, {:connection_close, reason}, state} ->
-        {:stop, {:shutdown, reason}, {socket, state}}
-
-      {:error, reason, state} ->
-        {:stop, reason, {socket, state}}
-    end
+    socket
+    |> execute_actions(state, pending_actions)
+    |> continue_paced(socket)
   end
 
   defp resume_paced_data(socket, %{paced_data: <<>>} = state) do
-    _ignored = ThousandIsland.Socket.setopts(socket, active: :once)
-    {:noreply, {socket, state}}
+    # Back through Thousand Island's own continuation, so re-arming the socket
+    # also resets its read timer, and so a FIN that arrived while the socket
+    # was passive is delivered as {:tcp_closed, _} as soon as it is re-armed.
+    resume(socket, {:continue, state})
   end
 
   defp resume_paced_data(socket, state) do
@@ -396,34 +388,35 @@ defmodule Derpex.Listener.Handler do
 
     case Session.receive_data(state.session, data) do
       {:ok, session, actions} ->
-        continue_paced(socket, %{state | session: session}, actions)
+        socket
+        |> execute_actions(%{state | session: session}, actions)
+        |> continue_paced(socket)
 
-      {:close, session, reason, actions} ->
+      {:close, session, _reason, actions} ->
         case execute_actions(socket, %{state | session: session}, actions) do
-          {:ok, state} -> {:stop, {:shutdown, reason}, {socket, state}}
-          {:pace, _delay, state, _pending} -> {:stop, {:shutdown, reason}, {socket, state}}
-          {:error, error, state} -> {:stop, error, {socket, state}}
+          {:error, error, state} -> resume(socket, {:error, error, state})
+          {:pace, _delay, state, _pending} -> resume(socket, {:close, state})
+          {:ok, state} -> resume(socket, {:close, state})
         end
     end
   end
 
-  defp continue_paced(socket, state, actions) do
-    case execute_actions(socket, state, actions) do
-      {:ok, state} ->
-        resume_paced_data(socket, state)
+  defp continue_paced({:ok, state}, socket), do: resume_paced_data(socket, state)
 
-      {:pace, delay, state, pending} ->
-        {:noreply, {socket, pace(state, delay, pending)}}
+  defp continue_paced({:pace, delay, state, pending}, socket),
+    do: {:noreply, {socket, pace(state, delay, pending)}}
 
-      {:error, {:admission, _reason}, state} ->
-        {:stop, {:shutdown, :admission}, {socket, state}}
+  defp continue_paced({:error, {:admission, _reason}, state}, socket),
+    do: resume(socket, {:close, state})
 
-      {:error, {:connection_close, reason}, state} ->
-        {:stop, {:shutdown, reason}, {socket, state}}
+  defp continue_paced({:error, {:connection_close, _reason}, state}, socket),
+    do: resume(socket, {:close, state})
 
-      {:error, reason, state} ->
-        {:stop, reason, {socket, state}}
-    end
+  defp continue_paced({:error, reason, state}, socket),
+    do: resume(socket, {:error, reason, state})
+
+  defp resume(socket, continuation) do
+    ThousandIsland.Handler.handle_continuation(continuation, socket)
   end
 
   # Pacing is a state, not a pause in the code: the handler keeps answering

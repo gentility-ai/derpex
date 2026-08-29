@@ -369,6 +369,14 @@ defmodule Derpex.WriterTest do
     # Writing a peer-gone frame re-arms the source: if that peer comes back,
     # this destination is owed another peer-gone. Go's sawSrc never re-arms,
     # which it can afford because its watcher set dies with the connection.
+    # A "not here" frame is about a key this connection sent to, not about a
+    # source it was written packets from, so it re-arms nothing.
+    enqueue_until_accepted(rings.lifecycle, {:peer_gone, source, 0x01})
+    assert_receive {:write_finished, :noted, _not_here}
+    enqueue_until_accepted(rings.ordinary, {:recv_packet, source, "still noted"})
+    assert_receive {:write_finished, :noted, _still_noted}
+    assert reverse_paths_for(source) == 0
+
     enqueue_until_accepted(rings.lifecycle, {:peer_gone, source, 0x00})
     assert_receive {:write_finished, :noted, _peer_gone}
 

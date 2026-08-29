@@ -34,6 +34,7 @@ defmodule Derpex.Outbox.LifecycleQueue do
   @wake_pending 2
   @closed 3
   @overflow_drops 4
+  @overflow_notified 5
   @default_soft_cap 65_536
 
   defstruct [
@@ -68,7 +69,7 @@ defmodule Derpex.Outbox.LifecycleQueue do
   def new(options \\ []) do
     %__MODULE__{
       table: :ets.new(__MODULE__, [:ordered_set, :public]),
-      state: :atomics.new(4, signed: false),
+      state: :atomics.new(5, signed: false),
       notifier: Keyword.get(options, :notifier, self()),
       owner: Keyword.get(options, :owner),
       wake_message: Keyword.get(options, :wake_message, :derpex_outbox_ready),
@@ -134,10 +135,18 @@ defmodule Derpex.Outbox.LifecycleQueue do
   end
 
   # The queue cannot close a connection from inside its own critical section:
-  # it tells the owner, outside the lock, and the owner closes itself.
+  # it tells the owner, outside the lock, and the owner closes itself. The
+  # owner is told once - it is already closing, and every further frame the
+  # watcher is owed would otherwise send another message to a dying process.
   defp report_overflow(queue, {:overflow, size}) do
     :ok = Metrics.add(queue.metrics, :lifecycle_queue_overflows, 1)
-    if is_pid(queue.owner), do: send(queue.owner, overflow_message(size))
+
+    if is_pid(queue.owner) and
+         :atomics.compare_exchange(queue.state, @overflow_notified, 0, 1) ==
+           :ok do
+      send(queue.owner, overflow_message(size))
+    end
+
     {:dropped, :overflow}
   end
 
@@ -219,6 +228,10 @@ defmodule Derpex.Outbox.LifecycleQueue do
   """
   @spec delete(t()) :: :ok
   def delete(%__MODULE__{} = queue) do
+    # The flag first, and unconditionally: `close/1` needs the lock and may not
+    # get it, and a producer that raced the delete must find the queue closed
+    # rather than a table that is already gone.
+    :atomics.put(queue.state, @closed, 1)
     _closed = close(queue)
     true = :ets.delete(queue.table)
     :ok
@@ -248,6 +261,10 @@ defmodule Derpex.Outbox.LifecycleQueue do
     end
   end
 
+  @doc "Returns the queue table's memory footprint in machine words."
+  @spec memory_words(t()) :: non_neg_integer()
+  def memory_words(%__MODULE__{} = queue), do: :ets.info(queue.table, :memory)
+
   @doc "The queue's current depth, for a gauge. Lock-free, so a hint under load."
   @spec size(t()) :: non_neg_integer()
   def size(%__MODULE__{} = queue) do
@@ -258,9 +275,8 @@ defmodule Derpex.Outbox.LifecycleQueue do
   defp size_locked(queue), do: max(:ets.info(queue.table, :size) - 1, 0)
 
   defp clear_items(queue) do
-    queue.table
-    |> :ets.select([{{{:item, :"$1"}, :_, :_}, [], [:"$1"]}])
-    |> Enum.each(&:ets.delete(queue.table, {:item, &1}))
+    _deleted = :ets.select_delete(queue.table, [{{{:item, :"$1"}, :_, :_}, [], [true]}])
+    :ok
   end
 
   defp signal_writer(queue) do

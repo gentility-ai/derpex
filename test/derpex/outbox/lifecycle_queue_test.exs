@@ -55,7 +55,12 @@ defmodule Derpex.Outbox.LifecycleQueueTest do
 
     assert LifecycleQueue.enqueue(queue, :one_too_many) == {:dropped, :overflow}
     assert_receive {:derpex_lifecycle_overflow, 4}
-    assert LifecycleQueue.stats(queue).overflow_drops == 1
+
+    # The owner is already closing; every further frame the watcher is owed
+    # counts, but none of them tells it again.
+    assert LifecycleQueue.enqueue(queue, :and_another) == {:dropped, :overflow}
+    refute_receive {:derpex_lifecycle_overflow, _size}
+    assert LifecycleQueue.stats(queue).overflow_drops == 2
 
     # The frames already queued are still owed to the watcher; only the one
     # that would have grown the queue further is refused.

@@ -262,7 +262,10 @@ defmodule Derpex.Writer do
     end
   end
 
-  defp note_reverse_path(state, {:peer_gone, key, _reason}) do
+  # Only a disconnect re-arms. Reason 0x01 says the packet's destination is not
+  # here, which is about a key this connection sent to, not about a source it
+  # was written packets from.
+  defp note_reverse_path(state, {:peer_gone, key, 0x00}) do
     %{state | noted_sources: MapSet.delete(state.noted_sources, key)}
   end
 

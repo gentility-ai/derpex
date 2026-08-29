@@ -38,6 +38,10 @@ defmodule Derpex.WriterTimeoutTest do
     assert_stalled_client_closed(:websocket)
   end
 
+  test "a stalled WebSocket-over-TLS client is closed while its neighbour keeps relaying" do
+    assert_stalled_client_closed(:websocket_tls)
+  end
+
   defp assert_stalled_client_closed(transport) do
     parent = self()
 
@@ -98,7 +102,7 @@ defmodule Derpex.WriterTimeoutTest do
     port
   end
 
-  defp transport_options(:tls) do
+  defp transport_options(transport) when transport in [:tls, :websocket_tls] do
     root =
       Path.join(System.tmp_dir!(), "derpex-writer-timeout-#{System.unique_integer([:positive])}")
 
@@ -146,7 +150,7 @@ defmodule Derpex.WriterTimeoutTest do
     Map.put(client, :public_key, public_key)
   end
 
-  defp open(:tls, port, socket_options) do
+  defp open(transport, port, socket_options) when transport in [:tls, :websocket_tls] do
     {:ok, socket} =
       :ssl.connect(
         {127, 0, 0, 1},
@@ -155,7 +159,7 @@ defmodule Derpex.WriterTimeoutTest do
         5_000
       )
 
-    %{transport: :tls, socket: socket, buffer: <<>>}
+    %{transport: transport, socket: socket, buffer: <<>>}
   end
 
   defp open(transport, port, socket_options) do
@@ -170,7 +174,7 @@ defmodule Derpex.WriterTimeoutTest do
     %{transport: transport, socket: socket, buffer: <<>>}
   end
 
-  defp upgrade_request(:websocket) do
+  defp upgrade_request(transport) when transport in [:websocket, :websocket_tls] do
     key = Base.encode64(:crypto.strong_rand_bytes(16))
 
     "GET /derp HTTP/1.1\r\nHost: localhost\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n" <>
@@ -200,20 +204,28 @@ defmodule Derpex.WriterTimeoutTest do
   defp put_buffer(client, buffer), do: Process.put({:buffer, client.socket}, buffer)
   defp buffer(client), do: Process.get({:buffer, client.socket}, <<>>)
 
-  defp send_frame(%{transport: :websocket} = client, frame) do
+  defp send_frame(%{transport: transport} = client, frame)
+       when transport in [:websocket, :websocket_tls] do
     send_data(client, websocket_client_frame(IO.iodata_to_binary(frame)))
   end
 
   defp send_frame(client, frame), do: send_data(client, frame)
 
-  defp send_data(%{transport: :tls, socket: socket}, data), do: :ssl.send(socket, data)
+  defp send_data(%{transport: transport, socket: socket}, data)
+       when transport in [:tls, :websocket_tls],
+       do: :ssl.send(socket, data)
+
   defp send_data(%{socket: socket}, data), do: :gen_tcp.send(socket, data)
 
-  defp recv(%{transport: :tls, socket: socket}, length), do: :ssl.recv(socket, length, 5_000)
+  defp recv(%{transport: transport, socket: socket}, length)
+       when transport in [:tls, :websocket_tls],
+       do: :ssl.recv(socket, length, 5_000)
+
   defp recv(%{socket: socket}, length), do: :gen_tcp.recv(socket, length, 5_000)
 
   # One DERP frame, whatever it is wrapped in.
-  defp recv_frame(%{transport: :websocket} = client) do
+  defp recv_frame(%{transport: transport} = client)
+       when transport in [:websocket, :websocket_tls] do
     <<type, length::unsigned-big-32, payload::binary-size(length)>> = websocket_message(client)
     {:ok, name} = Frame.type_name(type)
     {:ok, name, payload}
@@ -313,6 +325,8 @@ defmodule Derpex.WriterTimeoutTest do
     :ok
   end
 
-  defp close(%{transport: :tls, socket: socket}), do: :ssl.close(socket)
+  defp close(%{transport: transport, socket: socket}) when transport in [:tls, :websocket_tls],
+    do: :ssl.close(socket)
+
   defp close(%{socket: socket}), do: :gen_tcp.close(socket)
 end
