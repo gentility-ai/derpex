@@ -198,10 +198,26 @@ defmodule Derpex.Certificates.IPManagerValidityTest do
 
   defp issued(calls), do: Agent.get(calls, fn {count, _outcomes} -> count end)
 
-  # `Clock.Manual.advance/1` only sends the tick; this waits for the manager to
-  # have handled it, so an issuance count is read after the tick, not during.
+  # `Clock.Manual.advance/1` only sends the tick, and the renewal it starts runs
+  # in its own process, so an issuance count is only meaningful once the manager
+  # has handled the tick and no flight is still outstanding.
   defp await_tick(manager) do
-    _state = :sys.get_state(manager)
-    :ok
+    await_idle(manager, System.monotonic_time(:millisecond) + 5_000)
+  end
+
+  defp await_idle(manager, deadline) do
+    state = :sys.get_state(manager)
+
+    cond do
+      state.flights == %{} and Enum.all?(state.entries, fn {_ip, e} -> is_nil(e.flight) end) ->
+        :ok
+
+      System.monotonic_time(:millisecond) >= deadline ->
+        flunk("an IP certificate issuance was still in flight after five seconds")
+
+      true ->
+        Process.sleep(5)
+        await_idle(manager, deadline)
+    end
   end
 end

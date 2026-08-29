@@ -152,6 +152,7 @@ defmodule Derpex.Certificates.IPManager do
       next_provider: Keyword.get(options, :next_provider),
       renew_interval_ms: Keyword.get(options, :renew_interval_ms, @renew_interval_ms),
       entries: %{},
+      flights: %{},
       challenges: %{}
     }
 
@@ -159,25 +160,12 @@ defmodule Derpex.Certificates.IPManager do
   end
 
   @impl true
-  def handle_call({:certificate, local_ip, server_name}, _from, state) do
-    case resolve(state, local_ip, server_name) do
-      {:ok, {:managed, entry}, state} -> {:reply, {:ok, entry.certificate}, state}
-      {:ok, {:delegated, certificate}, state} -> {:reply, {:ok, certificate}, state}
-      {:error, reason, state} -> {:reply, {:error, reason}, state}
-    end
+  def handle_call({:certificate, local_ip, server_name}, from, state) do
+    answer(state, local_ip, server_name, from, :certificate)
   end
 
-  def handle_call({:certs_keys, local_ip, server_name}, _from, state) do
-    case resolve(state, local_ip, server_name) do
-      {:ok, {:managed, entry}, state} ->
-        {:reply, {:ok, entry.tls}, state}
-
-      {:ok, {:delegated, _certificate}, state} ->
-        {:reply, {:error, :next_provider_certificate_not_supported}, state}
-
-      {:error, reason, state} ->
-        {:reply, {:error, reason}, state}
-    end
+  def handle_call({:certs_keys, local_ip, server_name}, from, state) do
+    answer(state, local_ip, server_name, from, :certs_keys)
   end
 
   def handle_call({:put_challenge, path, response}, _from, state) do
@@ -203,15 +191,34 @@ defmodule Derpex.Certificates.IPManager do
   end
 
   # Upstream `renewLoop`: every hour, start an issuance for each held
-  # certificate that is inside its last third and not in a retry backoff.
+  # certificate that is inside its last third and not already being replaced.
   @impl true
   def handle_info(:renew_certificates, state) do
     state =
       Enum.reduce(state.entries, state, fn {ip, entry}, state ->
-        if renewable?(entry), do: elem(attempt(state, ip, entry), 2), else: state
+        if renewable?(entry), do: start_flight(state, ip, entry), else: state
       end)
 
     {:noreply, schedule_renewal(state)}
+  end
+
+  # An issuance runs in its own process, so a certificate authority that takes
+  # minutes cannot stall a handshake for a different address, and the issuer
+  # can call back into this manager to publish an HTTP-01 challenge while the
+  # request that started it is still outstanding.
+  def handle_info({:flight, ip, result}, state) do
+    {:noreply, finish_flight(state, ip, result)}
+  end
+
+  def handle_info({:DOWN, reference, :process, _pid, reason}, state) do
+    case Map.pop(state.flights, reference) do
+      {nil, _flights} ->
+        {:noreply, state}
+
+      {ip, flights} ->
+        state = %{state | flights: flights}
+        {:noreply, finish_flight(state, ip, {:error, {:issuance, {:flight_failed, reason}}})}
+    end
   end
 
   defp schedule_renewal(state) do
@@ -220,7 +227,88 @@ defmodule Derpex.Certificates.IPManager do
   end
 
   defp renewable?(entry) do
-    not is_nil(entry.certificate) and needs_renewal?(entry) and not backing_off?(entry)
+    not is_nil(entry.certificate) and is_nil(entry.flight) and needs_renewal?(entry) and
+      not backing_off?(entry)
+  end
+
+  defp answer(state, local_ip, server_name, from, projection) do
+    case resolve(state, local_ip, server_name) do
+      {:ok, result, state} -> {:reply, project(result, projection), state}
+      {:error, reason, state} -> {:reply, {:error, reason}, state}
+      {:wait, ip, state} -> {:noreply, add_waiter(state, ip, from, projection)}
+    end
+  end
+
+  defp project({:managed, entry}, :certificate), do: {:ok, entry.certificate}
+  defp project({:managed, entry}, :certs_keys), do: {:ok, entry.tls}
+  defp project({:delegated, certificate}, :certificate), do: {:ok, certificate}
+
+  defp project({:delegated, _certificate}, :certs_keys),
+    do: {:error, :next_provider_certificate_not_supported}
+
+  defp add_waiter(state, ip, from, projection) do
+    update_in(state.entries[ip].flight.waiters, &[{from, projection} | &1])
+  end
+
+  defp start_flight(state, ip, entry) do
+    manager = self()
+    directory = state.directory
+    issuer = state.issuer
+
+    {_pid, reference} =
+      spawn_monitor(fn ->
+        send(manager, {:flight, ip, flight_result(directory, issuer, ip)})
+      end)
+
+    state = put_entry(state, ip, %{entry | flight: %{reference: reference, waiters: []}})
+    %{state | flights: Map.put(state.flights, reference, ip)}
+  end
+
+  defp flight_result(directory, issuer, ip) do
+    case load_or_issue(directory, issuer, ip) do
+      {:ok, entry} -> {:ok, entry}
+      {:error, reason} -> {:error, reason}
+    end
+  end
+
+  defp finish_flight(state, ip, result) do
+    entry = Map.get(state.entries, ip, new_entry())
+    flight = entry.flight || %{reference: nil, waiters: []}
+    state = release_monitor(state, flight.reference)
+
+    {entry, reply} =
+      case result do
+        {:ok, fresh} ->
+          {%{fresh | flight: nil}, {:managed, fresh}}
+
+        {:error, reason} ->
+          deferred = defer(%{entry | flight: nil})
+          log_deferral(ip, reason, deferred)
+          {deferred, {:error, reason}}
+      end
+
+    Enum.each(flight.waiters, fn {from, projection} ->
+      GenServer.reply(from, reply(reply, projection))
+    end)
+
+    put_entry(state, ip, entry)
+  end
+
+  defp reply({:error, reason}, _projection), do: {:error, reason}
+  defp reply(result, projection), do: project(result, projection)
+
+  defp release_monitor(state, nil), do: state
+
+  defp release_monitor(state, reference) do
+    _flushed = Process.demonitor(reference, [:flush])
+    %{state | flights: Map.delete(state.flights, reference)}
+  end
+
+  defp log_deferral(ip, reason, deferred) do
+    Logger.warning(
+      "DERP IP certificate issuance for #{ip} failed: #{inspect(reason)}; " <>
+        "next attempt in #{div(deferred.next_attempt_ms - now_ms(), 1_000)}s"
+    )
   end
 
   defp resolve(state, local_ip, server_name) do
@@ -261,8 +349,9 @@ defmodule Derpex.Certificates.IPManager do
     end
   end
 
-  # Upstream `certForIP`: serve an unexpired certificate, refuse while a failed
-  # issuance is still backing off, otherwise attempt one.
+  # Upstream `certForIP`: serve an unexpired certificate, join an issuance
+  # already running, refuse while a failed one is still backing off, and
+  # otherwise start one.
   defp certificate_for_ip(state, ip) do
     entry = Map.get(state.entries, ip, new_entry())
 
@@ -270,28 +359,14 @@ defmodule Derpex.Certificates.IPManager do
       holds_valid_certificate?(entry) ->
         {:ok, {:managed, entry}, state}
 
+      not is_nil(entry.flight) ->
+        {:wait, ip, state}
+
       backing_off?(entry) ->
         {:error, {:issuance_deferred, entry.next_attempt_ms}, state}
 
       true ->
-        attempt(state, ip, entry)
-    end
-  end
-
-  defp attempt(state, ip, entry) do
-    case load_or_issue(state, ip) do
-      {:ok, fresh, state} ->
-        {:ok, {:managed, fresh}, put_entry(state, ip, fresh)}
-
-      {:error, reason, state} ->
-        deferred = defer(entry)
-
-        Logger.warning(
-          "DERP IP certificate issuance for #{ip} failed: #{inspect(reason)}; " <>
-            "next attempt in #{div(deferred.next_attempt_ms - now_ms(), 1_000)}s"
-        )
-
-        {:error, reason, put_entry(state, ip, deferred)}
+        {:wait, ip, start_flight(state, ip, entry)}
     end
   end
 
@@ -317,6 +392,7 @@ defmodule Derpex.Certificates.IPManager do
     %{
       certificate: nil,
       tls: nil,
+      flight: nil,
       not_before: 0,
       not_after: 0,
       next_attempt_ms: 0,
@@ -324,26 +400,28 @@ defmodule Derpex.Certificates.IPManager do
     }
   end
 
-  defp load_or_issue(state, ip) do
-    case load_cached(state.directory, ip) do
-      {:ok, entry} -> {:ok, entry, state}
-      {:error, _cache_reason} -> issue(state, ip)
+  # Runs in the flight process, so it takes the values it needs rather than the
+  # manager's state.
+  defp load_or_issue(directory, issuer, ip) do
+    case load_cached(directory, ip) do
+      {:ok, entry} -> {:ok, entry}
+      {:error, _cache_reason} -> issue(directory, issuer, ip)
     end
   end
 
-  defp issue(state, ip) do
-    case state.issuer.(ip, @short_lived_profile) do
+  defp issue(directory, issuer, ip) do
+    case issuer.(ip, @short_lived_profile) do
       {:ok, %{certificate_der: certificate_der, private_key: private_key} = certificate} ->
         with :ok <- Manual.verify_certificate(certificate_der, ip),
              {:ok, entry} <- valid_entry(certificate),
-             :ok <- write_cached(state.directory, ip, certificate_der, private_key) do
-          {:ok, entry, state}
+             :ok <- write_cached(directory, ip, certificate_der, private_key) do
+          {:ok, entry}
         else
-          {:error, reason} -> {:error, {:issuance, reason}, state}
+          {:error, reason} -> {:error, {:issuance, reason}}
         end
 
       {:error, reason} ->
-        {:error, {:issuance, reason}, state}
+        {:error, {:issuance, reason}}
     end
   end
 
