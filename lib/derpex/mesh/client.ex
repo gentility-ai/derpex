@@ -12,9 +12,11 @@ defmodule Derpex.Mesh.Client do
   thing with `send_timeout` plus `send_timeout_close`, on the TCP socket and
   on the transport under TLS alike, so a stalled peer surfaces as
   `{:error, :timeout}` and disconnects instead of wedging the client process.
-  A timer owned by this process cannot do the job: it cannot interrupt a
-  `:ssl.send/2` that is already blocked, and `:ssl.close/2` called from a
-  helper deadlocks against that same blocked sender.
+  A timer owned by this process cannot do the job: nothing interrupts a
+  `:ssl.send/2` that is already blocked, and `:ssl.close/2` from a helper does
+  not rescue it either — that call queues behind the same blocked sender, takes
+  its full five second internal timeout, then exits the helper, and the send
+  is still blocked afterwards.
 
   In the other direction a peer that stops speaking is caught by a two minute
   receive deadline, rearmed on every byte the peer sends, matching the
@@ -24,7 +26,10 @@ defmodule Derpex.Mesh.Client do
 
   One wakeup forwards at most 64 queued packets and then re-sends itself the
   wake message rather than looping until the ring empties, so a deep backlog
-  cannot starve inbound frames, peer-gone updates, timers or calls.
+  cannot starve inbound frames, peer-gone updates, timers or calls. The budget
+  is what makes that bound hold: producers keep publishing while the drain
+  runs, so "until the ring reports empty" is not a bound at all when the fill
+  rate matches the drain rate.
   """
 
   use GenServer

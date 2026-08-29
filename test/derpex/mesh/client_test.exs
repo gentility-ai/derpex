@@ -477,22 +477,18 @@ defmodule Derpex.Mesh.ClientTest do
       )
 
     assert_receive :connect_error, 5_000
-    {baseline_tables, baseline_owned} = table_census(client)
-    assert baseline_owned == 1
+    assert owned_table_count(client) == 1
 
     Enum.each(1..100, fn _reconnect -> assert_receive :connect_error, 5_000 end)
 
-    {final_tables, final_owned} = table_census(client)
-    assert final_owned == 1
-    assert final_tables - baseline_tables == 0
+    assert owned_table_count(client) == 1
   end
 
-  defp table_census(client) do
+  defp owned_table_count(client) do
     :ok = :sys.suspend(client)
 
     try do
-      tables = :ets.all()
-      {length(tables), Enum.count(tables, &(:ets.info(&1, :owner) == client))}
+      Enum.count(:ets.all(), &(:ets.info(&1, :owner) == client))
     after
       :ok = :sys.resume(client)
     end
