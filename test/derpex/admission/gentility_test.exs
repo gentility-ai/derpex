@@ -748,6 +748,40 @@ defmodule Derpex.Admission.GentilityTest do
     assert_receive {:admission_close, ^connection, :revocation}, 2_000
   end
 
+  test "a mass close that can find no closer is counted, not fatal" do
+    parent = self()
+    keys = [node_key(70), node_key(71), node_key(72)]
+
+    controller =
+      start_controller(
+        authority: fn request -> {:ok, signed_lease(request.node_key)} end,
+        close_peer: fn key -> send(parent, {:closed, key}) end
+      )
+
+    policy = Gentility.policy(controller)
+
+    Enum.each(keys, fn key ->
+      assert {:ok, _context} = Gentility.authorize(request(key), policy)
+    end)
+
+    # No closer, and none can be started: the batch has nowhere to go.
+    :sys.replace_state(controller, fn state ->
+      Closer.stop(state.closer)
+      %{state | closer: nil, close_peer: :not_a_function}
+    end)
+
+    log =
+      ExUnit.CaptureLog.capture_log(fn ->
+        assert Gentility.reconcile(controller, Enum.map(keys, &signed_revocation(&1, 10))) ==
+                 {:ok, %{applied: 3, stale: 0}}
+      end)
+
+    assert log =~ "no peer closer"
+    assert Process.alive?(controller)
+    assert Gentility.stats(controller).close_peer_failures == 3
+    assert Gentility.stats(controller).cache_entries == 0
+  end
+
   test "a mass close without a closer is counted rather than reported as done" do
     parent = self()
     keys = [node_key(67), node_key(68)]

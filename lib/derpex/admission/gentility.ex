@@ -1993,7 +1993,7 @@ defmodule Derpex.Admission.Gentility do
         count_close_peer(state, cause, length(keys))
 
       {:error, :no_closer} ->
-        :atomics.add(state.close_failures, length(keys), 1)
+        :atomics.add(state.close_failures, 1, length(keys))
 
         log_event(
           state,
