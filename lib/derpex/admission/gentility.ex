@@ -841,11 +841,10 @@ defmodule Derpex.Admission.Gentility do
   defp evict_lease(state, nil), do: state
 
   defp evict_lease(state, victim) do
-    state = drop_lease_entry(state, victim)
-    close_peer(state, victim, :eviction)
+    state = state |> drop_lease_entry(victim) |> close_peers([victim], :eviction)
 
     log_event(
-      count_close_peer(state, :eviction),
+      state,
       :eviction,
       "gentility admission cache is full; evicting the soonest-expiring unclaimed lease"
     )
@@ -969,12 +968,9 @@ defmodule Derpex.Admission.Gentility do
         {state, close?} = put_revocation(state, wire, revocation)
 
         state =
-          if close? do
-            close_peer(state, revocation.node_key, :revocation)
-            count_close_peer(state, :revocation)
-          else
-            state
-          end
+          if close?,
+            do: close_peers(state, [revocation.node_key], :revocation),
+            else: state
 
         state =
           log_event(state, :revocation, "gentility revocation applied; node closed: #{close?}")
@@ -1881,6 +1877,34 @@ defmodule Derpex.Admission.Gentility do
       :ok
   end
 
+  # Closing through the router only reaches a connection the router knows about,
+  # and a connection is claimed before it is registered. A revocation that lands
+  # in that window would otherwise leave the connection running, so every claim
+  # for the key is told to close directly as well.
+  defp close_claimed_connections(state, keys, cause) do
+    Enum.reduce(keys, state, fn key, state ->
+      state.node_claims
+      |> Map.get(key)
+      |> claimed_connections()
+      |> Enum.reduce(state, &close_claimed_connection(&2, &1, cause))
+    end)
+  end
+
+  defp close_claimed_connection(state, connection, cause) do
+    if MapSet.member?(state.closing_connections, connection) do
+      state
+    else
+      state.close_connection.(connection, cause)
+      %{state | closing_connections: MapSet.put(state.closing_connections, connection)}
+    end
+  end
+
+  defp claimed_connections(nil), do: []
+
+  defp claimed_connections(claims) do
+    claims |> :gb_sets.to_list() |> Enum.map(fn {_sequence, connection} -> connection end)
+  end
+
   # One close is a single router call and stays inline. A batch is handed to the
   # closer so that a reconciliation or an expiry sweep cannot stall admission
   # behind thousands of router calls.
@@ -1888,12 +1912,47 @@ defmodule Derpex.Admission.Gentility do
 
   defp close_peers(state, [key], cause) do
     close_peer(state, key, cause)
-    count_close_peer(state, cause)
+
+    state
+    |> close_claimed_connections([key], cause)
+    |> count_close_peer(cause)
   end
 
   defp close_peers(state, keys, cause) do
-    :ok = Closer.close(state.closer, keys)
-    count_close_peer(state, cause, length(keys))
+    state = ensure_closer(state)
+    state = close_claimed_connections(state, keys, cause)
+
+    case Closer.close(state.closer, keys) do
+      :ok ->
+        count_close_peer(state, cause, length(keys))
+
+      {:error, :no_closer} ->
+        :atomics.add(state.close_failures, length(keys), 1)
+
+        log_event(
+          state,
+          :close_peer_unavailable,
+          "gentility has no peer closer; #{length(keys)} peers were not closed through the router"
+        )
+    end
+  end
+
+  # A closer that could not be restarted must not turn every later mass close
+  # into a silent success: it is started on demand, and a batch that still has
+  # nowhere to go is counted and logged rather than reported as closed.
+  defp ensure_closer(%{closer: closer} = state) when is_pid(closer) do
+    if Process.alive?(closer), do: state, else: %{state | closer: nil} |> ensure_closer()
+  end
+
+  defp ensure_closer(state) do
+    case start_closer(state) do
+      {:ok, closer} -> %{state | closer: closer}
+      {:error, _unavailable} -> %{state | closer: nil}
+    end
+  end
+
+  defp start_closer(state) do
+    Closer.start_link(close_peer: state.close_peer, failures: state.close_failures)
   end
 
   defp count_close_peer(state, cause, count \\ 1) do
@@ -1902,14 +1961,11 @@ defmodule Derpex.Admission.Gentility do
   end
 
   # Losing the closer costs the batch it was running, not the relay: admission
-  # keeps deciding while a fresh closer takes over.
+  # keeps deciding while a fresh closer takes over, and the next batch starts one
+  # anyway if this restart fails.
   defp restart_closer(state, reason) do
     Logger.warning("gentility peer closer exited: #{inspect(reason)}; restarting it")
-
-    case Closer.start_link(close_peer: state.close_peer, failures: state.close_failures) do
-      {:ok, closer} -> {:noreply, %{state | closer: closer}}
-      {:error, _unavailable} -> {:noreply, %{state | closer: nil}}
-    end
+    {:noreply, ensure_closer(%{state | closer: nil})}
   end
 
   defp unexpected_exit(state, pid, reason) do

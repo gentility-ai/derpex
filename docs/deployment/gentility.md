@@ -198,6 +198,11 @@ thousands of records never depends on one oversized response. A pass is bounded
 by page count as well as by records and bytes per page, so a control plane that
 never finishes a pass is abandoned and retried instead of looping.
 
+A revocation closes a node two ways at once, because a connection is claimed
+before the router knows about it: the router is asked to close the peer, and
+every connection holding a claim on that node key is told to close directly.
+A revocation that lands in the moment between the two therefore still lands.
+
 Gentility prunes revocations older than `DERPEX_GENTILITY_MAX_LEASE_MS`. Every
 lease such a record could still deny has expired by then, which is what keeps
 reconciliation bounded: the window that must be replayed is exactly one maximum

@@ -22,10 +22,15 @@ defmodule Derpex.Admission.Gentility.Closer do
   @spec start_link(keyword()) :: GenServer.on_start()
   def start_link(options), do: GenServer.start_link(__MODULE__, options)
 
-  @doc "Closes a batch of node keys without waiting for them."
-  @spec close(nil | pid(), [binary()]) :: :ok
-  def close(nil, _keys), do: :ok
+  @doc """
+  Closes a batch of node keys without waiting for them.
+
+  Returns `{:error, :no_closer}` when there is no closer to hand the batch to,
+  so a caller reports peers it could not close rather than assuming it did.
+  """
+  @spec close(nil | pid(), [binary()]) :: :ok | {:error, :no_closer}
   def close(_server, []), do: :ok
+  def close(nil, _keys), do: {:error, :no_closer}
   def close(server, keys), do: GenServer.cast(server, {:close, keys})
 
   @doc false

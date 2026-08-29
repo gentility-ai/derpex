@@ -3,6 +3,7 @@ defmodule Derpex.Admission.GentilityTest do
 
   alias Derpex.Admission.Gentility
   alias Derpex.Admission.Gentility.Cache
+  alias Derpex.Admission.Gentility.Closer
   alias Derpex.Admission.Gentility.Contract
   alias Derpex.Admission.Gentility.Lease
   alias Derpex.Admission.Gentility.Revocation
@@ -713,6 +714,70 @@ defmodule Derpex.Admission.GentilityTest do
 
     assert_receive {:closing, ^fresh}, 2_000
     assert Gentility.stats(controller).close_peer_failures == 1
+  end
+
+  test "a revocation closes a connection claimed before it was registered" do
+    parent = self()
+    node_key = node_key(66)
+
+    controller =
+      start_controller(
+        authority: fn request -> {:ok, signed_lease(request.node_key)} end,
+        close_peer: fn key ->
+          # The router does not know this connection yet.
+          send(parent, {:closed, key})
+          0
+        end
+      )
+
+    policy = Gentility.policy(controller)
+    {:ok, context} = Gentility.authorize(request(node_key), policy)
+
+    connection =
+      spawn(fn ->
+        receive do
+          {:derpex_admission_close, reason} -> send(parent, {:admission_close, self(), reason})
+        end
+      end)
+
+    assert {:ok, ^context} = Gentility.claim(request(node_key), context, connection, policy)
+
+    assert Gentility.revoke(controller, signed_revocation(node_key, 10)) == {:ok, :applied}
+
+    assert_receive {:closed, ^node_key}
+    assert_receive {:admission_close, ^connection, :revocation}, 2_000
+  end
+
+  test "a mass close without a closer is counted rather than reported as done" do
+    parent = self()
+    keys = [node_key(67), node_key(68)]
+
+    controller =
+      start_controller(
+        authority: fn request -> {:ok, signed_lease(request.node_key)} end,
+        close_peer: fn key -> send(parent, {:closed, key}) end
+      )
+
+    policy = Gentility.policy(controller)
+
+    Enum.each(keys, fn key ->
+      assert {:ok, _context} = Gentility.authorize(request(key), policy)
+    end)
+
+    # Take the closer away the way a crash would.
+    :sys.replace_state(controller, fn state ->
+      Closer.stop(state.closer)
+      %{state | closer: nil}
+    end)
+
+    records = Enum.map(keys, &signed_revocation(&1, 10))
+    assert Gentility.reconcile(controller, records) == {:ok, %{applied: 2, stale: 0}}
+
+    # A closer is started on demand rather than the batch vanishing.
+    assert_receive {:closed, first}, 2_000
+    assert_receive {:closed, second}, 2_000
+    assert MapSet.new([first, second]) == MapSet.new(keys)
+    assert Gentility.stats(controller).close_peer_failures == 0
   end
 
   test "a mass close runs outside the controller call" do
