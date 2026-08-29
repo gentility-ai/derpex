@@ -23,6 +23,7 @@ defmodule Derpex.HTTP1 do
 
   @doc "Routes a parsed request without consuming bytes read past its headers."
   @acme_challenge_prefix "/.well-known/acme-challenge/"
+  @plaintext_paths ["/derp/probe", "/derp/latency-check", "/generate_204"]
 
   @spec route(Request.t(), binary(), keyword()) ::
           {:upgrade, :derp | :websocket, nil | iodata(), map()}
@@ -33,11 +34,65 @@ defmodule Derpex.HTTP1 do
       nil ->
         request
         |> Request.path()
-        |> route_path(request, server_public_key, options)
+        |> route_plaintext(request, server_public_key, options)
 
       error ->
         reject_host(error)
     end
+  end
+
+  # A plaintext listener exists to answer HTTP-01 challenges and the
+  # unauthenticated probes, and to send everything else to HTTPS. This is Go's
+  # `tsweb.Port80Handler`: GET and HEAD are redirected, anything else is told to
+  # use HTTPS. The DERP upgrade is not offered in cleartext unless the operator
+  # asked for it, so a client cannot be talked down onto port 80.
+  defp route_plaintext(path, request, server_public_key, options) do
+    case Keyword.get(options, :plaintext) do
+      nil -> route_path(path, request, server_public_key, options)
+      plaintext -> restrict_plaintext(path, request, server_public_key, options, plaintext)
+    end
+  end
+
+  defp restrict_plaintext(path, request, server_public_key, options, plaintext) do
+    cond do
+      plaintext_path?(path, plaintext) ->
+        route_path(path, request, server_public_key, options)
+
+      request.method in ["GET", "HEAD"] ->
+        redirect_to_https(request, path)
+
+      true ->
+        use_https()
+    end
+  end
+
+  defp plaintext_path?(@acme_challenge_prefix <> _token, _plaintext), do: true
+  defp plaintext_path?(path, _plaintext) when path in @plaintext_paths, do: true
+
+  defp plaintext_path?(path, plaintext)
+       when path == "/derp" or binary_part(path, 0, min(byte_size(path), 6)) == "/derp/",
+       do: Keyword.get(plaintext, :allow_upgrade, false)
+
+  defp plaintext_path?(_path, _plaintext), do: false
+
+  defp redirect_to_https(request, path) do
+    target = if String.starts_with?(request.target, "/"), do: request.target, else: path
+    location = "https://" <> (Request.header(request, "host") || "") <> target
+
+    {:response,
+     Response.encode(
+       302,
+       [{"Location", location}, {"Cache-Control", "no-store"}, {"Content-Length", "0"}]
+     )}
+  end
+
+  defp use_https do
+    {:response,
+     Response.encode(
+       400,
+       [{"Content-Type", "text/plain; charset=utf-8"}, {"X-Content-Type-Options", "nosniff"}],
+       "Use HTTPS\n"
+     )}
   end
 
   # Go's net/http validates Host while reading the head, before any handler

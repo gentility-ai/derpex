@@ -65,6 +65,7 @@ defmodule Derpex.Session do
         http_options:
           Keyword.take(options, [
             :acme_challenges,
+            :plaintext,
             :bootstrap_dns,
             :remote_address,
             :home_page,

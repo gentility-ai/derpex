@@ -39,6 +39,7 @@ defmodule Derpex.Listener.Handler do
     rate_controller = Keyword.get(options, :rate_controller, RateController)
     bootstrap_dns = Keyword.get(options, :bootstrap_dns, Derpex.BootstrapDNS)
     acme_challenges = Keyword.get(options, :acme_challenges)
+    plaintext = Keyword.get(options, :plaintext)
     drain = Keyword.get(options, :drain, Drain)
     metrics = Keyword.get_lazy(options, :metrics, &Metrics.default_handle/0)
     home_page = Keyword.get(options, :home_page, [])
@@ -102,6 +103,7 @@ defmodule Derpex.Listener.Handler do
              [mesh_key: mesh_key, server_info: server_info]
              |> Keyword.merge(
                acme_challenges: acme_challenges,
+               plaintext: plaintext,
                bootstrap_dns: bootstrap_dns,
                home_page: home_page,
                operations: operations,

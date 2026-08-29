@@ -451,6 +451,7 @@ if config_env() == :prod do
           [
             port: http_port,
             plaintext_challenge: true,
+            handler_options: [plaintext: [allow_upgrade: clear_http?]],
             transport_module: ThousandIsland.Transports.TCP,
             socket_options: [
               keepalive_ms: tcp_keepalive_ms,

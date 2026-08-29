@@ -409,6 +409,63 @@ defmodule Derpex.HTTP1Test do
     end
   end
 
+  describe "the plaintext listener" do
+    setup do
+      store = start_supervised!(ChallengeServer)
+      :ok = ChallengeServer.put_challenge(store, @challenge_path, "tok.thumbprint")
+
+      {:ok,
+       options: [
+         acme_challenges: {ChallengeServer, store},
+         plaintext: [allow_upgrade: false]
+       ]}
+    end
+
+    test "answers the challenge path and the unauthenticated probes", context do
+      for path <- [@challenge_path, "/derp/probe", "/derp/latency-check", "/generate_204"] do
+        assert {:response, response} =
+                 HTTP1.route(request("GET", path), @server_public, context.options)
+
+        response = IO.iodata_to_binary(response)
+        refute response =~ "HTTP/1.1 302 Found\r\n", "#{path} was redirected"
+        refute response =~ "HTTP/1.1 404 Not Found\r\n", "#{path} was not served"
+      end
+    end
+
+    test "redirects everything else to HTTPS, preserving the target", context do
+      for path <- ["/", "/robots.txt", "/bootstrap-dns?domain=x", "/debug/vars"] do
+        assert {:response, response} =
+                 HTTP1.route(request("GET", path), @server_public, context.options)
+
+        response = IO.iodata_to_binary(response)
+        assert response =~ "HTTP/1.1 302 Found\r\n"
+        assert response =~ "Location: https://derp.example#{path}\r\n"
+        assert response =~ "Cache-Control: no-store\r\n"
+      end
+    end
+
+    test "tells a non-GET request to use HTTPS", context do
+      assert {:response, response} =
+               HTTP1.route(request("POST", "/"), @server_public, context.options)
+
+      response = IO.iodata_to_binary(response)
+      assert response =~ "HTTP/1.1 400 Bad Request\r\n"
+      assert response =~ "Use HTTPS\n"
+    end
+
+    test "refuses a cleartext DERP upgrade unless it is opted into", context do
+      upgrade = request("GET", "/derp", [{"upgrade", "DERP"}])
+
+      assert {:response, response} = HTTP1.route(upgrade, @server_public, context.options)
+      assert IO.iodata_to_binary(response) =~ "HTTP/1.1 302 Found\r\n"
+
+      allowed = Keyword.put(context.options, :plaintext, allow_upgrade: true)
+
+      assert {:upgrade, :derp, _response, _metadata} =
+               HTTP1.route(upgrade, @server_public, allowed)
+    end
+  end
+
   test "the challenge path is not special without a challenge source" do
     assert {:response, response} = HTTP1.route(request("GET", @challenge_path), @server_public)
     assert IO.iodata_to_binary(response) =~ "HTTP/1.1 404 Not Found\r\n"
