@@ -7,6 +7,7 @@ defmodule Derpex.Interop.GoClientTest do
   alias Derpex.Certificates.Manual
   alias Derpex.Crypto
   alias Derpex.Listener.Handler
+  alias Derpex.Secret
   alias Derpex.ServerInfo
   alias Derpex.STUN
 
@@ -32,7 +33,10 @@ defmodule Derpex.Interop.GoClientTest do
         transport_options: [ip: {127, 0, 0, 1}],
         num_acceptors: 1,
         handler_module: Handler,
-        handler_options: [server_private_key: server_private, event_handler: event_handler]
+        handler_options: [
+          server_private_key: Secret.wrap(server_private),
+          event_handler: event_handler
+        ]
       )
 
     on_exit(fn ->
@@ -64,7 +68,7 @@ defmodule Derpex.Interop.GoClientTest do
         transport_options: [ip: {127, 0, 0, 1}],
         num_acceptors: 1,
         handler_module: Handler,
-        handler_options: [server_private_key: server_private]
+        handler_options: [server_private_key: Secret.wrap(server_private)]
       )
 
     on_exit(fn ->
@@ -103,7 +107,10 @@ defmodule Derpex.Interop.GoClientTest do
         transport_options: [ip: {127, 0, 0, 1}],
         num_acceptors: 1,
         handler_module: Handler,
-        handler_options: [server_private_key: server_private, server_info: server_info]
+        handler_options: [
+          server_private_key: Secret.wrap(server_private),
+          server_info: server_info
+        ]
       )
 
     on_exit(fn ->
@@ -134,7 +141,7 @@ defmodule Derpex.Interop.GoClientTest do
         transport_options: [ip: {127, 0, 0, 1}],
         num_acceptors: 1,
         handler_module: Handler,
-        handler_options: [server_private_key: server_private]
+        handler_options: [server_private_key: Secret.wrap(server_private)]
       )
 
     on_exit(fn ->
@@ -165,7 +172,7 @@ defmodule Derpex.Interop.GoClientTest do
         transport_options: [ip: {127, 0, 0, 1}],
         num_acceptors: 1,
         handler_module: Handler,
-        handler_options: [server_private_key: server_private]
+        handler_options: [server_private_key: Secret.wrap(server_private)]
       )
 
     on_exit(fn ->
@@ -237,7 +244,7 @@ defmodule Derpex.Interop.GoClientTest do
         transport_options: transport_options,
         num_acceptors: 1,
         handler_module: Handler,
-        handler_options: [server_private_key: server_private]
+        handler_options: [server_private_key: Secret.wrap(server_private)]
       )
 
     on_exit(fn ->
@@ -291,7 +298,7 @@ defmodule Derpex.Interop.GoClientTest do
         transport_options: transport_options,
         num_acceptors: 1,
         handler_module: Handler,
-        handler_options: [server_private_key: server_private]
+        handler_options: [server_private_key: Secret.wrap(server_private)]
       )
 
     on_exit(fn ->
@@ -322,7 +329,7 @@ defmodule Derpex.Interop.GoClientTest do
         transport_options: [ip: {127, 0, 0, 1}],
         num_acceptors: 1,
         handler_module: Handler,
-        handler_options: [server_private_key: server_private]
+        handler_options: [server_private_key: Secret.wrap(server_private)]
       )
 
     on_exit(fn ->
@@ -355,7 +362,7 @@ defmodule Derpex.Interop.GoClientTest do
         transport_options: [ip: {127, 0, 0, 1}],
         num_acceptors: 1,
         handler_module: Handler,
-        handler_options: [server_private_key: server_private]
+        handler_options: [server_private_key: Secret.wrap(server_private)]
       )
 
     on_exit(fn ->
@@ -429,7 +436,10 @@ defmodule Derpex.Interop.GoClientTest do
         transport_options: [ip: {127, 0, 0, 1}],
         num_acceptors: 1,
         handler_module: Handler,
-        handler_options: [server_private_key: server_private, mesh_key: mesh_key]
+        handler_options: [
+          server_private_key: Secret.wrap(server_private),
+          mesh_key: Secret.wrap(mesh_key)
+        ]
       )
 
     on_exit(fn ->
@@ -466,7 +476,10 @@ defmodule Derpex.Interop.GoClientTest do
         transport_options: [ip: {127, 0, 0, 1}],
         num_acceptors: 1,
         handler_module: Handler,
-        handler_options: [server_private_key: server_private, mesh_key: mesh_key]
+        handler_options: [
+          server_private_key: Secret.wrap(server_private),
+          mesh_key: Secret.wrap(mesh_key)
+        ]
       )
 
     on_exit(fn ->
@@ -504,8 +517,8 @@ defmodule Derpex.Interop.GoClientTest do
         num_acceptors: 1,
         handler_module: Handler,
         handler_options: [
-          server_private_key: server_private,
-          mesh_key: mesh_key,
+          server_private_key: Secret.wrap(server_private),
+          mesh_key: Secret.wrap(mesh_key),
           disallowed_app_names: ["badapp", "worseapp"]
         ]
       )

@@ -8,6 +8,7 @@ defmodule Derpex.Mesh.ClientTest do
   alias Derpex.Handshake
   alias Derpex.Mesh.Client
   alias Derpex.Router
+  alias Derpex.Secret
   alias Derpex.ServerInfo
 
   test "watches, forwards, withdraws, and reconnects without a second hop" do
@@ -42,8 +43,8 @@ defmodule Derpex.Mesh.ClientTest do
         {Client,
          url: "http://mesh.example.test:#{port}/derp",
          dial_host: "127.0.0.1",
-         private_key: local_private,
-         mesh_key: mesh_key,
+         private_key: Secret.wrap(local_private),
+         mesh_key: Secret.wrap(mesh_key),
          reconnect_interval: 25,
          event_handler: event_handler}
       )
@@ -140,8 +141,8 @@ defmodule Derpex.Mesh.ClientTest do
       start_supervised!(
         {Client,
          url: "http://127.0.0.1:#{port}/derp",
-         private_key: local_private,
-         mesh_key: mesh_key,
+         private_key: Secret.wrap(local_private),
+         mesh_key: Secret.wrap(mesh_key),
          reconnect_interval: 10,
          event_handler: fn event -> send(parent, {:self_event, event}) end}
       )
@@ -174,8 +175,8 @@ defmodule Derpex.Mesh.ClientTest do
       start_supervised!(
         {Client,
          url: "http://127.0.0.1:#{unavailable_port}/derp",
-         private_key: private_key,
-         mesh_key: mesh_key,
+         private_key: Secret.wrap(private_key),
+         mesh_key: Secret.wrap(mesh_key),
          connect_timeout: 250,
          reconnect_interval: 60_000,
          event_handler: fn event -> send(parent, {:dial_event, event}) end}
@@ -221,8 +222,8 @@ defmodule Derpex.Mesh.ClientTest do
         {Client,
          url: "http://127.0.0.1:#{derp_port}/derp",
          proxy_url: "http://127.0.0.1:#{proxy_port}",
-         private_key: local_private,
-         mesh_key: mesh_key,
+         private_key: Secret.wrap(local_private),
+         mesh_key: Secret.wrap(mesh_key),
          reconnect_interval: 60_000}
       )
 

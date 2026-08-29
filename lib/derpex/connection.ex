@@ -63,21 +63,26 @@ defmodule Derpex.Connection do
             close_reason: nil | term()
           }
 
-  @doc "Creates a connection and returns its greeting and handshake deadline actions."
-  @spec new(binary() | Secret.t(), keyword()) :: {:ok, t(), [action()]} | {:error, atom()}
+  @doc """
+  Creates a connection and returns its greeting and handshake deadline actions.
+
+  Both `private_key` and the `:mesh_key` option are `Derpex.Secret` references,
+  wrapped once by the caller that read them from configuration or disk.
+  """
+  @spec new(Secret.t(), keyword()) :: {:ok, t(), [action()]} | {:error, atom()}
   def new(private_key, options \\ []) do
     server_info =
       Keyword.get(options, :server_info, %ServerInfo{version: Handshake.protocol_version()})
 
     with {:ok, greeting} <- Handshake.server_key_frame(Secret.reveal(private_key)) do
       state = %__MODULE__{
-        private_key: Secret.wrap(private_key),
+        private_key: private_key,
         server_info: server_info,
         decoder: Decoder.new(frame_policy: &handshake_frame_policy/2),
         phase: :awaiting_client_info,
         client_public_key: nil,
         client_info: nil,
-        mesh_key: options |> Keyword.get(:mesh_key) |> Secret.wrap(),
+        mesh_key: Keyword.get(options, :mesh_key),
         can_mesh: false,
         keep_alive_interval: 60_000 + keep_alive_jitter(options),
         close_reason: nil

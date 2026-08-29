@@ -1,5 +1,12 @@
 defmodule Derpex.ListenerSupervisor do
-  @moduledoc "Supervises configured native TCP/TLS listeners."
+  @moduledoc """
+  Supervises configured native TCP/TLS listeners.
+
+  The server private key and each listener's `:mesh_key` handler option arrive
+  as `Derpex.Secret` references. A supervisor retains its start arguments for
+  restarts, so wrapping has to happen in the caller that builds this child
+  specification, not here.
+  """
 
   use Supervisor
 
@@ -12,15 +19,13 @@ defmodule Derpex.ListenerSupervisor do
   alias Derpex.Secret
   alias Derpex.SocketOptions
 
-  @spec start_link({[keyword()], binary() | Secret.t()}) :: Supervisor.on_start()
+  @spec start_link({[keyword()], Secret.t()}) :: Supervisor.on_start()
   def start_link({listeners, private_key}) do
-    Supervisor.start_link(__MODULE__, {listeners, Secret.wrap(private_key)}, name: __MODULE__)
+    Supervisor.start_link(__MODULE__, {listeners, private_key}, name: __MODULE__)
   end
 
   @impl true
   def init({listeners, private_key}) do
-    private_key = Secret.wrap(private_key)
-
     children =
       listeners
       |> Enum.with_index()

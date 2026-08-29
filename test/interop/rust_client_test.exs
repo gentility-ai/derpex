@@ -7,6 +7,7 @@ defmodule Derpex.Interop.RustClientTest do
   alias Derpex.Certificates.Manual
   alias Derpex.Crypto
   alias Derpex.Listener.Handler
+  alias Derpex.Secret
 
   setup_all do
     upstream =
@@ -52,7 +53,7 @@ defmodule Derpex.Interop.RustClientTest do
         transport_module: ThousandIsland.Transports.SSL,
         transport_options: transport_options,
         handler_module: Handler,
-        handler_options: [server_private_key: server_private]
+        handler_options: [server_private_key: Secret.wrap(server_private)]
       )
 
     on_exit(fn -> if Process.alive?(server), do: Process.exit(server, :shutdown) end)

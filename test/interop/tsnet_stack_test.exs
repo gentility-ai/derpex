@@ -8,6 +8,7 @@ defmodule Derpex.Interop.TsnetStackTest do
   alias Derpex.Certificates.Manual
   alias Derpex.Crypto
   alias Derpex.Listener.Handler
+  alias Derpex.Secret
 
   test "official tsnet nodes relay an encrypted tunnel ping through DERPEX" do
     upstream =
@@ -45,7 +46,7 @@ defmodule Derpex.Interop.TsnetStackTest do
         transport_module: ThousandIsland.Transports.SSL,
         transport_options: transport_options,
         handler_module: Handler,
-        handler_options: [server_private_key: server_private]
+        handler_options: [server_private_key: Secret.wrap(server_private)]
       )
 
     on_exit(fn -> if Process.alive?(server), do: Process.exit(server, :shutdown) end)

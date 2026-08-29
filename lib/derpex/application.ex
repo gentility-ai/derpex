@@ -84,19 +84,26 @@ defmodule Derpex.Application do
 
         {:ok,
          listener_children(listeners, private_key, gentility) ++
-           mesh_children(
-             mesh_peers,
-             private_key,
-             Application.fetch_env!(:derpex, :mesh_key)
-           )}
+           mesh_children(mesh_peers, private_key)}
       end
     end
   end
 
   defp listener_children([], _private_key, _gentility), do: []
 
+  # Listener configuration carries the mesh key as raw bytes. Wrap it here,
+  # before the child specification exists, because both this supervisor and
+  # Derpex.ListenerSupervisor retain their start arguments for restarts.
   defp listener_children(listeners, private_key, gentility) do
-    listeners = Enum.map(listeners, &put_gentility_admission(&1, gentility))
+    listeners =
+      Enum.map(listeners, fn listener ->
+        listener
+        |> put_gentility_admission(gentility)
+        |> Keyword.replace_lazy(:handler_options, fn handler_options ->
+          Keyword.replace_lazy(handler_options, :mesh_key, &Derpex.Secret.wrap/1)
+        end)
+      end)
+
     [{Derpex.ListenerSupervisor, {listeners, private_key}}]
   end
 
@@ -155,13 +162,18 @@ defmodule Derpex.Application do
     end
   end
 
-  defp mesh_children([], _private_key, _mesh_key), do: []
+  defp mesh_children([], _private_key), do: []
 
-  defp mesh_children(mesh_peers, private_key, <<mesh_key::binary-size(32)>>) do
-    [{Derpex.Mesh.Supervisor, {mesh_peers, private_key, Derpex.Secret.wrap(mesh_key)}}]
-  end
+  # The mesh key stays raw in application environment, where operators and
+  # `config/runtime.exs` expect it. It is wrapped here, at its only read site,
+  # so no child specification or process state below carries the bytes.
+  defp mesh_children(mesh_peers, private_key) do
+    case Application.fetch_env!(:derpex, :mesh_key) do
+      <<mesh_key::binary-size(32)>> ->
+        [{Derpex.Mesh.Supervisor, {mesh_peers, private_key, Derpex.Secret.wrap(mesh_key)}}]
 
-  defp mesh_children(_mesh_peers, _private_key, _mesh_key) do
-    raise "configure :derpex, :mesh_key before enabling mesh peers"
+      _unconfigured ->
+        raise "configure :derpex, :mesh_key before enabling mesh peers"
+    end
   end
 end

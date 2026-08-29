@@ -7,6 +7,7 @@ defmodule Derpex.Interop.DifferentialTest do
 
   alias Derpex.Crypto
   alias Derpex.Listener.Handler
+  alias Derpex.Secret
 
   test "pinned Go server and DERPEX produce the same normalized semantic trace" do
     upstream =
@@ -24,7 +25,7 @@ defmodule Derpex.Interop.DifferentialTest do
         transport_options: [ip: {127, 0, 0, 1}],
         num_acceptors: 1,
         handler_module: Handler,
-        handler_options: [server_private_key: server_private]
+        handler_options: [server_private_key: Secret.wrap(server_private)]
       )
 
     on_exit(fn -> if Process.alive?(server), do: Process.exit(server, :shutdown) end)

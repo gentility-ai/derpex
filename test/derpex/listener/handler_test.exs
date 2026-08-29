@@ -14,6 +14,7 @@ defmodule Derpex.Listener.HandlerTest do
   alias Derpex.Outbox.Ring
   alias Derpex.RateConfig
   alias Derpex.RateController
+  alias Derpex.Secret
 
   defmodule LifecyclePolicy do
     @behaviour Derpex.Admission
@@ -65,7 +66,10 @@ defmodule Derpex.Listener.HandlerTest do
         transport_options: [ip: {127, 0, 0, 1}],
         num_acceptors: 1,
         handler_module: Handler,
-        handler_options: [server_private_key: server_private, event_handler: event_handler]
+        handler_options: [
+          server_private_key: Secret.wrap(server_private),
+          event_handler: event_handler
+        ]
       )
 
     stop_server_on_exit(server)
@@ -121,7 +125,10 @@ defmodule Derpex.Listener.HandlerTest do
         transport_options: [ip: {127, 0, 0, 1}],
         num_acceptors: 1,
         handler_module: Handler,
-        handler_options: [server_private_key: server_private, event_handler: event_handler]
+        handler_options: [
+          server_private_key: Secret.wrap(server_private),
+          event_handler: event_handler
+        ]
       )
 
     stop_server_on_exit(server)
@@ -167,8 +174,8 @@ defmodule Derpex.Listener.HandlerTest do
         num_acceptors: 1,
         handler_module: Handler,
         handler_options: [
-          server_private_key: server_private,
-          mesh_key: mesh_key,
+          server_private_key: Secret.wrap(server_private),
+          mesh_key: Secret.wrap(mesh_key),
           client_verifier: verifier,
           admission: admission,
           disallowed_app_names: ["badapp"]
@@ -225,7 +232,7 @@ defmodule Derpex.Listener.HandlerTest do
         num_acceptors: 1,
         handler_module: Handler,
         handler_options: [
-          server_private_key: server_private,
+          server_private_key: Secret.wrap(server_private),
           admission: {LifecyclePolicy, self()}
         ]
       )
@@ -290,7 +297,7 @@ defmodule Derpex.Listener.HandlerTest do
         num_acceptors: 1,
         handler_module: Handler,
         handler_options: [
-          server_private_key: server_private,
+          server_private_key: Secret.wrap(server_private),
           event_handler: event_handler,
           rate_controller: rate_controller
         ]
@@ -350,7 +357,10 @@ defmodule Derpex.Listener.HandlerTest do
         transport_options: [ip: {127, 0, 0, 1}],
         num_acceptors: 1,
         handler_module: Handler,
-        handler_options: [server_private_key: server_private, accept_limiter: limiter]
+        handler_options: [
+          server_private_key: Secret.wrap(server_private),
+          accept_limiter: limiter
+        ]
       )
 
     stop_server_on_exit(server)
@@ -378,7 +388,10 @@ defmodule Derpex.Listener.HandlerTest do
         transport_options: [ip: {127, 0, 0, 1}],
         num_acceptors: 1,
         handler_module: Handler,
-        handler_options: [server_private_key: server_private, accept_limiter: limiter]
+        handler_options: [
+          server_private_key: Secret.wrap(server_private),
+          accept_limiter: limiter
+        ]
       )
 
     stop_server_on_exit(server)
@@ -412,7 +425,7 @@ defmodule Derpex.Listener.HandlerTest do
         transport_options: [ip: {127, 0, 0, 1}],
         num_acceptors: 1,
         handler_module: Handler,
-        handler_options: [server_private_key: server_private, drain: drain]
+        handler_options: [server_private_key: Secret.wrap(server_private), drain: drain]
       )
 
     stop_server_on_exit(server)
@@ -459,7 +472,7 @@ defmodule Derpex.Listener.HandlerTest do
         transport_options: [ip: {127, 0, 0, 1}],
         num_acceptors: 1,
         handler_module: Handler,
-        handler_options: [server_private_key: server_private]
+        handler_options: [server_private_key: Secret.wrap(server_private)]
       )
 
     stop_server_on_exit(server)
@@ -516,7 +529,7 @@ defmodule Derpex.Listener.HandlerTest do
         num_acceptors: 1,
         handler_module: Handler,
         handler_options: [
-          server_private_key: server_private,
+          server_private_key: Secret.wrap(server_private),
           send_queue_depth: 64,
           event_handler: event_handler
         ]
@@ -551,7 +564,7 @@ defmodule Derpex.Listener.HandlerTest do
         num_acceptors: 1,
         handler_module: Handler,
         handler_options: [
-          server_private_key: server_private,
+          server_private_key: Secret.wrap(server_private),
           debug: [traffic: [run_ss: run_ss, interval_ms: 60_000]]
         ]
       )
@@ -592,7 +605,7 @@ defmodule Derpex.Listener.HandlerTest do
         num_acceptors: 1,
         handler_module: Handler,
         handler_options: [
-          server_private_key: server_private,
+          server_private_key: Secret.wrap(server_private),
           tcp_rtt: [reader: reader, interval_ms: 10_000]
         ]
       )

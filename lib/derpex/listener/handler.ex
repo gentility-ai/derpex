@@ -30,7 +30,7 @@ defmodule Derpex.Listener.Handler do
 
   @impl ThousandIsland.Handler
   def handle_connection(socket, options) do
-    private_key = options |> Keyword.fetch!(:server_private_key) |> Secret.wrap()
+    private_key = Keyword.fetch!(options, :server_private_key)
     mesh_key = Keyword.get(options, :mesh_key)
     server_info = Keyword.get(options, :server_info)
     admission_policy = Keyword.get(options, :admission)

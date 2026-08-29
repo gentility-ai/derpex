@@ -57,21 +57,22 @@ defmodule Derpex.Mesh.Client do
 
   @impl true
   def init(options) do
+    private_key = Keyword.fetch!(options, :private_key)
+    mesh_key = Keyword.fetch!(options, :mesh_key)
+
     with {:ok, endpoint} <- parse_endpoint(Keyword.fetch!(options, :url)),
          {:ok, proxy} <- parse_proxy(Keyword.get(options, :proxy_url)),
-         <<private_key::binary-size(32)>> <-
-           options |> Keyword.fetch!(:private_key) |> Secret.reveal(),
-         <<mesh_key::binary-size(32)>> <-
-           options |> Keyword.fetch!(:mesh_key) |> Secret.reveal(),
-         {:ok, local_public_key} <- Crypto.public_key(private_key) do
+         <<_::binary-size(32)>> <- Secret.reveal(mesh_key),
+         <<revealed_private_key::binary-size(32)>> <- Secret.reveal(private_key),
+         {:ok, local_public_key} <- Crypto.public_key(revealed_private_key) do
       endpoint = %{endpoint | dial_host: Keyword.get(options, :dial_host, endpoint.host)}
 
       state = %{
         endpoint: endpoint,
         proxy: proxy,
-        private_key: Secret.wrap(private_key),
+        private_key: private_key,
         local_public_key: local_public_key,
-        mesh_key: Secret.wrap(mesh_key),
+        mesh_key: mesh_key,
         router: Keyword.get(options, :router, Router),
         event_handler: Keyword.get(options, :event_handler, fn _event -> :ok end),
         reconnect_interval:
