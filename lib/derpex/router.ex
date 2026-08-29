@@ -742,17 +742,12 @@ defmodule Derpex.Router do
   defp route_forwarder(source, destination, packet) do
     case :ets.lookup(@forwarders_table, destination) do
       [{^destination, _identity, ring}] ->
-        result = safe_enqueue(ring, {:forward_packet, source, destination, packet})
-
-        case result do
-          {:ok, _enqueue_result} ->
-            Metrics.add(Metrics.default_handle(), :packets_forwarded_out, 1)
-
-          {:dropped, _reason} ->
-            :ok
-        end
-
-        result
+        # Go's `handleFrameSendPacket` does `s.packetsForwardedOut.Add(1)`
+        # before `fwd.ForwardPacket(...)` and ignores the error, so the counter
+        # measures forwarding attempts. Counting only successes here would make
+        # DERPEX's series disagree with the oracle's on every dropped forward.
+        Metrics.add(Metrics.default_handle(), :packets_forwarded_out, 1)
+        safe_enqueue(ring, {:forward_packet, source, destination, packet})
 
       [] ->
         {:dropped, :unknown_destination}

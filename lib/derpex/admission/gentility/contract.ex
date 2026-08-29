@@ -24,6 +24,18 @@ defmodule Derpex.Admission.Gentility.Contract do
   @type verification_keys :: %{required(binary()) => <<_::256>>}
   @type verify_option :: {:max_lease_ms, pos_integer()} | {:max_future_skew_ms, non_neg_integer()}
 
+  @doc """
+  Classifies a signed record by its contract v1 type magic without authenticating it.
+
+  The authority answers an authorization with either an admission lease or a
+  denial, and a denial is a signed revocation record. Callers use this to route
+  a record to the matching verifier before any state is touched.
+  """
+  @spec record_type(binary()) :: {:ok, :lease | :revocation} | {:error, term()}
+  def record_type(<<@lease_magic, _rest::binary>>), do: {:ok, :lease}
+  def record_type(<<@revocation_magic, _rest::binary>>), do: {:ok, :revocation}
+  def record_type(wire) when is_binary(wire), do: {:error, :unknown_record_type}
+
   @doc "Signs a validated lease and returns its portable contract record."
   @spec sign_lease(Lease.t(), <<_::256>>) :: {:ok, binary()} | {:error, term()}
   def sign_lease(%Lease{} = lease, <<private_key::binary-size(32)>>) do

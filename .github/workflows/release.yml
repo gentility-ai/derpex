@@ -45,6 +45,32 @@ jobs:
           test "$MIX_VERSION" = "$VERSION"
           echo "value=$VERSION" >> "$GITHUB_OUTPUT"
 
+      # The manifest is committed, not generated at publish time: publish-native
+      # only compares it against the archives this run built. An empty manifest
+      # therefore ships a release whose consumers must compile the NIF from
+      # source, which a stable tag must never do silently.
+      - name: Require a published checksum manifest on a stable tag
+        env:
+          VERSION: ${{ steps.version.outputs.value }}
+        run: |
+          MANIFEST=checksum-Elixir.Derpex.Crypto.Native.exs
+
+          if [[ "$GITHUB_REF" != refs/tags/v* ]]; then
+            echo "not a tag push: $MANIFEST is not required"
+            exit 0
+          fi
+
+          if [[ "$VERSION" == *-* ]]; then
+            echo "prerelease $VERSION: consumers build the NIF from source, so an empty $MANIFEST is expected"
+            exit 0
+          fi
+
+          if [[ "$(tr -d '[:space:]' < "$MANIFEST")" == "%{}" ]]; then
+            echo "$MANIFEST is empty on stable tag v$VERSION." >&2
+            echo "Tag a prerelease, commit the manifest that run publishes, then tag v$VERSION." >&2
+            exit 1
+          fi
+
   build-native:
     name: NIF ${{ matrix.target }}
     needs: [gate, version]

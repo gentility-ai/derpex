@@ -27,15 +27,28 @@ defmodule Derpex.Admission.Gentility.ByteBudget do
     sync_row(table, {scope, budget.identity}, budget, now_microsecond)
   end
 
-  @doc "Deletes budget rows no longer represented by a lease or live claim."
-  @spec prune(:ets.tid(), MapSet.t({scope(), binary()})) :: :ok
-  def prune(table, retained) do
-    table
-    |> :ets.tab2list()
-    |> Enum.each(fn {key, _revision, _rate, _burst, _tokens, _last} ->
-      unless MapSet.member?(retained, key), do: :ets.delete(table, key)
-    end)
+  @doc """
+  Returns up to `limit` row keys and a continuation.
 
+  Sweeping the table in bounded steps keeps reclamation off any single
+  reduction budget; a continuation may miss or repeat rows changed while it is
+  held, which the next sweep corrects.
+  """
+  @spec keys(:ets.tid(), pos_integer()) :: :done | {[{scope(), binary()}], term()}
+  def keys(table, limit) when is_integer(limit) and limit > 0 do
+    table
+    |> :ets.select([{{:"$1", :_, :_, :_, :_, :_}, [], [:"$1"]}], limit)
+    |> selected()
+  end
+
+  @doc "Continues a `keys/2` sweep."
+  @spec next_keys(term()) :: :done | {[{scope(), binary()}], term()}
+  def next_keys(continuation), do: continuation |> :ets.select() |> selected()
+
+  @doc "Deletes one budget row no longer represented by a lease or live claim."
+  @spec delete(:ets.tid(), {scope(), binary()}) :: :ok
+  def delete(table, key) do
+    true = :ets.delete(table, key)
     :ok
   end
 
@@ -48,6 +61,9 @@ defmodule Derpex.Admission.Gentility.ByteBudget do
   catch
     :error, :badarg -> {:error, :byte_budget_unavailable}
   end
+
+  defp selected({keys, continuation}), do: {keys, continuation}
+  defp selected(:"$end_of_table"), do: :done
 
   defp sync_row(table, key, budget, now_microsecond) do
     case :ets.lookup(table, key) do

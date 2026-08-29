@@ -80,6 +80,16 @@ the tag from producing a NIF archive, a GitHub release, or a runtime image.
 CI ignores `v*` tag pushes on its own trigger, so a release tag runs the suite
 once, through that gate.
 
+`checksum-Elixir.Derpex.Crypto.Native.exs` is the manifest `rustler_precompiled`
+verifies a downloaded NIF archive against. It is committed rather than generated
+at publish time, and it is empty (`%{}`) today, so consumers build the crate from
+source. Prerelease tags — any version carrying a SemVer prerelease suffix, such
+as `v0.2.0-rc.1` — are expected to ship that way and are exempt from the check.
+A stable tag is not: the `version` job fails a tag whose manifest is still empty,
+because a stable release must not silently require a Rust toolchain on every
+machine that installs it. So the order is: tag a prerelease, take the manifest
+that run publishes, commit it, then tag the stable version.
+
 The `tsnet` smoke advertises DERPEX from Tailscale's own in-memory test control
 server, pins DERPEX's raw-IP TLS certificate, forces the two nodes off direct
 UDP, and requires both Tailscale DERP data counters to advance around a

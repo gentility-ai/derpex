@@ -47,14 +47,38 @@ defmodule Derpex.Admission.Gentility.ByteBudgetTest do
     assert List.last(delays) == 90_000
   end
 
-  test "zero rate is unlimited and pruning removes retired identities" do
+  test "zero rate is unlimited and a swept row retires its identity" do
     table = ByteBudget.new()
     assert ByteBudget.sync(table, :node, budget(1, 0, 0), 0) == :ok
     assert ByteBudget.reserve(table, :node, "node-1", 1_000_000, 0) == {:ok, 0}
-    assert ByteBudget.prune(table, MapSet.new()) == :ok
+
+    assert {[{:node, "node-1"}], continuation} = ByteBudget.keys(table, 10)
+    assert ByteBudget.next_keys(continuation) == :done
+    assert ByteBudget.delete(table, {:node, "node-1"}) == :ok
 
     assert ByteBudget.reserve(table, :node, "node-1", 1, 0) ==
              {:error, :byte_budget_missing}
+
+    assert ByteBudget.keys(table, 10) == :done
+  end
+
+  test "a sweep hands back one bounded step at a time" do
+    table = ByteBudget.new()
+
+    for index <- 1..5 do
+      identity = "node-#{index}"
+      budget = %{identity: identity, revision: 1, bytes_per_second: 10, byte_burst: 10}
+      assert ByteBudget.sync(table, :node, budget, 0) == :ok
+    end
+
+    assert {first, continuation} = ByteBudget.keys(table, 2)
+    assert length(first) == 2
+    assert {second, continuation} = ByteBudget.next_keys(continuation)
+    assert length(second) == 2
+    assert {third, continuation} = ByteBudget.next_keys(continuation)
+    assert length(third) == 1
+    assert ByteBudget.next_keys(continuation) == :done
+    assert (first ++ second ++ third) |> Enum.uniq() |> length() == 5
   end
 
   defp budget(revision, rate, burst) do

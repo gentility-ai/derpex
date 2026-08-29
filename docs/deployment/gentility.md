@@ -33,6 +33,102 @@ proxy or load balancer.
   `/debug/check` remain nonexistent until `DERPEX_OPERATIONS_TOKEN` is set and
   then require its bearer credential on every request.
 
+## Admission lease tuning
+
+The lease controller is configured entirely from the environment. Every value
+below applies only when `DERPEX_GENTILITY_ADAPTER` is set, and every one is
+validated at boot: an out-of-range value refuses to start the release rather
+than silently reverting to its default.
+
+| Variable | Default | Meaning |
+| --- | --- | --- |
+| `DERPEX_GENTILITY_MAX_CACHE_ENTRIES` | `100000` | Hard bound on cached authorization leases. |
+| `DERPEX_GENTILITY_MAX_REVOCATIONS` | `10000` | Hard bound on retained revocation records. |
+| `DERPEX_GENTILITY_MAX_CONCURRENT_REQUESTS` | `64` | Live authorizations in flight; excess is shed as `admission_overloaded`. |
+| `DERPEX_GENTILITY_AUTHORITY_TIMEOUT_MS` | `2000` | Deadline for one live authorization call. |
+| `DERPEX_GENTILITY_MAX_LEASE_MS` | `900000` | Longest lease lifetime accepted, and so the worst-case missed-revocation window. |
+| `DERPEX_GENTILITY_MAX_FUTURE_SKEW_MS` | `30000` | Clock skew allowed on a lease issue time. It never extends expiry. |
+| `DERPEX_GENTILITY_MAX_BYTE_DELAY_MS` | `30000` | Pacing delay above which a connection is closed instead of paced. |
+| `DERPEX_GENTILITY_CACHE_PERSIST_MS` | `5000` | Longest a newly cached lease may go unwritten to disk. |
+
+Size `DERPEX_GENTILITY_MAX_CACHE_ENTRIES` above the number of distinct nodes an
+instance expects to serve within one lease lifetime, not above its concurrent
+connection count: the cache holds every node that may reconnect during a
+Gentility outage. All budgets are per instance and must be divided by the
+number of instances in the region.
+
+### Cache durability
+
+Writing the cache rewrites the whole file, so lease admissions are debounced:
+a change marks the cache dirty and the file is written at most once per
+`DERPEX_GENTILITY_CACHE_PERSIST_MS`, and again when the controller shuts down.
+A burst of reconnections therefore costs one write rather than one per node.
+
+Revocations and reconciliation batches are never deferred — they are the
+security-relevant writes, and each flushes the file synchronously before the
+call returns, so a revocation is durable by the time Gentility is told it was
+applied. Verification-key rotation flushes when its sweep completes.
+
+The write itself runs in a dedicated writer process, so the controller pays
+only for encoding the snapshot, never for the disk. At most one write is in
+flight and queued snapshots replace one another, so lease churn cannot build a
+backlog of writes.
+
+Verification-key rotation re-verifies every cached record, one signature check
+each, in bounded chunks between other messages. A rotation therefore is not
+atomic: records signed only by a retired key are dropped and their connections
+closed as the sweep reaches them, so a large cache sheds admissions over a
+brief window rather than all at once. Leases signed by a key that is still
+published are unaffected.
+
+Worst case, an unclean crash (SIGKILL, power loss, or a VM halt that skips
+shutdown) loses the leases admitted in the last `DERPEX_GENTILITY_CACHE_PERSIST_MS`
+and nothing else. Those nodes simply re-authorize against Gentility on their
+next connection; a lost lease can never admit a node that should be denied. No
+revocation is ever lost this way. The cost of a longer window is a slightly
+larger set of nodes that must reach Gentility after a crash that coincides with
+a control-plane outage; lower it only if that combination is a real concern.
+
+### Cache eviction
+
+The cache never sacrifices an established peer to admit a new one. When it is
+at its bound, a new lease evicts, in order:
+
+1. an expired entry, claimed or not, because an expired lease must close anyway;
+2. otherwise the soonest-expiring entry that no connection is claiming, ties
+   broken by node key.
+
+Both orders are maintained incrementally, so admitting a lease, claiming a
+connection, and releasing one cost the same whether the cache holds ten leases
+or a hundred thousand.
+
+If every entry holds a valid lease with a live claim, the *new* admission is
+rejected with `cache_full` and the counter behind
+`derpex_gentility_cache_full` increments. Sustained growth in that counter
+means the cache bound is below the instance's working set: raise
+`DERPEX_GENTILITY_MAX_CACHE_ENTRIES` or reduce the nodes homed on the instance.
+
+## Usage export
+
+Each fixed window is exported as one or more batches with the same window
+bounds. A batch is bounded twice: at most 10 000 sender attributions, and at
+most 8 MiB on the wire. The window is ordered once and cut into batches of
+10 000; a cut still too large for the wire — long identities make that
+possible well below 10 000 entries — is bisected and retried until each half
+encodes. A busier or wider window therefore produces more batches, never a
+loss.
+
+Only a single row that cannot encode on its own is discarded. It is logged,
+counted in `derpex_gentility_usage_dropped_rows`, and deleted, because a row
+that can never be encoded would otherwise block the spool and shed every
+relayed packet behind it. Every other row sharing its window is still
+exported. Any increase in that counter is an accounting loss and must alert.
+
+`derpex_gentility_usage_dropped_rows` counts since the usage worker started, so
+a restart resets it to zero. Alert on an increase rather than an absolute
+value, and read a reset as a restart, not as recovery. Spooled batches survive
+a restart; the counter does not.
+
 ## Milestone 0 launch inputs
 
 The following values must be jointly fixed before Milestone 0 exits:

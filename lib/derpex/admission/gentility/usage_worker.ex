@@ -9,6 +9,8 @@ defmodule Derpex.Admission.Gentility.UsageWorker do
 
   use GenServer
 
+  require Logger
+
   alias Derpex.Admission.Gentility.Usage
   alias Derpex.Admission.Gentility.UsageContract
   alias Derpex.Admission.Gentility.UsageSpool
@@ -43,13 +45,17 @@ defmodule Derpex.Admission.Gentility.UsageWorker do
   @spec handle(GenServer.server()) :: Handle.t()
   def handle(server), do: GenServer.call(server, :handle)
 
-  @doc false
+  @doc """
+  Stops the worker within the controller's shutdown budget.
+
+  The link is deliberately left in place: unlinking would hide a worker that
+  died on its own, and the controller traps exits precisely so that it sees it.
+  """
   @spec stop(nil | Handle.t()) :: :ok
   def stop(nil), do: :ok
 
   def stop(%Handle{server: server}) do
-    Process.unlink(server)
-    GenServer.stop(server, :shutdown)
+    GenServer.stop(server, :shutdown, 1_500)
   catch
     :exit, _reason -> :ok
   end
@@ -151,7 +157,14 @@ defmodule Derpex.Admission.Gentility.UsageWorker do
   def handle_info({:DOWN, _monitor, :process, _pid, _reason}, state), do: {:noreply, state}
 
   def handle_info({:EXIT, owner, reason}, %{owner: owner} = state), do: {:stop, reason, state}
-  def handle_info({:EXIT, _pid, _reason}, state), do: {:noreply, state}
+  def handle_info({:EXIT, _pid, :normal}, state), do: {:noreply, state}
+
+  # Export workers are linked, so a normal completion is routine and silent; any
+  # other exit is a failure the monitor handles, and worth a line either way.
+  def handle_info({:EXIT, pid, reason}, state) do
+    Logger.warning("gentility usage worker saw #{inspect(pid)} exit: #{inspect(reason)}")
+    {:noreply, state}
+  end
 
   @impl GenServer
   def terminate(_reason, state) do
@@ -204,7 +217,8 @@ defmodule Derpex.Admission.Gentility.UsageWorker do
          timer: nil,
          timer_token: nil,
          export: nil,
-         last_error: nil
+         last_error: nil,
+         dropped_rows: 0
        }}
     end
   end
@@ -216,29 +230,77 @@ defmodule Derpex.Admission.Gentility.UsageWorker do
   defp rotate_usage(state) do
     now = state.clock.system_time(:millisecond)
 
-    case Usage.oldest_closed(
-           state.table,
-           state.window_ms,
-           state.instance_id,
-           state.region_id,
-           now
-         ) do
+    case Usage.oldest_closed(state.table, state.window_ms, now) do
       nil -> state
-      {batch, rows} -> commit_batch(state, batch, rows)
+      {window_start, rows} -> drain_window(state, window_start, rows)
     end
   end
 
-  defp commit_batch(state, batch, rows) do
-    with {:ok, encoded} <- UsageContract.encode(batch),
-         {:ok, spool} <- UsageSpool.put(state.spool, encoded) do
-      :ok = Usage.delete_rows(state.table, rows)
-      :atomics.put(state.blocked, 1, 0)
-      rotate_usage(%{state | spool: spool, last_error: nil})
-    else
+  # The window is snapshotted and ordered once; it is then cut into batches the
+  # contract accepts. A cut that is still too large for the wire is bisected
+  # rather than discarded, so a window of large identities is exported in full.
+  defp drain_window(state, _window_start, []), do: state
+
+  defp drain_window(state, window_start, rows) do
+    {chunk, rest} = Enum.split(rows, UsageContract.max_entries())
+
+    case commit_rows(state, window_start, chunk) do
+      {:ok, state} when rest == [] -> rotate_usage(state)
+      {:ok, state} -> drain_window(state, window_start, rest)
+      {:blocked, state} -> state
+    end
+  end
+
+  defp commit_rows(state, _window_start, []), do: {:ok, state}
+
+  defp commit_rows(state, window_start, rows) do
+    batch =
+      Usage.batch(state.instance_id, state.region_id, window_start, state.window_ms, rows)
+
+    case UsageContract.encode(batch) do
+      {:ok, encoded} -> spool_batch(state, encoded, rows)
+      {:error, reason} -> bisect_or_drop(state, window_start, rows, reason)
+    end
+  end
+
+  defp spool_batch(state, encoded, rows) do
+    case UsageSpool.put(state.spool, encoded) do
+      {:ok, spool} ->
+        :ok = Usage.delete_rows(state.table, rows)
+        :atomics.put(state.blocked, 1, 0)
+        {:ok, %{state | spool: spool, last_error: nil}}
+
       {:error, reason} ->
         :atomics.put(state.blocked, 1, 1)
-        %{state | last_error: reason}
+        {:blocked, %{state | last_error: reason}}
     end
+  end
+
+  # Halving isolates whatever the contract rejects. Only a single row that still
+  # cannot encode on its own is dropped: everything that shares the window with
+  # it is exported normally.
+  defp bisect_or_drop(state, window_start, [row], reason) do
+    {:ok, drop_row(state, window_start, row, reason)}
+  end
+
+  defp bisect_or_drop(state, window_start, rows, _reason) do
+    {left, right} = Enum.split(rows, div(length(rows), 2))
+
+    case commit_rows(state, window_start, left) do
+      {:ok, state} -> commit_rows(state, window_start, right)
+      {:blocked, state} -> {:blocked, state}
+    end
+  end
+
+  # A row the contract can never encode would otherwise be retried forever and
+  # block every packet behind the billing ledger. Account for the loss, delete
+  # it, and keep draining the window.
+  defp drop_row(state, window_start, row, reason) do
+    Logger.warning("gentility usage row dropped: #{inspect(reason)} (window #{window_start})")
+
+    :ok = Usage.delete_rows(state.table, [row])
+    :atomics.put(state.blocked, 1, 0)
+    %{state | dropped_rows: state.dropped_rows + 1, last_error: nil}
   end
 
   defp start_export(%{export: export} = state) when not is_nil(export), do: state
@@ -358,6 +420,7 @@ defmodule Derpex.Admission.Gentility.UsageWorker do
       spool_batches: spool.batches,
       spool_bytes: spool.bytes,
       exporting?: not is_nil(state.export),
+      dropped_rows: state.dropped_rows,
       last_error: state.last_error
     }
 
@@ -371,6 +434,7 @@ defmodule Derpex.Admission.Gentility.UsageWorker do
       spool_batches: 0,
       spool_bytes: 0,
       exporting?: false,
+      dropped_rows: 0,
       last_error: :usage_unavailable
     }
   end

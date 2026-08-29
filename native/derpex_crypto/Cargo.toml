@@ -12,3 +12,4 @@ crate-type = ["cdylib"]
 [dependencies]
 crypto_box = { version = "=0.9.1", features = ["std"] }
 rustler = "=0.38.0"
+zeroize = "=1.9.0"
