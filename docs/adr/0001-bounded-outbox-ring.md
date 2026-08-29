@@ -34,8 +34,26 @@ committed or recovered.
 ## Consequences
 
 The structure has an auditable memory ceiling and stalled writers receive no
-repeated wakeups. A producer can tail-drop during a very short critical section;
-this matches the allowed concurrent-admission fallback. The ring is ETS-owner
-lifetime-bound and is intentionally single-consumer. Ordinary, disco, and
-control traffic receive separate rings or bounded single-slot structures at
-the Outbox layer.
+repeated wakeups. The ring is ETS-owner lifetime-bound and is intentionally
+single-consumer. Ordinary, disco, and control traffic receive separate rings or
+bounded single-slot structures at the Outbox layer.
+
+Tail drops are an expected outcome, not an error path. A producer that finds the
+lock held drops the packet immediately and increments `tail_drops` plus the
+`queue_tail` drop metric for the ring's packet class, so contention is always
+visible in the counters rather than paid for in sender latency. The drop rate
+rises with the number of senders that fan into one destination at once: eight
+producers enqueuing in a tight loop (no work between packets) turn most attempts
+into counted tail drops, while producers that spend a few hundred microseconds
+per packet — the realistic relay case — see a small percentage. This is the
+deliberate trade for the invariant that a sender's reader is never suspended by
+a destination's queue.
+
+Producers make exactly one lock attempt because any waiting scheme requires
+shared "someone is waiting" state, and a producer killed inside that window
+leaves the state behind. An earlier revision let producers retry for a few
+milliseconds and made the consumer defer to waiting producers; a producer killed
+while parked left the waiter count non-zero forever, so every subsequent `take`
+returned `:busy` and the connection's writer stalled permanently. A single
+attempt has no such window: the only shared state a dead producer can leave is
+the lock itself, which the next caller reclaims from the recorded owner pid.

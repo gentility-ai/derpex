@@ -2,10 +2,10 @@ defmodule Derpex.Outbox.Ring do
   @moduledoc """
   Fixed-capacity, non-blocking packet storage for one writer.
 
-  Producers use a brief bounded acquisition window. Sustained contention is a
-  tail drop; a full ring replaces its oldest item. Packet references live only
-  in the preallocated ETS slots. The writer receives at most one coalesced atom
-  wakeup and pulls values directly from the ring.
+  Producers make a single lock attempt and never wait: contention is an
+  immediate, counted tail drop; a full ring replaces its oldest item. Packet
+  references live only in the preallocated ETS slots. The writer receives at
+  most one coalesced atom wakeup and pulls values directly from the ring.
 
   A tiny ETS journal makes interrupted mutations recoverable by the next
   producer or consumer. It contains indices and counters, never the packet.
@@ -20,9 +20,7 @@ defmodule Derpex.Outbox.Ring do
   @head_drops 4
   @tail_drops 5
   @closed 6
-  @producer_waiters 7
   @lock_retries 1_024
-  @producer_wait_attempts 5
 
   defstruct [
     :table,
@@ -63,7 +61,7 @@ defmodule Derpex.Outbox.Ring do
 
     %__MODULE__{
       table: table,
-      state: :atomics.new(7, signed: false),
+      state: :atomics.new(6, signed: false),
       capacity: capacity,
       notifier: Keyword.get(options, :notifier, self()),
       wake_message: Keyword.get(options, :wake_message, :derpex_outbox_ready),
@@ -294,36 +292,9 @@ defmodule Derpex.Outbox.Ring do
     :atomics.put(ring.state, @head_drops, head_drops)
   end
 
-  defp acquire_producer(ring) do
-    case try_acquire(ring) do
-      {:ok, _token} = acquired ->
-        acquired
+  defp acquire_producer(ring), do: try_acquire(ring)
 
-      :busy ->
-        :atomics.add_get(ring.state, @producer_waiters, 1)
-
-        try do
-          acquire_producer_wait(ring, @producer_wait_attempts)
-        after
-          :atomics.sub_get(ring.state, @producer_waiters, 1)
-        end
-    end
-  end
-
-  defp acquire_consumer(ring) do
-    if atomic_get(ring, @producer_waiters) == 0, do: try_acquire(ring), else: :busy
-  end
-
-  defp acquire_producer_wait(ring, attempts_left) do
-    case try_acquire(ring) do
-      :busy when attempts_left > 0 ->
-        Process.sleep(1)
-        acquire_producer_wait(ring, attempts_left - 1)
-
-      result ->
-        result
-    end
-  end
+  defp acquire_consumer(ring), do: try_acquire(ring)
 
   defp acquire(ring), do: acquire(ring, @lock_retries)
 
