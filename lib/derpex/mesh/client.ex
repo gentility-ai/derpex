@@ -209,14 +209,9 @@ defmodule Derpex.Mesh.Client do
       {:ok, state, read_ahead} ->
         state = cancel_reconnect_timer(state)
 
-        with {:ok, state} <- process_server_data(state, read_ahead),
-             :ok <- active_once(state.socket),
-             :ok <- cache_local_address(state.socket) do
-          state = arm_recv_deadline(state)
-          dispatch_event(state, {:connected, state.remote_server_key})
-          {:noreply, %{state | last_error: nil}}
-        else
-          {:error, reason} -> {:noreply, disconnect_and_retry(state, reason)}
+        case process_server_data(state, read_ahead) do
+          {:ok, state} -> finish_connect(state)
+          {:error, reason, state} -> {:noreply, disconnect_and_retry(state, reason)}
         end
 
       {:self_connect, state} ->
@@ -225,6 +220,17 @@ defmodule Derpex.Mesh.Client do
 
       {:error, reason, state} ->
         {:noreply, disconnect_and_retry(state, reason)}
+    end
+  end
+
+  defp finish_connect(state) do
+    with :ok <- active_once(state.socket),
+         :ok <- cache_local_address(state.socket) do
+      state = arm_recv_deadline(state)
+      dispatch_event(state, {:connected, state.remote_server_key})
+      {:noreply, %{state | last_error: nil}}
+    else
+      {:error, reason} -> {:noreply, disconnect_and_retry(state, reason)}
     end
   end
 
@@ -314,7 +320,7 @@ defmodule Derpex.Mesh.Client do
           {:error, reason} -> {:noreply, disconnect_and_retry(state, reason)}
         end
 
-      {:error, reason} ->
+      {:error, reason, state} ->
         {:noreply, disconnect_and_retry(state, reason)}
     end
   end
@@ -327,15 +333,19 @@ defmodule Derpex.Mesh.Client do
         process_server_frames(frames, %{state | decoder: decoder})
 
       {:error, reason} ->
-        {:error, {:frame, reason}}
+        {:error, {:frame, reason}, state}
     end
   end
 
+  # Failing halfway through a batch must still hand back the state the batch
+  # built so far. A `peer_present` earlier in the same segment has already
+  # registered a forwarder with the router, and only `state.remote_peers`
+  # records that it needs withdrawing before the ring behind it is deleted.
   defp process_server_frames(frames, state) do
     Enum.reduce_while(frames, {:ok, state}, fn frame, {:ok, state} ->
       case process_server_frame(state, frame) do
         {:ok, state} -> {:cont, {:ok, state}}
-        {:error, reason} -> {:halt, {:error, reason}}
+        {:error, reason} -> {:halt, {:error, reason, state}}
       end
     end)
   end

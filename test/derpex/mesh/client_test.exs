@@ -568,7 +568,110 @@ defmodule Derpex.Mesh.ClientTest do
     error -> send(parent, {:fake_error, error, __STACKTRACE__})
   end
 
+  test "a frame error after a peer_present still withdraws that forwarder" do
+    parent = self()
+    {_server_public, server_private} = Crypto.generate_keypair()
+    {_local_public, local_private} = Crypto.generate_keypair()
+    mesh_key = :crypto.strong_rand_bytes(32)
+    remote_peer = :crypto.strong_rand_bytes(32)
+
+    {:ok, listener} =
+      :gen_tcp.listen(0, [:binary, packet: :raw, active: false, reuseaddr: true])
+
+    {:ok, {_ip, port}} = :inet.sockname(listener)
+
+    fake =
+      spawn(fn -> batch_error_server(listener, server_private, mesh_key, remote_peer, parent) end)
+
+    on_exit(fn ->
+      :gen_tcp.close(listener)
+      if Process.alive?(fake), do: Process.exit(fake, :kill)
+    end)
+
+    client =
+      start_supervised!(
+        {Client,
+         url: "http://127.0.0.1:#{port}/derp",
+         private_key: Secret.wrap(local_private),
+         mesh_key: Secret.wrap(mesh_key),
+         reconnect_interval: 25,
+         event_handler: fn event -> send(parent, {:mesh_event, event}) end}
+      )
+
+    assert_receive {:batch_ready, 1}, 2_000
+    assert_receive {:mesh_event, {:connected, _server_key}}, 2_000
+
+    :ok = :sys.suspend(client)
+    send(fake, :send_batch)
+    assert_receive :batch_sent, 2_000
+    await_queued_messages(client, 1)
+    send(fake, :abort)
+    Process.sleep(50)
+    :ok = :sys.resume(client)
+
+    assert_receive {:mesh_event, {:peer_present, ^remote_peer}}, 2_000
+    assert_receive {:mesh_event, {:disconnected, _reason}}, 2_000
+
+    source = :crypto.strong_rand_bytes(32)
+
+    assert Router.route(source, remote_peer, "between") ==
+             {:dropped, :unknown_destination}
+
+    assert_receive {:batch_ready, 2}, 5_000
+    assert_receive {:mesh_event, {:peer_present, ^remote_peer}}, 5_000
+
+    assert Router.route(source, remote_peer, "new ring") in [{:ok, :wake}, {:ok, :coalesced}]
+    assert_receive {:batch_forward, ^source, ^remote_peer, "new ring"}, 5_000
+  end
+
+  defp batch_error_server(listener, server_private, mesh_key, remote_peer, parent) do
+    {:ok, socket} = :gen_tcp.accept(listener)
+    _read_ahead = mesh_handshake(socket, server_private, mesh_key)
+    send(parent, {:batch_ready, 1})
+    abort_after_batch(socket, remote_peer, parent)
+
+    {:ok, reconnected} = :gen_tcp.accept(listener)
+    read_ahead = mesh_handshake(reconnected, server_private, mesh_key, remote_peer)
+    send(parent, {:batch_ready, 2})
+    {source, destination, packet} = receive_forward(reconnected, read_ahead, 2, parent)
+    send(parent, {:batch_forward, source, destination, packet})
+
+    receive do
+      :stop -> :gen_tcp.close(reconnected)
+    end
+  rescue
+    error -> send(parent, {:fake_error, error, __STACKTRACE__})
+  end
+
+  defp abort_after_batch(socket, remote_peer, parent) do
+    receive do
+      :send_batch ->
+        {:ok, ping} = Body.encode_server({:ping, "resetnow"})
+        :ok = :gen_tcp.send(socket, [peer_present_frame(remote_peer), ping])
+        send(parent, :batch_sent)
+    end
+
+    receive do
+      :abort ->
+        :ok = :inet.setopts(socket, linger: {true, 0})
+        :gen_tcp.close(socket)
+    end
+  end
+
   defp mesh_handshake(socket, server_private, mesh_key, remote_peer) do
+    read_ahead = mesh_handshake(socket, server_private, mesh_key)
+    :ok = transport_send(socket, peer_present_frame(remote_peer))
+    read_ahead
+  end
+
+  defp peer_present_frame(remote_peer) do
+    {:ok, peer_present} =
+      Body.encode_server({:peer_present, remote_peer, <<0::128>>, 12_345, 0x01, "remote"})
+
+    peer_present
+  end
+
+  defp mesh_handshake(socket, server_private, mesh_key) do
     {:ok, _request, read_ahead} = receive_http_head(socket, "")
     {:ok, server_key} = Handshake.server_key_frame(server_private)
 
@@ -590,10 +693,7 @@ defmodule Derpex.Mesh.ClientTest do
     {:ok, server_info} =
       Handshake.server_info_frame(server_private, client_public, %ServerInfo{version: 2})
 
-    {:ok, peer_present} =
-      Body.encode_server({:peer_present, remote_peer, <<0::128>>, 12_345, 0x01, "remote"})
-
-    :ok = transport_send(socket, [server_info, peer_present])
+    :ok = transport_send(socket, server_info)
     read_ahead
   end
 
