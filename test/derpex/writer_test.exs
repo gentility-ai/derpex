@@ -313,6 +313,67 @@ defmodule Derpex.WriterTest do
     assert Writer.estimated_unique_senders(writer) in 1..3
   end
 
+  test "a saturated ordinary ring cannot starve the pong and disco rings" do
+    {:ok, writer} =
+      Writer.start_link(
+        owner: self(),
+        transport: ControlledTransport,
+        socket: {self(), :fair, :open}
+      )
+
+    rings = rings(writer)
+    source = :crypto.strong_rand_bytes(32)
+
+    # Fill the ordinary ring before the writer can drain it, so every ordinary
+    # packet is older than the pong and the disco packet that follow.
+    for sequence <- 1..32 do
+      enqueue_until_accepted(rings.ordinary, {:recv_packet, source, <<sequence::32>>})
+    end
+
+    enqueue_until_accepted(rings.pong, {:pong, "12345678"})
+    enqueue_until_accepted(rings.disco, {:recv_packet, source, disco_packet()})
+
+    frames = collect_frames(20)
+    pong_position = Enum.find_index(frames, &match?({:pong, _payload}, &1))
+    disco_position = Enum.find_index(frames, &(&1 == {:packet, disco_packet()}))
+
+    assert pong_position, "the pong was never written"
+    assert disco_position, "the disco packet was never written"
+    assert ordinary_frames_before(frames, pong_position) <= 2
+    assert ordinary_frames_before(frames, disco_position) <= 2
+  end
+
+  defp disco_packet, do: <<0x64, 0x65, 0x87, 0xB0, 0x8E, 0xF5>> <> :binary.copy(<<7>>, 26)
+
+  defp ordinary_frames_before(frames, position) do
+    disco = disco_packet()
+
+    frames
+    |> Enum.take(position)
+    |> Enum.count(fn frame ->
+      match?({:packet, _payload}, frame) and frame != {:packet, disco}
+    end)
+  end
+
+  defp collect_frames(count, collected \\ [])
+  defp collect_frames(0, collected), do: Enum.reverse(collected)
+
+  defp collect_frames(count, collected) do
+    receive do
+      {:write_finished, :fair, frame} ->
+        collect_frames(count - 1, [decode_frame(frame) | collected])
+    after
+      1_000 -> Enum.reverse(collected)
+    end
+  end
+
+  defp decode_frame(<<0x13, _length::32, payload::binary>>), do: {:pong, payload}
+
+  defp decode_frame(<<0x05, _length::32, _source::binary-size(32), payload::binary>>),
+    do: {:packet, payload}
+
+  defp decode_frame(frame), do: {:other, frame}
+
   defp rings(writer) do
     rings = %{
       ordinary: Ring.new(32, notifier: writer, wake_message: Writer.wake_message()),

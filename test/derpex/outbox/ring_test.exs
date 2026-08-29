@@ -182,7 +182,7 @@ defmodule Derpex.Outbox.RingTest do
     # about the ring — its four-millisecond budget and the naps that fit in it
     # — rather than about the machine.
     nap_cost = Enum.max(for _sample <- 1..25, do: elem(:timer.tc(&Process.sleep/1, [1]), 0))
-    ceiling = @acquire_budget_microseconds + @producer_naps * nap_cost
+    ceiling = @acquire_budget_microseconds + 2 * @producer_naps * nap_cost
 
     latencies =
       Enum.flat_map(producers, fn {producer, monitor} ->

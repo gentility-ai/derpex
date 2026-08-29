@@ -19,6 +19,7 @@ defmodule Derpex.Writer do
   @retry_message :derpex_outbox_retry
   @retry_interval_ms 5
   @websocket_chunk_size 16 * 1_024
+  @packet_classes [:ordinary, :disco, :pong]
 
   @type rings :: %{
           ordinary: Ring.t(),
@@ -79,6 +80,7 @@ defmodule Derpex.Writer do
        wire_mode: :native,
        rings: nil,
        retry_timer: nil,
+       packet_cursor: 0,
        sender_cardinality: Cardinality.new()
      }}
   end
@@ -139,8 +141,8 @@ defmodule Derpex.Writer do
   end
 
   defp drain(state) do
-    case take_next(state.rings) do
-      {:ok, message, queue_age_microseconds} ->
+    case take_next(state) do
+      {{:ok, message, queue_age_microseconds}, state} ->
         with {:ok, frame} <- Body.encode_server(message),
              :ok <- send_data(state, frame) do
           record_queue_duration(state.metrics, message, queue_age_microseconds)
@@ -154,13 +156,13 @@ defmodule Derpex.Writer do
             {:error, reason, state}
         end
 
-      :empty ->
+      {:empty, state} ->
         {:ok, state}
 
-      :busy ->
+      {:busy, state} ->
         {:ok, schedule_retry(state)}
 
-      :closed ->
+      {:closed, state} ->
         {:ok, state}
     end
   end
@@ -192,25 +194,50 @@ defmodule Derpex.Writer do
     %{state | retry_timer: nil}
   end
 
-  defp take_next(%{lifecycle: lifecycle} = rings) do
-    case Ring.take_with_age(lifecycle) do
-      :empty -> take_packet(rings)
-      result -> result
+  # Go's sendLoop selects at random among the ready channels, so no packet class
+  # can be starved by another. Lifecycle frames still come first: peer-gone and
+  # mesh updates are state changes, not traffic. Among the packet classes a
+  # cursor rotates, which is the deterministic form of the same fairness -
+  # picking the oldest head instead would drain a full ordinary ring before a
+  # pong that arrived after it.
+  defp take_next(state) do
+    case Ring.take_with_age(state.rings.lifecycle) do
+      :empty -> take_packet(state)
+      result -> {result, state}
     end
   end
 
-  defp take_packet(%{ordinary: ordinary, disco: disco, pong: pong}) do
-    case Ring.take_with_age(ordinary) do
+  defp take_packet(state) do
+    take_in_order(state, rotation(state.packet_cursor), :empty)
+  end
+
+  defp rotation(cursor) do
+    Enum.drop(@packet_classes, cursor) ++ Enum.take(@packet_classes, cursor)
+  end
+
+  defp take_in_order(state, [], outcome), do: {outcome, state}
+
+  defp take_in_order(state, [class | rest], outcome) do
+    case Ring.take_with_age(Map.fetch!(state.rings, class)) do
+      {:ok, _message, _age} = result ->
+        {result, %{state | packet_cursor: next_cursor(class)}}
+
       :empty ->
-        case Ring.take_with_age(disco) do
-          :empty -> Ring.take_with_age(pong)
-          result -> result
-        end
+        take_in_order(state, rest, outcome)
 
-      result ->
-        result
+      other ->
+        take_in_order(state, rest, weaker_of(outcome, other))
     end
   end
+
+  defp next_cursor(class) do
+    rem(Enum.find_index(@packet_classes, &(&1 == class)) + 1, length(@packet_classes))
+  end
+
+  # A ring that was locked matters more than one that was closed: the locked one
+  # still owes the writer a drain.
+  defp weaker_of(:busy, _other), do: :busy
+  defp weaker_of(_outcome, other), do: other
 
   defp maybe_note_send(_state, {:recv_packet, <<0::256>>, _packet}), do: :ok
 
