@@ -63,7 +63,11 @@ at its bound, a new lease evicts, in order:
 
 1. an expired entry, claimed or not, because an expired lease must close anyway;
 2. otherwise the soonest-expiring entry that no connection is claiming, ties
-   broken by least recently used.
+   broken by node key.
+
+Both orders are maintained incrementally, so admitting a lease, claiming a
+connection, and releasing one cost the same whether the cache holds ten leases
+or a hundred thousand.
 
 If every entry holds a valid lease with a live claim, the *new* admission is
 rejected with `cache_full` and the counter behind

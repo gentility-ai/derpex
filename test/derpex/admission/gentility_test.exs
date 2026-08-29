@@ -347,6 +347,92 @@ defmodule Derpex.Admission.GentilityTest do
     Process.exit(connection, :kill)
   end
 
+  @tag timeout: 600_000
+  test "claims and releases in constant time against a full lease cache" do
+    entries = 100_000
+    samples = 500
+    now = System.system_time(:millisecond)
+
+    controller =
+      start_supervised!(
+        {Gentility,
+         [
+           authority: fn request -> {:ok, perf_lease(request.node_key, now)} end,
+           verification_keys: %{@signing_key_id => @public_key},
+           clock: Derpex.Clock.System,
+           max_lease_ms: 900_000,
+           max_future_skew_ms: 30_000,
+           max_cache_entries: entries
+         ]}
+      )
+
+    policy = Gentility.policy(controller)
+
+    contexts =
+      Enum.reduce(1..entries, %{}, fn index, contexts ->
+        node_key = <<index::256>>
+        assert {:ok, context} = Gentility.authorize(request(node_key), policy)
+        if index <= samples, do: Map.put(contexts, node_key, context), else: contexts
+      end)
+
+    assert Gentility.stats(controller).cache_entries == entries
+
+    connections = connections(samples)
+
+    claims =
+      connections
+      |> Enum.with_index(1)
+      |> Enum.map(fn {connection, index} ->
+        node_key = <<index::256>>
+        context = Map.fetch!(contexts, node_key)
+
+        {microseconds, result} =
+          :timer.tc(fn -> Gentility.claim(request(node_key), context, connection, policy) end)
+
+        assert {:ok, _context} = result
+        {microseconds, connection}
+      end)
+
+    releases =
+      Enum.map(claims, fn {_microseconds, connection} ->
+        {microseconds, :ok} = :timer.tc(fn -> Gentility.release(connection, policy) end)
+        microseconds
+      end)
+
+    claim_p99 = percentile(Enum.map(claims, &elem(&1, 0)), 99)
+    release_p99 = percentile(releases, 99)
+
+    assert claim_p99 < 100,
+           "claim p99 was #{claim_p99} us over #{samples} samples with #{entries} cached leases"
+
+    assert release_p99 < 100,
+           "release p99 was #{release_p99} us over #{samples} samples with #{entries} cached leases"
+
+    Enum.each(connections, &Process.exit(&1, :kill))
+  end
+
+  test "reclaims byte-budget rows on the prune timer, not on the admission path" do
+    node_key = node_key(37)
+
+    controller =
+      start_controller(
+        authority: fn _request -> {:ok, signed_lease(node_key)} end,
+        budget_prune_ms: 30_000
+      )
+
+    policy = Gentility.policy(controller)
+    assert {:ok, _context} = Gentility.authorize(request(node_key), policy)
+    assert :ets.info(policy.byte_budgets, :size) == 2
+
+    assert Gentility.revoke(controller, signed_revocation(node_key, 10)) == {:ok, :applied}
+    assert Gentility.stats(controller).cache_entries == 0
+    assert :ets.info(policy.byte_budgets, :size) == 2
+    assert Gentility.stats(controller).budget_nodes == 0
+
+    Manual.advance(30_000)
+    eventually(fn -> :ets.info(policy.byte_budgets, :size) == 0 end)
+  end
+
   test "rejects excess authorization work before it enters controller state" do
     parent = self()
 
@@ -902,6 +988,37 @@ defmodule Derpex.Admission.GentilityTest do
   defp keeper_request(node_key, expires_at_ms) do
     request = request(node_key)
     %Request{request | metadata: %{expires_at_ms: expires_at_ms}}
+  end
+
+  defp perf_lease(node_key, now_ms) do
+    lease = %Lease{
+      key_id: @signing_key_id,
+      node_key: node_key,
+      node_id: "node_01",
+      organization_id: "org_01",
+      owner_kind: "deployment",
+      deployment_id: "dep_01",
+      region_id: 17,
+      policy_revision: 9,
+      quota_revision: 3,
+      issued_at_ms: now_ms,
+      expires_at_ms: now_ms + 900_000,
+      node_connection_limit: 4,
+      organization_connection_limit: 1_000_000,
+      node_bytes_per_second: 10_000,
+      node_byte_burst: 20_000,
+      organization_bytes_per_second: 100_000,
+      organization_byte_burst: 200_000
+    }
+
+    {:ok, wire} = Contract.sign_lease(lease, @private_key)
+    wire
+  end
+
+  defp percentile(samples, percentile) do
+    sorted = Enum.sort(samples)
+    index = max(ceil(length(sorted) * percentile / 100) - 1, 0)
+    Enum.at(sorted, index)
   end
 
   defp signed_revocation(node_key, revision) do

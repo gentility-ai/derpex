@@ -6,6 +6,11 @@ defmodule Derpex.Admission.Gentility do
   revocation remain responsive during a control-plane outage. An atomic gate
   rejects excess work before it can enter the controller mailbox.
 
+  Allocations are incremental: a claim or a release touches only the node and
+  organization it names, expiry order is kept in a tree rather than rescanned,
+  and stale token-bucket rows are reclaimed on a timer. No admission decision
+  walks the lease cache.
+
   An authority answer is authoritative only when it is a signed contract v1
   record: a lease admits, and a revocation denies. Every other answer — an
   error tuple of any shape, a timeout, an exit, or an unrecognized term — is a
@@ -17,6 +22,7 @@ defmodule Derpex.Admission.Gentility do
 
   @behaviour Derpex.Admission
 
+  alias Derpex.Admission.Gentility.Budgets
   alias Derpex.Admission.Gentility.ByteBudget
   alias Derpex.Admission.Gentility.Cache
   alias Derpex.Admission.Gentility.Contract
@@ -35,6 +41,7 @@ defmodule Derpex.Admission.Gentility do
   @default_max_lease_ms 15 * 60 * 1_000
   @default_max_future_skew_ms 30_000
   @default_max_byte_delay_ms 30_000
+  @default_budget_prune_ms 30_000
   defmodule Policy do
     @moduledoc "An immutable, lock-free admission handle obtained from a running controller."
 
@@ -206,7 +213,13 @@ defmodule Derpex.Admission.Gentility do
   @impl GenServer
   def init(options) do
     with {:ok, state} <- initial_state(options) do
-      state = state |> load_cache() |> purge_expired() |> reschedule_expiry()
+      state =
+        state
+        |> load_cache()
+        |> purge_expired()
+        |> reschedule_expiry()
+        |> schedule_budget_prune()
+
       {:ok, state}
     end
   end
@@ -225,6 +238,8 @@ defmodule Derpex.Admission.Gentility do
       max_cache_entries: state.max_cache_entries,
       max_revocations: state.max_revocations,
       cache_full: state.cache_full,
+      budget_nodes: Budgets.stats(state.budgets).nodes,
+      budget_organizations: Budgets.stats(state.budgets).organizations,
       load_error: state.load_error,
       persist_error: state.persist_error
     }
@@ -289,6 +304,14 @@ defmodule Derpex.Admission.Gentility do
 
   def handle_info({__MODULE__, :expire, _stale}, state), do: {:noreply, state}
 
+  def handle_info({__MODULE__, :prune_budgets, token}, %{budget_prune_token: token} = state) do
+    :ok = Budgets.prune(state.budgets)
+    state = %{state | budget_prune_timer: nil, budget_prune_token: nil}
+    {:noreply, schedule_budget_prune(state)}
+  end
+
+  def handle_info({__MODULE__, :prune_budgets, _stale}, state), do: {:noreply, state}
+
   def handle_info({:DOWN, monitor, :process, connection, _reason}, state) do
     case state.claims[connection] do
       %{monitor: ^monitor} -> {:noreply, release_connection(state, connection, false)}
@@ -299,6 +322,7 @@ defmodule Derpex.Admission.Gentility do
   @impl GenServer
   def terminate(_reason, state) do
     cancel_expiry(state)
+    cancel_budget_prune(state)
     UsageWorker.stop(state.usage)
     :ok
   end
@@ -322,12 +346,13 @@ defmodule Derpex.Admission.Gentility do
     max_byte_delay_ms =
       positive_option!(options, :max_byte_delay_ms, @default_max_byte_delay_ms)
 
+    budget_prune_ms = positive_option!(options, :budget_prune_ms, @default_budget_prune_ms)
     verification_keys = Keyword.fetch!(options, :verification_keys)
     clock = Keyword.get(options, :clock, Clock)
 
     with :ok <- validate_verification_keys(verification_keys),
          {:ok, usage} <- initial_usage(Keyword.get(options, :usage), clock) do
-      byte_budgets = ByteBudget.new()
+      budgets = Budgets.new()
 
       policy = %Policy{
         server: server,
@@ -335,7 +360,7 @@ defmodule Derpex.Admission.Gentility do
         gate: gate,
         max_concurrent_requests: max_concurrent_requests,
         authority_timeout: authority_timeout,
-        byte_budgets: byte_budgets,
+        byte_budgets: Budgets.table(budgets),
         clock: clock,
         max_byte_delay_ms: max_byte_delay_ms,
         usage: usage_policy(usage)
@@ -357,12 +382,16 @@ defmodule Derpex.Admission.Gentility do
              send(connection, {:derpex_admission_close, reason})
            end),
          leases: %{},
+         by_expiry: :gb_trees.empty(),
+         unclaimed: :gb_trees.empty(),
          revocations: %{},
          claims: %{},
          node_connections: %{},
          organization_connections: %{},
-         node_budgets: %{},
-         organization_budgets: %{},
+         budgets: budgets,
+         budget_prune_ms: budget_prune_ms,
+         budget_prune_timer: nil,
+         budget_prune_token: nil,
          closing_connections: MapSet.new(),
          cache_full: 0,
          sequence: 0,
@@ -471,14 +500,8 @@ defmodule Derpex.Admission.Gentility do
 
   defp cached_decision(state, node_key) do
     case state.leases[node_key] do
-      nil ->
-        {:reply, {:error, :no_cached_lease}, reschedule_expiry(state)}
-
-      entry ->
-        sequence = state.sequence + 1
-        entry = %{entry | accessed: sequence}
-        state = %{state | leases: Map.put(state.leases, node_key, entry), sequence: sequence}
-        {:reply, {:ok, context(entry.lease, :cached)}, reschedule_expiry(state)}
+      nil -> {:reply, {:error, :no_cached_lease}, reschedule_expiry(state)}
+      entry -> {:reply, {:ok, context(entry.lease, :cached)}, reschedule_expiry(state)}
     end
   end
 
@@ -498,28 +521,46 @@ defmodule Derpex.Admission.Gentility do
     end
   end
 
+  # Admits a lease into the bounded cache. Expired entries are already gone,
+  # purged before the record was accepted, so the victim is the soonest-expiring
+  # entry no connection is claiming. An entry an active connection is claiming is
+  # never evicted, so a saturated cache rejects the new admission instead of
+  # closing an established peer.
   defp install_live_lease(state, wire, lease) do
-    sequence = state.sequence + 1
-    entry = %{wire: wire, lease: lease, accessed: sequence}
+    entry = %{wire: wire, lease: lease}
 
-    case admit_lease(state, lease.node_key, entry) do
-      {:ok, leases, evicted} ->
-        install_admitted_lease(state, lease, leases, evicted, sequence)
+    cond do
+      Map.has_key?(state.leases, lease.node_key) ->
+        install_admitted_lease(state, lease, entry, nil)
 
-      {:error, :cache_full} ->
-        {:reply, {:error, :cache_full}, %{state | cache_full: state.cache_full + 1}}
+      map_size(state.leases) < state.max_cache_entries ->
+        install_admitted_lease(state, lease, entry, nil)
+
+      true ->
+        case evictable_lease(state) do
+          nil -> {:reply, {:error, :cache_full}, %{state | cache_full: state.cache_full + 1}}
+          victim -> install_admitted_lease(state, lease, entry, victim)
+        end
     end
   end
 
-  defp install_admitted_lease(state, lease, leases, evicted, sequence) do
-    revocations = Map.delete(state.revocations, lease.node_key)
+  defp install_admitted_lease(state, lease, entry, victim) do
+    state = evict_lease(state, victim)
+    node_revision = Budgets.revision(state.budgets, :node, lease.node_key)
+    organization_revision = Budgets.revision(state.budgets, :organization, lease.organization_id)
 
     candidate =
-      %{state | leases: leases, revocations: revocations, sequence: sequence}
-      |> rebuild_budgets()
+      state
+      |> drop_lease_entry(lease.node_key)
+      |> put_lease_entry(lease.node_key, entry)
+      |> Map.update!(:revocations, &Map.delete(&1, lease.node_key))
 
-    close_evicted(candidate, evicted)
-    candidate = enforce_revised_budgets(candidate)
+    candidate =
+      if revised_budgets?(candidate, lease, node_revision, organization_revision) do
+        enforce_revised_budgets(candidate, lease.node_key, lease.organization_id)
+      else
+        candidate
+      end
 
     case persist(candidate) do
       :ok ->
@@ -532,33 +573,66 @@ defmodule Derpex.Admission.Gentility do
     end
   end
 
-  # Admits a lease into the bounded cache. An entry an active connection is
-  # claiming is never evicted while its lease is valid, so a saturated cache
-  # rejects the new admission instead of closing an established peer.
-  defp admit_lease(state, node_key, entry) do
-    leases = Map.put(state.leases, node_key, entry)
+  defp evict_lease(state, nil), do: state
 
-    if map_size(leases) <= state.max_cache_entries do
-      {:ok, leases, nil}
+  defp evict_lease(state, victim) do
+    state = drop_lease_entry(state, victim)
+    close_peer(state, victim)
+    state
+  end
+
+  # Only a changed allocation can put an established connection over its limit:
+  # a claim is refused when it would exceed the limit in force. Scanning claims
+  # is therefore confined to the two identities whose revision actually moved.
+  defp revised_budgets?(state, lease, node_revision, organization_revision) do
+    Budgets.revision(state.budgets, :node, lease.node_key) != node_revision or
+      Budgets.revision(state.budgets, :organization, lease.organization_id) !=
+        organization_revision
+  end
+
+  defp evictable_lease(state) do
+    if :gb_trees.is_empty(state.unclaimed) do
+      nil
     else
-      case evictable_lease(state, leases, node_key) do
-        nil -> {:error, :cache_full}
-        {key, evicted} -> {:ok, Map.delete(leases, key), {key, evicted}}
-      end
+      {{_expires_at_ms, node_key}, _present} = :gb_trees.smallest(state.unclaimed)
+      node_key
     end
   end
 
-  defp evictable_lease(state, leases, admitted_key) do
-    now = now_ms(state)
+  defp put_lease_entry(state, node_key, entry) do
+    key = expiry_key(node_key, entry)
 
-    leases
-    |> Enum.reject(fn {key, entry} ->
-      key == admitted_key or (entry.lease.expires_at_ms > now and claimed?(state, key))
-    end)
-    |> Enum.min_by(fn {_key, entry} -> {entry.lease.expires_at_ms, entry.accessed} end, fn ->
-      nil
-    end)
+    state = %{
+      state
+      | leases: Map.put(state.leases, node_key, entry),
+        by_expiry: :gb_trees.enter(key, true, state.by_expiry),
+        budgets: Budgets.add_lease(state.budgets, entry.lease, now_microsecond(state))
+    }
+
+    if claimed?(state, node_key),
+      do: state,
+      else: %{state | unclaimed: :gb_trees.enter(key, true, state.unclaimed)}
   end
+
+  defp drop_lease_entry(state, node_key) do
+    case Map.pop(state.leases, node_key) do
+      {nil, _leases} ->
+        state
+
+      {entry, leases} ->
+        key = expiry_key(node_key, entry)
+
+        %{
+          state
+          | leases: leases,
+            by_expiry: :gb_trees.delete_any(key, state.by_expiry),
+            unclaimed: :gb_trees.delete_any(key, state.unclaimed),
+            budgets: Budgets.remove_lease(state.budgets, entry.lease, now_microsecond(state))
+        }
+    end
+  end
+
+  defp expiry_key(node_key, entry), do: {entry.lease.expires_at_ms, node_key}
 
   defp claimed?(state, node_key), do: Map.get(state.node_connections, node_key, 0) > 0
 
@@ -624,8 +698,7 @@ defmodule Derpex.Admission.Gentility do
     close? =
       is_nil(cached_lease) or cached_lease.lease.policy_revision <= revocation.policy_revision
 
-    leases =
-      if close?, do: Map.delete(state.leases, revocation.node_key), else: state.leases
+    state = if close?, do: drop_lease_entry(state, revocation.node_key), else: state
 
     entry = %{
       wire: wire,
@@ -641,7 +714,7 @@ defmodule Derpex.Admission.Gentility do
         state.max_revocations
       )
 
-    {%{state | leases: leases, revocations: revocations} |> rebuild_budgets(), close?}
+    {%{state | revocations: revocations}, close?}
   end
 
   defp verify_revocations(wires, keys, maximum) when length(wires) <= maximum do
@@ -710,8 +783,8 @@ defmodule Derpex.Admission.Gentility do
         node_key: node_key,
         organization_id: lease.organization_id,
         sequence: sequence,
-        node_budget: node_budget(lease),
-        organization_budget: organization_budget(lease)
+        node_budget: Budgets.node_budget(lease),
+        organization_budget: Budgets.organization_budget(lease)
       }
 
       state = %{
@@ -720,12 +793,37 @@ defmodule Derpex.Admission.Gentility do
           node_connections: increment(state.node_connections, node_key),
           organization_connections:
             increment(state.organization_connections, lease.organization_id),
+          budgets: Budgets.add_claim(state.budgets, claim, now_microsecond(state)),
           sequence: sequence
       }
 
-      {:reply, {:ok, context}, rebuild_budgets(state)}
+      {:reply, {:ok, context}, hold_claimed_lease(state, node_key)}
     else
       {:error, _reason} = error -> {:reply, error, state}
+    end
+  end
+
+  # A lease an active connection is claiming leaves the eviction order entirely;
+  # it returns to it when the last connection for that node is released.
+  defp hold_claimed_lease(state, node_key) do
+    case state.leases[node_key] do
+      nil ->
+        state
+
+      entry ->
+        key = expiry_key(node_key, entry)
+        %{state | unclaimed: :gb_trees.delete_any(key, state.unclaimed)}
+    end
+  end
+
+  defp release_claimed_lease(state, node_key) do
+    case state.leases[node_key] do
+      nil ->
+        state
+
+      entry ->
+        key = expiry_key(node_key, entry)
+        %{state | unclaimed: :gb_trees.enter(key, true, state.unclaimed)}
     end
   end
 
@@ -740,8 +838,11 @@ defmodule Derpex.Admission.Gentility do
   defp claim_lease(_state, _node_key, _context), do: {:error, :invalid_admission_context}
 
   defp connection_budget_available(state, lease) do
-    node_limit = state.node_budgets[lease.node_key].connection_limit
-    organization_limit = state.organization_budgets[lease.organization_id].connection_limit
+    node_limit = Budgets.connection_limit(state.budgets, :node, lease.node_key)
+
+    organization_limit =
+      Budgets.connection_limit(state.budgets, :organization, lease.organization_id)
+
     node_count = Map.get(state.node_connections, lease.node_key, 0)
     organization_count = Map.get(state.organization_connections, lease.organization_id, 0)
 
@@ -760,15 +861,19 @@ defmodule Derpex.Admission.Gentility do
       {claim, claims} ->
         if demonitor?, do: Process.demonitor(claim.monitor, [:flush])
 
-        %{
+        state = %{
           state
           | claims: claims,
             node_connections: decrement(state.node_connections, claim.node_key),
             organization_connections:
               decrement(state.organization_connections, claim.organization_id),
+            budgets: Budgets.remove_claim(state.budgets, claim, now_microsecond(state)),
             closing_connections: MapSet.delete(state.closing_connections, connection)
         }
-        |> rebuild_budgets()
+
+        if claimed?(state, claim.node_key),
+          do: state,
+          else: release_claimed_lease(state, claim.node_key)
     end
   end
 
@@ -781,102 +886,11 @@ defmodule Derpex.Admission.Gentility do
     end
   end
 
-  defp rebuild_budgets(state) do
-    {node_budgets, organization_budgets} =
-      Enum.reduce(state.leases, {%{}, %{}}, fn {_key, entry}, budgets ->
-        merge_budgets(budgets, node_budget(entry.lease), organization_budget(entry.lease))
-      end)
-
-    {node_budgets, organization_budgets} =
-      Enum.reduce(state.claims, {node_budgets, organization_budgets}, fn {_pid, claim}, budgets ->
-        merge_budgets(budgets, claim.node_budget, claim.organization_budget)
-      end)
-
-    state = %{state | node_budgets: node_budgets, organization_budgets: organization_budgets}
-    sync_byte_budgets(state)
-  end
-
-  defp sync_byte_budgets(state) do
-    now = state.clock.monotonic_time(:microsecond)
-
-    Enum.each(state.node_budgets, fn {_identity, budget} ->
-      ByteBudget.sync(state.policy.byte_budgets, :node, budget, now)
-    end)
-
-    Enum.each(state.organization_budgets, fn {_identity, budget} ->
-      ByteBudget.sync(state.policy.byte_budgets, :organization, budget, now)
-    end)
-
-    retained =
-      Enum.reduce(state.node_budgets, MapSet.new(), fn {identity, _budget}, retained ->
-        MapSet.put(retained, {:node, identity})
-      end)
-
-    retained =
-      Enum.reduce(state.organization_budgets, retained, fn {identity, _budget}, retained ->
-        MapSet.put(retained, {:organization, identity})
-      end)
-
-    :ok = ByteBudget.prune(state.policy.byte_budgets, retained)
+  # Only the two identities a revised lease names can have gone over their
+  # allocation, so enforcement never walks the whole cache.
+  defp enforce_revised_budgets(state, node_key, organization_id) do
     state
-  end
-
-  defp merge_budgets({node_budgets, organization_budgets}, node, organization) do
-    {
-      put_newer_budget(node_budgets, node.identity, node),
-      put_newer_budget(organization_budgets, organization.identity, organization)
-    }
-  end
-
-  defp put_newer_budget(budgets, identity, budget) do
-    case budgets[identity] do
-      %{revision: revision} when revision > budget.revision ->
-        budgets
-
-      %{revision: revision} = current when revision == budget.revision ->
-        Map.put(budgets, identity, stricter_budget(current, budget))
-
-      _older_or_missing ->
-        Map.put(budgets, identity, budget)
-    end
-  end
-
-  defp stricter_budget(left, right) do
-    %{
-      left
-      | connection_limit: min(left.connection_limit, right.connection_limit),
-        bytes_per_second: stricter_rate(left.bytes_per_second, right.bytes_per_second),
-        byte_burst: min(left.byte_burst, right.byte_burst)
-    }
-  end
-
-  defp stricter_rate(0, rate), do: rate
-  defp stricter_rate(rate, 0), do: rate
-  defp stricter_rate(left, right), do: min(left, right)
-
-  defp node_budget(lease) do
-    %{
-      identity: lease.node_key,
-      revision: lease.quota_revision,
-      connection_limit: lease.node_connection_limit,
-      bytes_per_second: lease.node_bytes_per_second,
-      byte_burst: lease.node_byte_burst
-    }
-  end
-
-  defp organization_budget(lease) do
-    %{
-      identity: lease.organization_id,
-      revision: lease.quota_revision,
-      connection_limit: lease.organization_connection_limit,
-      bytes_per_second: lease.organization_bytes_per_second,
-      byte_burst: lease.organization_byte_burst
-    }
-  end
-
-  defp enforce_revised_budgets(state) do
-    state
-    |> over_limit_connections()
+    |> over_limit_connections(node_key, organization_id)
     |> Enum.reject(&MapSet.member?(state.closing_connections, &1))
     |> Enum.reduce(state, fn connection, state ->
       state.close_connection.(connection, :quota_revision)
@@ -884,23 +898,28 @@ defmodule Derpex.Admission.Gentility do
     end)
   end
 
-  defp over_limit_connections(state) do
+  defp over_limit_connections(state, node_key, organization_id) do
+    node_count = Map.get(state.node_connections, node_key, 0)
+    node_limit = Budgets.connection_limit(state.budgets, :node, node_key)
+
     node_excess =
-      Enum.flat_map(state.node_connections, fn {node_key, count} ->
-        limit = state.node_budgets[node_key].connection_limit
-        newest_claims(state, fn claim -> claim.node_key == node_key end, max(count - limit, 0))
-      end)
+      newest_claims(
+        state,
+        fn claim -> claim.node_key == node_key end,
+        max(node_count - node_limit, 0)
+      )
+
+    organization_count = Map.get(state.organization_connections, organization_id, 0)
+
+    organization_limit =
+      Budgets.connection_limit(state.budgets, :organization, organization_id)
 
     organization_excess =
-      Enum.flat_map(state.organization_connections, fn {organization_id, count} ->
-        limit = state.organization_budgets[organization_id].connection_limit
-
-        newest_claims(
-          state,
-          fn claim -> claim.organization_id == organization_id end,
-          max(count - limit, 0)
-        )
-      end)
+      newest_claims(
+        state,
+        fn claim -> claim.organization_id == organization_id end,
+        max(organization_count - organization_limit, 0)
+      )
 
     Enum.uniq(node_excess ++ organization_excess)
   end
@@ -931,33 +950,32 @@ defmodule Derpex.Admission.Gentility do
         end
       end)
 
-    revocation_wires
-    |> Enum.reduce(state, fn wire, state ->
+    Enum.reduce(revocation_wires, state, fn wire, state ->
       case Contract.verify_revocation(wire, state.verification_keys) do
         {:ok, revocation} -> elem(put_revocation(state, wire, revocation), 0)
         {:error, _invalid} -> state
       end
     end)
-    |> rebuild_budgets()
   end
 
   defp put_loaded_lease(state, wire, lease) do
-    sequence = state.sequence + 1
-    entry = %{wire: wire, lease: lease, accessed: sequence}
-    %{state | leases: Map.put(state.leases, lease.node_key, entry), sequence: sequence}
+    put_lease_entry(state, lease.node_key, %{wire: wire, lease: lease})
   end
 
   defp reverify_records(state) do
-    leases =
-      Map.new(state.leases, fn {key, entry} ->
-        case verify_lease(state, entry.wire) do
-          {:ok, lease} -> {key, %{entry | lease: lease}}
-          {:error, _reason} -> {key, nil}
-        end
+    invalid_keys =
+      state.leases
+      |> Enum.reject(fn {_key, entry} ->
+        match?({:ok, _lease}, verify_lease(state, entry.wire))
       end)
+      |> Enum.map(&elem(&1, 0))
 
-    {invalid_keys, valid_leases} = Enum.split_with(leases, fn {_key, entry} -> is_nil(entry) end)
-    Enum.each(invalid_keys, fn {key, _nil} -> close_peer(state, key) end)
+    state =
+      Enum.reduce(invalid_keys, state, fn key, state ->
+        state = drop_lease_entry(state, key)
+        close_peer(state, key)
+        state
+      end)
 
     revocations =
       Map.filter(state.revocations, fn {_key, entry} ->
@@ -967,38 +985,45 @@ defmodule Derpex.Admission.Gentility do
         )
       end)
 
-    %{state | leases: Map.new(valid_leases), revocations: revocations} |> rebuild_budgets()
+    %{state | revocations: revocations}
   end
 
+  # Expiry order is maintained incrementally, so purging walks only the leases
+  # that have actually expired rather than the whole cache.
   defp purge_expired(state) do
-    now = now_ms(state)
+    case purge_expired_leases(state, now_ms(state), false) do
+      {state, false} -> state
+      {state, true} -> persist_or_note_error(state)
+    end
+  end
 
-    {expired, valid} =
-      Enum.split_with(state.leases, fn {_key, entry} -> entry.lease.expires_at_ms <= now end)
-
-    if expired == [] do
-      state
+  defp purge_expired_leases(state, now, purged?) do
+    if :gb_trees.is_empty(state.by_expiry) do
+      {state, purged?}
     else
-      Enum.each(expired, fn {key, _entry} -> close_peer(state, key) end)
-      state = %{state | leases: Map.new(valid)} |> rebuild_budgets()
-      persist_or_note_error(state)
+      {{expires_at_ms, node_key}, _present} = :gb_trees.smallest(state.by_expiry)
+
+      if expires_at_ms <= now do
+        state = drop_lease_entry(state, node_key)
+        close_peer(state, node_key)
+        purge_expired_leases(state, now, true)
+      else
+        {state, purged?}
+      end
     end
   end
 
   defp reschedule_expiry(state) do
     state = cancel_expiry(state)
 
-    case Enum.min_by(state.leases, fn {_key, entry} -> entry.lease.expires_at_ms end, fn ->
-           nil
-         end) do
-      nil ->
-        state
-
-      {_key, entry} ->
-        delay = max(entry.lease.expires_at_ms - now_ms(state), 0)
-        token = make_ref()
-        timer = state.clock.send_after(self(), {__MODULE__, :expire, token}, delay)
-        %{state | expiry_timer: timer, expiry_token: token}
+    if :gb_trees.is_empty(state.by_expiry) do
+      state
+    else
+      {{expires_at_ms, _node_key}, _present} = :gb_trees.smallest(state.by_expiry)
+      delay = max(expires_at_ms - now_ms(state), 0)
+      token = make_ref()
+      timer = state.clock.send_after(self(), {__MODULE__, :expire, token}, delay)
+      %{state | expiry_timer: timer, expiry_token: token}
     end
   end
 
@@ -1009,12 +1034,37 @@ defmodule Derpex.Admission.Gentility do
     %{state | expiry_timer: nil, expiry_token: nil}
   end
 
+  # Token-bucket rows outlive the lease or claim that created them until this
+  # timer reclaims them, so no admission pays for the sweep.
+  defp schedule_budget_prune(state) do
+    state = cancel_budget_prune(state)
+    token = make_ref()
+
+    timer =
+      state.clock.send_after(
+        self(),
+        {__MODULE__, :prune_budgets, token},
+        state.budget_prune_ms
+      )
+
+    %{state | budget_prune_timer: timer, budget_prune_token: token}
+  end
+
+  defp cancel_budget_prune(%{budget_prune_timer: nil} = state), do: state
+
+  defp cancel_budget_prune(state) do
+    _remaining = state.clock.cancel_timer(state.budget_prune_timer)
+    %{state | budget_prune_timer: nil, budget_prune_token: nil}
+  end
+
   defp persist_or_note_error(state) do
     case persist(state) do
       :ok -> %{state | persist_error: nil}
       {:error, reason} -> %{state | persist_error: reason}
     end
   end
+
+  defp persist(%{cache_path: nil}), do: :ok
 
   defp persist(state) do
     leases =
@@ -1043,9 +1093,6 @@ defmodule Derpex.Admission.Gentility do
       Map.delete(entries, evicted_key)
     end
   end
-
-  defp close_evicted(_state, nil), do: :ok
-  defp close_evicted(state, {key, _entry}), do: close_peer(state, key)
 
   defp close_peer(state, key) do
     _connection_count = state.close_peer.(key)
@@ -1084,6 +1131,8 @@ defmodule Derpex.Admission.Gentility do
   end
 
   defp now_ms(state), do: state.clock.system_time(:millisecond)
+
+  defp now_microsecond(state), do: state.clock.monotonic_time(:microsecond)
 
   defp validate_verification_keys(keys) when map_size(keys) > 0 and map_size(keys) <= 16 do
     if Enum.all?(keys, fn {key_id, key} ->
