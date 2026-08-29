@@ -3,6 +3,8 @@ defmodule Derpex.Listener.Handler do
 
   use ThousandIsland.Handler
 
+  require Logger
+
   alias Derpex.AcceptLimiter
   alias Derpex.Admission
   alias Derpex.Admission.Request, as: AdmissionRequest
@@ -294,11 +296,27 @@ defmodule Derpex.Listener.Handler do
   defp continue_after_actions(socket, state, actions) do
     case execute_actions(socket, state, actions) do
       {:ok, state} -> {:continue, state}
-      {:error, {:admission, _reason}, state} -> {:close, state}
-      {:error, {:connection_close, _reason}, state} -> {:close, state}
-      {:error, reason, state} -> {:error, reason, state}
+      {:error, reason, state} -> close_or_error(reason, state)
     end
   end
+
+  # Shedding for a full usage spool is a capacity decision, not a fault: the
+  # connection closes cleanly and the drop is counted by admission. Any other
+  # usage failure is a fault worth a line in the log, but it still closes the
+  # connection rather than crash-reporting it.
+  defp close_or_error({kind, _reason}, state)
+       when kind in [:admission, :connection_close],
+       do: {:close, state}
+
+  defp close_or_error({:usage, :usage_spool_full}, state), do: {:close, state}
+  defp close_or_error({:rate_limit, :usage_spool_full}, state), do: {:close, state}
+
+  defp close_or_error({:usage, reason}, state) do
+    Logger.warning("closing a connection after a usage-accounting failure: #{inspect(reason)}")
+    {:close, state}
+  end
+
+  defp close_or_error(reason, state), do: {:error, reason, state}
 
   defp close_after_actions(socket, state, actions) do
     case execute_actions(socket, state, actions) do
@@ -553,9 +571,7 @@ defmodule Derpex.Listener.Handler do
       {:ok, session, actions} ->
         case execute_actions(socket, %{state | session: session}, actions) do
           {:ok, state} -> process_websocket_events(socket, state, rest)
-          {:error, {:admission, _reason}, state} -> {:close, state}
-          {:error, {:connection_close, _reason}, state} -> {:close, state}
-          {:error, reason, state} -> {:error, reason, state}
+          {:error, reason, state} -> close_or_error(reason, state)
         end
 
       {:close, session, _reason, actions} ->

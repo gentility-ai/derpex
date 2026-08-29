@@ -54,11 +54,11 @@ defmodule Derpex.UpstreamCoverageTest do
     end
   end
 
-  test "the ACME-dependent IP certificate rows are pending" do
+  test "only the ACME-dependent IP certificate rows and the prober plan are pending" do
     pending =
       rows() |> Enum.filter(&(&1.disposition == "pending")) |> Enum.map(& &1.name) |> Enum.sort()
 
-    assert pending == ["TestIPCertManager", "TestIPCertManagerNextProvider"]
+    assert pending == ["TestDerpProber", "TestIPCertManager", "TestIPCertManagerNextProvider"]
   end
 
   test "the send-freeze row points at the system test that ports it" do

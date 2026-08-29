@@ -23,10 +23,10 @@ a repository path that exists, and every `ported`, `black-box`, and
 | State | Count |
 | --- | ---: |
 | Total | 69 |
-| Ported | 52 |
+| Ported | 51 |
 | Black-box | 9 |
 | Differential | 2 |
-| Pending (release-blocking) | 2 |
+| Pending (release-blocking) | 3 |
 | Implementation-specific | 4 |
 
 | Area | Upstream test | Source | Disposition | Gate/notes |
@@ -95,7 +95,7 @@ a repository path that exists, and every `ported`, `black-box`, and
 | cmd/derper | `TestIPCertManager` | `cmd/derper/ipcert_test.go:328` | `pending` | upstream drives issuance against a fake ACME server; DERPEX has no RFC 8555 client (PLAN.md section 2.3), so only the self-signed issuer behind DERPEX_IP_CERT_ISSUER=self is wired |
 | cmd/derper | `TestIPCertManagerNextProvider` | `cmd/derper/ipcert_test.go:426` | `pending` | the `:next_provider` hook exists but has no production caller — nothing can supply a DNS hostname provider until the ACME client does — so the delegation test in test/derpex/certificates/ip_manager_test.exs exercises a test-only fixture and does not close this row; PLAN.md section 2.3 records ACME as pending |
 | cmd/derper | `TestCertModeIPCertsGating` | `cmd/derper/ipcert_test.go:448` | `ported` | ported certificate-mode/IP-host gating in test/derpex/certificates/mode_test.exs and the boot-time refusal of unimplemented modes in test/derpex/certificates/boot_test.exs |
-| DERP prober | `TestDerpProber` | `prober/derp_test.go:25` | `ported` | ported dynamic region filtering, probe inventory, and add/remove reconciliation in test/derpex/prober_test.exs |
+| DERP prober | `TestDerpProber` | `prober/derp_test.go:25` | `pending` | release-blocking mapping not yet implemented |
 | DERP prober | `TestRunDerpProbeNodePair` | `prober/derp_test.go:146` | `black-box` | upstream 100 MB transfer and 30-packet in-flight bound run through DERPEX with unchanged official clients in test/interop/go_client_test.exs |
 | DERP prober | `Test_packetsForSize` | `prober/derp_test.go:202` | `ported` | ported exact packet counts, total sizes, per-call randomness, and large-payload caching in test/derpex/prober_test.exs |
 | XDP | `TestXDP` | `derp/xdp/xdp_linux_test.go:274` | `implementation-specific` | separate Linux XDP path is not in the cmd/derper request path; the pinned oracle job in .github/workflows/ci.yml still runs upstream's own XDP package |

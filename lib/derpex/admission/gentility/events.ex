@@ -3,6 +3,8 @@ defmodule Derpex.Admission.Gentility.Events do
 
   use GenServer
 
+  require Logger
+
   alias Derpex.Admission.Gentility
   alias Derpex.Clock
 
@@ -12,6 +14,7 @@ defmodule Derpex.Admission.Gentility.Events do
   @default_backoff_ms 1_000
   @default_max_backoff_ms 30_000
   @default_max_reconciliation_records 10_000
+  @default_max_reconciliation_pages 64
   @default_max_reconciliation_bytes 8 * 1_024 * 1_024
   @max_cursor_bytes 256
   @max_revocation_bytes 4_096
@@ -57,10 +60,13 @@ defmodule Derpex.Admission.Gentility.Events do
       initial_backoff_ms: positive_option!(options, :backoff_ms, @default_backoff_ms),
       max_backoff_ms: positive_option!(options, :max_backoff_ms, @default_max_backoff_ms),
       max_reconciliation_records:
-        positive_option!(
-          options,
-          :max_reconciliation_records,
-          @default_max_reconciliation_records
+        reconciliation_record_bound(
+          positive_option!(
+            options,
+            :max_reconciliation_records,
+            @default_max_reconciliation_records
+          ),
+          Keyword.get(options, :controller, Gentility)
         ),
       max_reconciliation_bytes:
         positive_option!(
@@ -68,7 +74,15 @@ defmodule Derpex.Admission.Gentility.Events do
           :max_reconciliation_bytes,
           @default_max_reconciliation_bytes
         ),
+      max_reconciliation_pages:
+        positive_option!(
+          options,
+          :max_reconciliation_pages,
+          @default_max_reconciliation_pages
+        ),
       cursor: "",
+      page: 0,
+      reconciliation_pages: 0,
       mode: :reconcile,
       worker: nil,
       retry_timer: nil,
@@ -90,6 +104,7 @@ defmodule Derpex.Admission.Gentility.Events do
       retrying?: not is_nil(state.retry_timer),
       last_error: state.last_error,
       reconciliations: state.reconciliations,
+      reconciliation_pages: state.reconciliation_pages,
       revocations: state.revocations,
       early_timeouts: state.early_timeouts,
       worker_timeouts: state.worker_timeouts
@@ -163,6 +178,32 @@ defmodule Derpex.Admission.Gentility.Events do
     :ok
   end
 
+  # A page larger than the controller's revocation bound would be rejected whole
+  # on arrival, so the page size is capped by what the controller will accept.
+  defp reconciliation_record_bound(configured, controller) do
+    case controller_revocation_bound(controller) do
+      nil ->
+        configured
+
+      bound when bound < configured ->
+        Logger.warning(
+          "gentility reconciliation page size #{configured} exceeds the controller's " <>
+            "revocation bound #{bound}; using #{bound}"
+        )
+
+        bound
+
+      _within_bound ->
+        configured
+    end
+  end
+
+  defp controller_revocation_bound(controller) do
+    Gentility.stats(controller).max_revocations
+  catch
+    :exit, _unavailable -> nil
+  end
+
   defp start_worker(%{worker: nil, retry_timer: nil} = state) do
     parent = self()
     reference = make_ref()
@@ -202,10 +243,11 @@ defmodule Derpex.Admission.Gentility.Events do
 
   defp start_worker(state), do: state
 
-  defp invoke_adapter({module, options}, :reconcile, _cursor, _timeout),
-    do: module.reconcile(options)
+  defp invoke_adapter({module, options}, :reconcile, cursor, _timeout),
+    do: module.reconcile(reconcile_cursor(cursor), options)
 
-  defp invoke_adapter(module, :reconcile, _cursor, _timeout), do: module.reconcile([])
+  defp invoke_adapter(module, :reconcile, cursor, _timeout),
+    do: module.reconcile(reconcile_cursor(cursor), [])
 
   defp invoke_adapter({module, options}, :stream, cursor, timeout),
     do: module.next_revocation(cursor, timeout, options)
@@ -213,20 +255,25 @@ defmodule Derpex.Admission.Gentility.Events do
   defp invoke_adapter(module, :stream, cursor, timeout),
     do: module.next_revocation(cursor, timeout, [])
 
+  # A reconciliation pass starts from no cursor and continues from the cursor
+  # the previous page returned.
+  defp reconcile_cursor(""), do: nil
+  defp reconcile_cursor(cursor), do: cursor
+
   defp handle_result(%{mode: :reconcile} = state, {:ok, wires, cursor}, _elapsed_ms) do
-    with :ok <- valid_cursor(cursor),
+    with :ok <- valid_page_cursor(cursor),
          :ok <- valid_reconciliation(wires, state),
+         :ok <- within_page_bound(state),
          {:ok, _summary} <- Gentility.reconcile(state.controller, wires) do
       state = %{
         state
-        | cursor: cursor,
-          mode: :stream,
-          last_error: nil,
+        | last_error: nil,
           backoff_ms: state.initial_backoff_ms,
-          reconciliations: state.reconciliations + 1
+          page: state.page + 1,
+          reconciliation_pages: state.reconciliation_pages + 1
       }
 
-      start_worker(state)
+      start_worker(continue_reconciliation(state, cursor))
     else
       {:error, reason} -> fail_and_retry(state, normalize_error(reason))
     end
@@ -273,8 +320,31 @@ defmodule Derpex.Admission.Gentility.Events do
   defp handle_result(state, _invalid, _elapsed_ms),
     do: fail_and_retry(state, :invalid_adapter_response)
 
+  # A nil cursor ends the pass: streaming resumes from the last position the
+  # adapter gave, so an adapter returns its end position on the last page of
+  # records and then answers `{:ok, [], nil}`.
+  defp continue_reconciliation(state, nil) do
+    %{
+      state
+      | mode: :stream,
+        page: 0,
+        reconciliations: state.reconciliations + 1
+    }
+  end
+
+  defp continue_reconciliation(state, cursor), do: %{state | cursor: cursor}
+
+  defp within_page_bound(state) do
+    if state.page < state.max_reconciliation_pages,
+      do: :ok,
+      else: {:error, :reconciliation_too_long}
+  end
+
+  defp valid_page_cursor(nil), do: :ok
+  defp valid_page_cursor(cursor), do: valid_cursor(cursor)
+
   defp fail_and_retry(state, reason) do
-    state = %{state | mode: :reconcile, last_error: reason}
+    state = %{state | mode: :reconcile, page: 0, cursor: "", last_error: reason}
     schedule_retry(state)
   end
 

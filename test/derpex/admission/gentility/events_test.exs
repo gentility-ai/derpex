@@ -5,6 +5,7 @@ defmodule Derpex.Admission.Gentility.EventsTest do
   alias Derpex.Admission.Gentility.Contract
   alias Derpex.Admission.Gentility.Events
   alias Derpex.Admission.Gentility.Revocation
+  alias Derpex.Admission.Gentility.Signer
   alias Derpex.Clock.Manual
 
   @private_key :binary.copy(<<0x23>>, 32)
@@ -21,7 +22,7 @@ defmodule Derpex.Admission.Gentility.EventsTest do
     def export_usage(_id, _wire, _options), do: {:error, :unavailable}
 
     @impl true
-    def reconcile(agent), do: take(agent, :reconcile)
+    def reconcile(_cursor, agent), do: take(agent, :reconcile)
 
     @impl true
     def next_revocation(_cursor, _timeout, agent), do: take(agent, :stream)
@@ -40,7 +41,7 @@ defmodule Derpex.Admission.Gentility.EventsTest do
     @behaviour Derpex.Admission.Gentility.ControlPlane
     def authorize(_request, _options), do: {:error, :unavailable}
     def export_usage(_id, _wire, _options), do: {:error, :unavailable}
-    def reconcile(function), do: function.()
+    def reconcile(_cursor, function), do: function.()
     def next_revocation(_cursor, _timeout, _options), do: {:error, :unavailable}
   end
 
@@ -62,7 +63,11 @@ defmodule Derpex.Admission.Gentility.EventsTest do
     {:ok, adapter} =
       Agent.start_link(fn ->
         %{
-          reconcile: [{:ok, [first], "cursor-1"}, {:ok, [], "cursor-2"}],
+          reconcile: [
+            {:ok, [first], "cursor-1"},
+            {:ok, [], nil},
+            {:ok, [], nil}
+          ],
           stream: [{:ok, second, "cursor-2"}, {:error, :disconnected}]
         }
       end)
@@ -90,12 +95,104 @@ defmodule Derpex.Admission.Gentility.EventsTest do
     assert Events.stats(events).last_error == :adapter_unavailable
   end
 
+  test "pages a large reconciliation to completion before it starts streaming" do
+    parent = self()
+    count = 25_000
+    page_size = div(count, 3) + 1
+
+    pages =
+      1..count
+      |> Task.async_stream(
+        fn index -> signed_revocation(<<index::256>>, 10) end,
+        max_concurrency: System.schedulers_online(),
+        ordered: true,
+        timeout: 120_000
+      )
+      |> Enum.map(fn {:ok, wire} -> wire end)
+      |> Enum.chunk_every(page_size)
+
+    assert length(pages) == 3
+
+    responses =
+      pages
+      |> Enum.with_index(1)
+      |> Enum.map(fn {page, index} -> {:ok, page, "cursor-#{index}"} end)
+      |> Kernel.++([{:ok, [], nil}])
+
+    {:ok, adapter} =
+      Agent.start_link(fn ->
+        %{reconcile: responses, stream: [{:timeout, "cursor-3"}]}
+      end)
+
+    controller = start_controller(parent)
+
+    events =
+      start_supervised!(
+        {Events,
+         controller: controller,
+         adapter: {Adapter, adapter},
+         clock: Manual,
+         max_reconciliation_records: page_size,
+         backoff_ms: 100}
+      )
+
+    eventually(fn -> Events.stats(events).reconciliations == 1 end, 600)
+
+    stats = Events.stats(events)
+    assert stats.reconciliation_pages == 4
+    refute stats.reconciling?
+
+    # Streaming only begins once the pass ends, so a consumed stream response
+    # proves every page was applied first.
+    eventually(fn -> Agent.get(adapter, &length(&1.stream)) == 0 end, 600)
+    assert Gentility.stats(controller).revocations > 0
+  end
+
+  test "a reconciliation page larger than the controller accepts is capped at boot" do
+    parent = self()
+    wires = Enum.map(1..3, &signed_revocation(<<&1::256>>, 10))
+
+    {:ok, adapter} =
+      Agent.start_link(fn ->
+        %{reconcile: [{:ok, wires, nil}], stream: [{:timeout, "cursor"}]}
+      end)
+
+    controller =
+      start_supervised!(
+        {Gentility,
+         authority: fn _request -> {:error, :unavailable} end,
+         verification_keys: %{@key_id => @public_key},
+         clock: Manual,
+         max_revocations: 2,
+         close_peer: fn key -> send(parent, {:closed, key}) end}
+      )
+
+    log =
+      ExUnit.CaptureLog.capture_log(fn ->
+        events =
+          start_supervised!(
+            {Events,
+             controller: controller,
+             adapter: {Adapter, adapter},
+             clock: Manual,
+             max_reconciliation_records: 10,
+             backoff_ms: 50}
+          )
+
+        # The page the adapter offers is larger than the controller's bound, so
+        # it is refused here instead of being sent and rejected whole.
+        eventually(fn -> Events.stats(events).last_error == :invalid_reconciliation end)
+      end)
+
+    assert log =~ "exceeds the controller's revocation bound"
+  end
+
   test "invalid reconciliation fails closed and retries without applying any record" do
     parent = self()
     valid = signed_revocation(node_key(3), 10)
 
     {:ok, adapter} =
-      Agent.start_link(fn -> %{reconcile: [{:ok, [valid, "bad"], "cursor"}], stream: []} end)
+      Agent.start_link(fn -> %{reconcile: [{:ok, [valid, "bad"], nil}], stream: []} end)
 
     controller = start_controller(parent)
 
@@ -142,7 +239,7 @@ defmodule Derpex.Admission.Gentility.EventsTest do
     {:ok, adapter} =
       Agent.start_link(fn ->
         %{
-          reconcile: [{:ok, [], "cursor"}],
+          reconcile: [{:ok, [], nil}],
           stream: [{:timeout, "cursor"}, {:timeout, "cursor"}]
         }
       end)
@@ -211,7 +308,7 @@ defmodule Derpex.Admission.Gentility.EventsTest do
       reason: "disabled"
     }
 
-    {:ok, wire} = Contract.sign_revocation(revocation, @private_key)
+    {:ok, wire} = Signer.sign_revocation(revocation, @private_key)
     wire
   end
 

@@ -353,6 +353,7 @@ if config_env() == :prod do
             authority: adapter,
             verification_keys: verification_keys,
             cache_path: cache_path,
+            region_id: region_id,
             max_cache_entries: max_cache_entries,
             max_revocations: max_revocations,
             max_concurrent_requests: max_concurrent_requests,

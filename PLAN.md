@@ -303,6 +303,19 @@ fail-open or fail-closed:
 - cache size, durable state, clock skew, key rotation, and outage behavior are
   explicitly bounded and tested.
 
+The lease lifetime is the single number that bounds outage behavior. It is the
+worst-case window in which a revoked node can still connect when both push and
+reconciliation are unavailable, and it is how long the relay serves without
+Gentility. Leases backing live connections are re-authorized in the background
+at 80% of their lifetime, so an outage darkens the relay one lifetime after the
+last successful renewal rather than one lifetime after the outage begins; each
+connection closes a little before its own expiry, jittered, so a region does not
+reconnect in one burst. `nearest_lease_expiry_seconds` is exported for alerting
+because it is the only signal that precedes connection loss. Because every
+budget in a lease is enforced by the instance holding it, Gentility divides each
+intended organization and node limit by the number of instances that may serve
+it.
+
 Global organization limits must not introduce a synchronous control-plane call
 on the packet path. Gentility allocates versioned regional or instance budgets;
 DERPEX enforces those budgets locally and reports consumption in fixed windows.

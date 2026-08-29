@@ -124,8 +124,6 @@ defmodule Derpex.UpstreamInventory do
       "ported all challenge validity cases in test/derpex/http1_test.exs",
     {"cmd/derper/ipcert_test.go", "TestCertModeIPCertsGating"} =>
       "ported certificate-mode/IP-host gating in test/derpex/certificates/mode_test.exs and the boot-time refusal of unimplemented modes in test/derpex/certificates/boot_test.exs",
-    {"prober/derp_test.go", "TestDerpProber"} =>
-      "ported dynamic region filtering, probe inventory, and add/remove reconciliation in test/derpex/prober_test.exs",
     {"prober/derp_test.go", "Test_packetsForSize"} =>
       "ported exact packet counts, total sizes, per-call randomness, and large-payload caching in test/derpex/prober_test.exs"
   }
