@@ -1,7 +1,13 @@
 defmodule Derpex.HTTP1.Parser do
-  @moduledoc "Incremental, bounded HTTP/1 request-head parser."
+  @moduledoc """
+  Incremental, bounded HTTP/1 request-head parser.
+
+  Parsing is syntactic only; the semantic `Host` rules live in `Derpex.HTTP1.route/3`
+  so a rejection can answer with the status Go's `net/http` sends.
+  """
 
   alias Derpex.HTTP1.Request
+  alias Derpex.HTTP1.Scan
 
   @default_max_header_bytes 1 * 1_024 * 1_024
   @default_max_request_line_bytes 8 * 1_024
@@ -34,9 +40,10 @@ defmodule Derpex.HTTP1.Parser do
   @spec push(t(), binary()) ::
           {:more, t()} | {:ok, Request.t(), binary(), t()} | {:error, atom()}
   def push(%__MODULE__{} = parser, chunk) when is_binary(chunk) do
-    buffer = parser.buffer <> chunk
+    scanned = parser.buffer
+    buffer = scanned <> chunk
 
-    case :binary.match(buffer, "\r\n\r\n") do
+    case Scan.match_from(buffer, byte_size(scanned), "\r\n\r\n") do
       {head_length, 4} when head_length + 4 <= parser.max_header_bytes ->
         <<head::binary-size(^head_length), "\r\n\r\n", read_ahead::binary>> = buffer
 

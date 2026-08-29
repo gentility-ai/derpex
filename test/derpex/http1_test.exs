@@ -89,6 +89,130 @@ defmodule Derpex.HTTP1Test do
     assert IO.iodata_to_binary(response) =~ "Upgrade: DERP\r\n"
   end
 
+  test "closes a WebSocket that offers no exact derp subprotocol with a policy violation" do
+    key = Base.encode64(:binary.copy(<<7>>, 16))
+
+    # Upstream routes into websocket.Accept on a substring test, negotiates no
+    # subprotocol, then closes because Conn.Subprotocol() is not exactly "derp".
+    for offer <- ["notderp", "derp2", "derpx, notderp"] do
+      assert {:response, response} =
+               HTTP1.route(websocket_request(key, offer), @server_public)
+
+      response = IO.iodata_to_binary(response)
+      assert response =~ "HTTP/1.1 101 Switching Protocols\r\n"
+      refute response =~ "Sec-WebSocket-Protocol"
+
+      assert String.ends_with?(
+               response,
+               <<0x88, 40, 1008::unsigned-big-16>> <> "client must speak the derp subprotocol"
+             )
+    end
+  end
+
+  test "negotiates the exact derp subprotocol out of a comma separated offer" do
+    key = Base.encode64(:binary.copy(<<7>>, 16))
+
+    assert {:upgrade, :websocket, response, _metadata} =
+             HTTP1.route(websocket_request(key, "foo, derp"), @server_public)
+
+    assert IO.iodata_to_binary(response) =~ "Sec-WebSocket-Protocol: derp\r\n"
+  end
+
+  test "echoes the client spelling of a case-folded derp offer before rejecting it" do
+    key = Base.encode64(:binary.copy(<<7>>, 16))
+
+    assert {:response, response} =
+             HTTP1.route(websocket_request(key, "derpish, Derp"), @server_public)
+
+    response = IO.iodata_to_binary(response)
+    assert response =~ "Sec-WebSocket-Protocol: Derp\r\n"
+    assert response =~ "client must speak the derp subprotocol"
+  end
+
+  # Every expected byte string below was captured from a Go 1.27 http.Server
+  # answering the same raw request head.
+  test "answers each malformed Host exactly as Go net/http does" do
+    cases = [
+      {[], "GET", "400 Bad Request: missing required Host header"},
+      {[{"host", "a.example"}, {"host", "b.example"}], "GET", "400 Bad Request"},
+      {[{"host", "bad host"}], "GET", "400 Bad Request: malformed Host header"},
+      {[{"host", "bad\thost"}], "GET", "400 Bad Request: malformed Host header"},
+      {[{"host", "user@host"}], "GET", "400 Bad Request: malformed Host header"},
+      {[{"host", "bad host"}], "CONNECT", "400 Bad Request: malformed Host header"}
+    ]
+
+    for {headers, method, status} <- cases do
+      request = %Request{
+        method: method,
+        target: "/derp/probe",
+        version: "HTTP/1.1",
+        headers: headers
+      }
+
+      assert {:response, response} = HTTP1.route(request, @server_public)
+
+      assert IO.iodata_to_binary(response) ==
+               "HTTP/1.1 " <>
+                 status <>
+                 "\r\nContent-Type: text/plain; charset=utf-8\r\n" <>
+                 "Connection: close\r\n\r\n" <> status
+    end
+  end
+
+  test "accepts every Host shape Go net/http lets through" do
+    accepted = [
+      {"HTTP/1.1", "GET", [{"host", ""}], "HTTP/1.1 200 OK\r\n"},
+      {"HTTP/1.1", "GET", [{"host", "h.example:8443"}], "HTTP/1.1 200 OK\r\n"},
+      {"HTTP/1.1", "GET", [{"host", "bad_host"}], "HTTP/1.1 200 OK\r\n"},
+      {"HTTP/1.0", "GET", [], "HTTP/1.1 200 OK\r\n"},
+      # CONNECT is exempt from the Host requirement, so it reaches the probe
+      # handler and is turned away there on method rather than on Host.
+      {"HTTP/1.1", "CONNECT", [], "HTTP/1.1 405 Method Not Allowed\r\n"}
+    ]
+
+    for {version, method, headers, status_line} <- accepted do
+      request = %Request{
+        method: method,
+        target: "/derp/probe",
+        version: version,
+        headers: headers
+      }
+
+      assert {:response, response} = HTTP1.route(request, @server_public)
+      assert IO.iodata_to_binary(response) =~ status_line
+    end
+  end
+
+  test "negotiates a derp token carried by a second subprotocol header" do
+    key = Base.encode64(:binary.copy(<<7>>, 16))
+
+    request =
+      request("GET", "/derp", [
+        {"upgrade", "websocket"},
+        {"connection", "Upgrade"},
+        {"sec-websocket-version", "13"},
+        {"sec-websocket-key", key},
+        {"sec-websocket-protocol", "derpx"},
+        {"sec-websocket-protocol", "derp"}
+      ])
+
+    assert {:upgrade, :websocket, response, _metadata} = HTTP1.route(request, @server_public)
+
+    response = IO.iodata_to_binary(response)
+    assert response =~ "Sec-WebSocket-Protocol: derp\r\n"
+    refute response =~ "client must speak the derp subprotocol"
+  end
+
+  defp websocket_request(key, subprotocol) do
+    request("GET", "/derp", [
+      {"upgrade", "websocket"},
+      {"connection", "Upgrade"},
+      {"sec-websocket-version", "13"},
+      {"sec-websocket-key", key},
+      {"sec-websocket-protocol", subprotocol}
+    ])
+  end
+
   test "requires an upgrade on other DERP paths" do
     assert {:response, response} = HTTP1.route(request("GET", "/derp/sdf"), @server_public)
     response = IO.iodata_to_binary(response)
@@ -250,6 +374,11 @@ defmodule Derpex.HTTP1Test do
   end
 
   defp request(method, path, headers \\ []) do
+    headers =
+      if List.keymember?(headers, "host", 0),
+        do: headers,
+        else: [{"host", "derp.example"} | headers]
+
     %Request{method: method, target: path, version: "HTTP/1.1", headers: headers}
   end
 end

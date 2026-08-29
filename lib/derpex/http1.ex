@@ -12,6 +12,14 @@ defmodule Derpex.HTTP1 do
   alias Derpex.HTTP1.Request
   alias Derpex.HTTP1.Response
   alias Derpex.Operations
+  alias Derpex.WebSocket.Frame
+
+  @subprotocol_violation "client must speak the derp subprotocol"
+  @policy_violation_status 1008
+  @error_headers "\r\nContent-Type: text/plain; charset=utf-8\r\nConnection: close\r\n\r\n"
+
+  # httpguts.ValidHostHeader's byte set, minus the alphanumerics handled by range.
+  @host_punctuation ~c"!$%&'()*+,-.:;=[]_~"
 
   @doc "Routes a parsed request without consuming bytes read past its headers."
   @spec route(Request.t(), binary(), keyword()) ::
@@ -19,10 +27,48 @@ defmodule Derpex.HTTP1 do
           | {:stream, :debug_traffic, iodata(), keyword()}
           | {:response, iodata()}
   def route(%Request{} = request, server_public_key, options \\ []) do
-    request
-    |> Request.path()
-    |> route_path(request, server_public_key, options)
+    case host_error(request) do
+      nil ->
+        request
+        |> Request.path()
+        |> route_path(request, server_public_key, options)
+
+      error ->
+        reject_host(error)
+    end
   end
+
+  # Go's net/http validates Host while reading the head, before any handler
+  # runs. Duplicates are rejected first, then a missing Host on HTTP/1.1
+  # (CONNECT excepted), then a value outside ValidHostHeader's byte set. An
+  # empty Host value is a present header and stays legal.
+  defp host_error(%Request{} = request) do
+    case Request.header_values(request, "host") do
+      [host] -> if valid_host?(host), do: nil, else: :malformed
+      [] -> if host_mandatory?(request), do: :missing, else: nil
+      _duplicates -> :too_many
+    end
+  end
+
+  defp host_mandatory?(%Request{version: "HTTP/1.1", method: method}), do: method != "CONNECT"
+  defp host_mandatory?(%Request{}), do: false
+
+  defp valid_host?(<<>>), do: true
+
+  defp valid_host?(<<byte, rest::binary>>)
+       when byte in ?0..?9 or byte in ?A..?Z or byte in ?a..?z or byte in @host_punctuation do
+    valid_host?(rest)
+  end
+
+  defp valid_host?(_host), do: false
+
+  # Byte-for-byte the responses Go's conn.serve writes for these three errors:
+  # the first two carry a statusError suffix, "too many Host headers" does not.
+  defp reject_host(:missing), do: host_status("400 Bad Request: missing required Host header")
+  defp reject_host(:malformed), do: host_status("400 Bad Request: malformed Host header")
+  defp reject_host(:too_many), do: host_status("400 Bad Request")
+
+  defp host_status(status), do: {:response, ["HTTP/1.1 ", status, @error_headers, status]}
 
   defp route_path(path, request, _server_public_key, _options)
        when path in ["/derp/probe", "/derp/latency-check"],
@@ -292,11 +338,14 @@ defmodule Derpex.HTTP1 do
     {:upgrade, :derp, response, upgrade_metadata(request)}
   end
 
+  # Upstream picks the WebSocket path on a case-sensitive substring test, then
+  # lets coder/websocket negotiate one exact (case-insensitive) token out of the
+  # offer. Anything else stays on the legacy native-DERP path.
   defp websocket_or_legacy_upgrade(request, server_public_key) do
     case Request.header(request, "sec-websocket-protocol") do
       protocols when is_binary(protocols) ->
         if String.contains?(protocols, "derp") do
-          websocket_upgrade(request)
+          websocket_upgrade(request, negotiated_subprotocol(request))
         else
           native_upgrade(request, server_public_key)
         end
@@ -306,7 +355,17 @@ defmodule Derpex.HTTP1 do
     end
   end
 
-  defp websocket_upgrade(request) do
+  # The path gate above reads only the first header value, as Go's Header.Get
+  # does, but negotiation unions the tokens of every value like headerTokens.
+  defp negotiated_subprotocol(request) do
+    request
+    |> Request.header_values("sec-websocket-protocol")
+    |> Enum.flat_map(&String.split(&1, ","))
+    |> Enum.map(&String.trim/1)
+    |> Enum.find(&(String.downcase(&1, :ascii) == "derp"))
+  end
+
+  defp websocket_upgrade(request, subprotocol) do
     with true <- request.method == "GET",
          true <- connection_upgrade?(Request.header(request, "connection")),
          "13" <- Request.header(request, "sec-websocket-version"),
@@ -314,23 +373,37 @@ defmodule Derpex.HTTP1 do
          {:ok, decoded_key} <- Base.decode64(key),
          true <- byte_size(decoded_key) == 16 do
       accept = Base.encode64(:crypto.hash(:sha, key <> "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"))
+      handshake = websocket_handshake(accept, subprotocol)
 
-      response = [
-        "HTTP/1.1 101 Switching Protocols\r\n",
-        "Upgrade: websocket\r\n",
-        "Connection: Upgrade\r\n",
-        "Sec-WebSocket-Accept: ",
-        accept,
-        "\r\n",
-        "Sec-WebSocket-Protocol: derp\r\n\r\n"
-      ]
-
-      {:upgrade, :websocket, response, upgrade_metadata(request)}
+      # Upstream compares the negotiated subprotocol to "derp" byte for byte
+      # after the handshake, so a near miss gets a 101 and then a close.
+      if subprotocol == "derp" do
+        {:upgrade, :websocket, handshake, upgrade_metadata(request)}
+      else
+        {:response,
+         [handshake, Frame.encode_close(@policy_violation_status, @subprotocol_violation)]}
+      end
     else
       _invalid ->
         {:response, Response.encode(400, [], "Bad Request\n")}
     end
   end
+
+  defp websocket_handshake(accept, subprotocol) do
+    [
+      "HTTP/1.1 101 Switching Protocols\r\n",
+      "Upgrade: websocket\r\n",
+      "Connection: Upgrade\r\n",
+      "Sec-WebSocket-Accept: ",
+      accept,
+      "\r\n",
+      subprotocol_header(subprotocol),
+      "\r\n"
+    ]
+  end
+
+  defp subprotocol_header(nil), do: []
+  defp subprotocol_header(subprotocol), do: ["Sec-WebSocket-Protocol: ", subprotocol, "\r\n"]
 
   defp connection_upgrade?(nil), do: false
 

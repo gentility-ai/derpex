@@ -40,6 +40,11 @@ defmodule Derpex.WebSocket.Frame do
   @spec encode_pong(binary()) :: binary()
   def encode_pong(payload) when byte_size(payload) <= 125, do: encode(0xA, payload)
 
+  @doc "Encodes one unmasked server close control message."
+  @spec encode_close(0..65_535, binary()) :: binary()
+  def encode_close(status, reason \\ "") when byte_size(reason) <= 123,
+    do: encode(0x8, <<status::unsigned-big-16, reason::binary>>)
+
   defp parse(state, events) do
     case decode_frame(state.buffer, state.max_message_length) do
       :more ->

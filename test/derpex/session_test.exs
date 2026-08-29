@@ -12,7 +12,10 @@ defmodule Derpex.SessionTest do
     {client_public, client_private} = Crypto.generate_keypair()
     client_info = %ClientInfo{version: 2}
     {:ok, client_frame} = Handshake.client_info_frame(client_private, server_public, client_info)
-    request = "GET /derp HTTP/1.1\r\nUpgrade: DERP\r\nConnection: Upgrade\r\n\r\n"
+
+    request =
+      "GET /derp HTTP/1.1\r\nHost: derp.example\r\nUpgrade: DERP\r\nConnection: Upgrade\r\n\r\n"
+
     {:ok, session, [{:set_timeout, :http, 10_000}]} = Session.new(server_private)
 
     assert {:ok, session, actions} =
@@ -45,7 +48,8 @@ defmodule Derpex.SessionTest do
       Handshake.client_info_frame(client_private, server_public, %ClientInfo{version: 2})
 
     request =
-      "GET /derp HTTP/1.1\r\nUpgrade: DERP\r\nConnection: Upgrade\r\nDerp-Fast-Start: 1\r\n\r\n"
+      "GET /derp HTTP/1.1\r\nHost: derp.example\r\n" <>
+        "Upgrade: DERP\r\nConnection: Upgrade\r\nDerp-Fast-Start: 1\r\n\r\n"
 
     {:ok, session, _actions} = Session.new(server_private)
 
@@ -62,7 +66,10 @@ defmodule Derpex.SessionTest do
     {:ok, session, _actions} = Session.new(server_private)
 
     assert {:close, session, :http_response, [{:cancel_timeout, :http}, {:send, response}]} =
-             Session.receive_data(session, "GET /derp/probe HTTP/1.1\r\n\r\n")
+             Session.receive_data(
+               session,
+               "GET /derp/probe HTTP/1.1\r\nHost: derp.example\r\n\r\n"
+             )
 
     assert IO.iodata_to_binary(response) =~ "200 OK"
     assert Session.info(session).phase == :closed
@@ -81,7 +88,11 @@ defmodule Derpex.SessionTest do
               {:cancel_timeout, :http},
               {:send, response},
               {:start_debug_traffic, [interval_ms: 25]}
-            ]} = Session.receive_data(session, "GET /debug/traffic HTTP/1.1\r\n\r\n")
+            ]} =
+             Session.receive_data(
+               session,
+               "GET /debug/traffic HTTP/1.1\r\nHost: derp.example\r\n\r\n"
+             )
 
     assert IO.iodata_to_binary(response) =~ "Transfer-Encoding: chunked"
     assert Session.info(session).phase == :debug_traffic
@@ -94,6 +105,7 @@ defmodule Derpex.SessionTest do
 
     request =
       "GET /derp HTTP/1.1\r\n" <>
+        "Host: derp.example\r\n" <>
         "Upgrade: websocket\r\n" <>
         "Connection: Upgrade\r\n" <>
         "Sec-WebSocket-Version: 13\r\n" <>
