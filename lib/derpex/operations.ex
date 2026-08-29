@@ -298,7 +298,8 @@ defmodule Derpex.Operations do
       aggregate_entries: "derpex_gentility_usage_aggregate_entries",
       aggregate_windows: "derpex_gentility_usage_aggregate_windows",
       blocked?: "derpex_gentility_usage_blocked",
-      exporting?: "derpex_gentility_usage_exporting"
+      exporting?: "derpex_gentility_usage_exporting",
+      dropped_rows: "derpex_gentility_usage_dropped_rows"
     }
 
     merge_values(metrics, usage, names)
@@ -313,7 +314,8 @@ defmodule Derpex.Operations do
       active_organizations: "derpex_gentility_active_organizations",
       active_requests: "derpex_gentility_active_requests",
       max_cache_entries: "derpex_gentility_max_cache_entries",
-      max_revocations: "derpex_gentility_max_revocations"
+      max_revocations: "derpex_gentility_max_revocations",
+      cache_full: "derpex_gentility_cache_full"
     }
 
     metrics

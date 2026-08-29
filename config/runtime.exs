@@ -211,6 +211,16 @@ if config_env() == :prod do
         ]
       end
 
+    parse_bounded_integer = fn name, default, minimum, maximum ->
+      case Integer.parse(System.get_env(name, Integer.to_string(default))) do
+        {value, ""} when value >= minimum and value <= maximum ->
+          value
+
+        _invalid ->
+          raise "#{name} must be an integer from #{minimum} through #{maximum}"
+      end
+    end
+
     gentility =
       case gentility_adapter_text do
         nil ->
@@ -292,10 +302,47 @@ if config_env() == :prod do
               do: nil,
               else: [adapter: adapter]
 
+          max_cache_entries =
+            parse_bounded_integer.("DERPEX_GENTILITY_MAX_CACHE_ENTRIES", 100_000, 1, 100_000_000)
+
+          max_revocations =
+            parse_bounded_integer.("DERPEX_GENTILITY_MAX_REVOCATIONS", 10_000, 1, 100_000_000)
+
+          max_concurrent_requests =
+            parse_bounded_integer.("DERPEX_GENTILITY_MAX_CONCURRENT_REQUESTS", 64, 1, 65_535)
+
+          authority_timeout =
+            parse_bounded_integer.(
+              "DERPEX_GENTILITY_AUTHORITY_TIMEOUT_MS",
+              2_000,
+              1,
+              0xFFFF_FFFF
+            )
+
+          max_lease_ms =
+            parse_bounded_integer.("DERPEX_GENTILITY_MAX_LEASE_MS", 900_000, 1, 0xFFFF_FFFF)
+
+          max_future_skew_ms =
+            parse_bounded_integer.("DERPEX_GENTILITY_MAX_FUTURE_SKEW_MS", 30_000, 0, 0xFFFF_FFFF)
+
+          max_byte_delay_ms =
+            parse_bounded_integer.("DERPEX_GENTILITY_MAX_BYTE_DELAY_MS", 30_000, 1, 0xFFFF_FFFF)
+
+          cache_persist_ms =
+            parse_bounded_integer.("DERPEX_GENTILITY_CACHE_PERSIST_MS", 5_000, 1, 0xFFFF_FFFF)
+
           [
             authority: adapter,
             verification_keys: verification_keys,
             cache_path: cache_path,
+            max_cache_entries: max_cache_entries,
+            max_revocations: max_revocations,
+            max_concurrent_requests: max_concurrent_requests,
+            authority_timeout: authority_timeout,
+            max_lease_ms: max_lease_ms,
+            max_future_skew_ms: max_future_skew_ms,
+            max_byte_delay_ms: max_byte_delay_ms,
+            cache_persist_ms: cache_persist_ms,
             usage: [
               instance_id: instance_id,
               region_id: region_id,
