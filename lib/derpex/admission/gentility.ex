@@ -385,7 +385,7 @@ defmodule Derpex.Admission.Gentility do
 
   def handle_call({:reconcile, wires}, _from, state) do
     case verify_revocations(wires, state.verification_keys, state.max_revocations) do
-      {:ok, revocations} -> apply_reconciliation(state, revocations)
+      {:ok, revocations} -> apply_reconciliation(%{state | journal_error: nil}, revocations)
       {:error, _reason} = error -> {:reply, error, state}
     end
   end
@@ -418,9 +418,12 @@ defmodule Derpex.Admission.Gentility do
   def handle_info({__MODULE__, :renewed, pid, node_key, result}, state) do
     state = finish_renewal(state, pid)
 
+    # The slot this renewal held is free again, so the next lease waiting on one
+    # goes out now rather than at the next tick.
     state =
       state
       |> apply_renewal(node_key, result)
+      |> renew_due()
       |> reschedule_timers()
 
     {:noreply, state}
@@ -458,7 +461,14 @@ defmodule Derpex.Admission.Gentility do
       match?(%{monitor: ^monitor}, state.renewals[pid]) ->
         node_key = state.renewals[pid].node_key
         state = finish_renewal(%{state | renewals: Map.delete(state.renewals, pid)}, nil)
-        {:noreply, state |> requeue_renewal_for(node_key) |> reschedule_renewal()}
+
+        state =
+          state
+          |> requeue_renewal_for(node_key)
+          |> renew_due()
+          |> reschedule_renewal()
+
+        {:noreply, state}
 
       match?(%{monitor: ^monitor}, state.claims[pid]) ->
         {:noreply, release_connection(state, pid, false)}
@@ -609,6 +619,7 @@ defmodule Derpex.Admission.Gentility do
          renewal_token: nil,
          renewal_retry_ms: renewal_retry_ms,
          renewals: %{},
+         renewal_stalled?: false,
          expiry_jitter: expiry_jitter,
          authorize_counts: %{},
          close_peer_counts: %{},
@@ -621,6 +632,7 @@ defmodule Derpex.Admission.Gentility do
          expiry_token: nil,
          load_error: nil,
          persist_error: nil,
+         journal_error: nil,
          registered?: is_atom(server),
          usage: usage
        }}
@@ -1006,10 +1018,15 @@ defmodule Derpex.Admission.Gentility do
     end
   end
 
+  # A revocation is applied in memory whatever the disk does — the node is closed
+  # and stays denied — but the answer says whether it survived a restart. A
+  # control plane told `:applied` may stop replaying it, so it is only told that
+  # once the record is durable.
   defp apply_one_revocation(state, wire, revocation) do
-    case revoke_record(state, wire, revocation) do
+    case revoke_record(%{state | journal_error: nil}, wire, revocation) do
       {:stale, state} -> {:reply, {:ok, :stale}, state}
-      {_covered_or_uncovered, state} -> {:reply, {:ok, :applied}, state}
+      {_applied, %{journal_error: nil} = state} -> {:reply, {:ok, :applied}, state}
+      {_applied, state} -> {:reply, {:error, :not_durable}, state}
     end
   end
 
@@ -1058,7 +1075,12 @@ defmodule Derpex.Admission.Gentility do
         else: state
 
     state = state |> mark_cache_dirty() |> reschedule_timers()
-    {:reply, {:ok, %{applied: applied, stale: stale}}, state}
+
+    if state.journal_error do
+      {:reply, {:error, :not_durable}, state}
+    else
+      {:reply, {:ok, %{applied: applied, stale: stale}}, state}
+    end
   end
 
   defp reconcile_revocation({wire, revocation}, {state, applied, stale, close_keys}) do
@@ -1638,7 +1660,7 @@ defmodule Derpex.Admission.Gentility do
   # cached lease costs nothing to re-authorize on the node's next connection,
   # and renewing the whole cache would put the fleet's reconnection load on
   # Gentility continuously.
-  defp renew_due(state), do: renew_due(state, @renewal_chunk)
+  defp renew_due(state), do: renew_due(%{state | renewal_stalled?: false}, @renewal_chunk)
 
   # A cache loaded from disk can have every lease past its renewal time at once.
   # The sweep takes a bounded number per message and leaves the rest due, which
@@ -1655,12 +1677,19 @@ defmodule Derpex.Admission.Gentility do
 
       if renew_at_ms <= now do
         state = %{state | by_renewal: :gb_trees.delete_any(key, state.by_renewal)}
-        renew_due(start_renewal(state, node_key, key), remaining - 1)
+        continue_renewals(start_renewal(state, node_key, key), remaining)
       else
         state
       end
     end
   end
+
+  # Losing the race for a slot is not a failure to renew: the lease keeps its
+  # place at the head of the queue and goes out the moment a slot frees. Only an
+  # authority that actually answered badly is pushed back by the retry interval.
+  defp continue_renewals(%{renewal_stalled?: true} = state, _remaining), do: state
+
+  defp continue_renewals(state, remaining), do: renew_due(state, remaining - 1)
 
   defp start_renewal(state, node_key, key) do
     entry = state.leases[node_key]
@@ -1699,7 +1728,11 @@ defmodule Derpex.Admission.Gentility do
         %{state | renewals: Map.put(state.renewals, pid, renewal)}
 
       {:error, :admission_overloaded} ->
-        requeue_renewal(state, node_key, entry)
+        %{
+          state
+          | renewal_stalled?: true,
+            by_renewal: :gb_trees.enter(renewal_key(node_key, entry), true, state.by_renewal)
+        }
     end
   end
 
@@ -1807,6 +1840,8 @@ defmodule Derpex.Admission.Gentility do
   end
 
   defp reschedule_timers(state), do: state |> reschedule_expiry() |> reschedule_renewal()
+
+  defp reschedule_renewal(%{renewal_stalled?: true} = state), do: cancel_renewal(state)
 
   defp reschedule_renewal(state) do
     state = cancel_renewal(state)
@@ -1957,11 +1992,11 @@ defmodule Derpex.Admission.Gentility do
   defp journal_revocations(state, wires) do
     case CacheWriter.append_revocations(state.cache_writer, wires, @cache_write_timeout_ms) do
       :ok ->
-        %{state | persist_error: nil}
+        %{state | persist_error: nil, journal_error: nil}
 
       {:error, reason} ->
         log_event(
-          %{state | persist_error: reason},
+          %{state | persist_error: reason, journal_error: reason},
           :cache_persist_error,
           "gentility could not make a revocation durable: #{inspect(reason)}"
         )

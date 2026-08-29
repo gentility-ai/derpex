@@ -75,7 +75,8 @@ defmodule Derpex.Admission.Gentility.CacheWriter do
          table: table,
          pending?: false,
          journal: nil,
-         appended: 0
+         appended: 0,
+         journalled: 0
        }}
     else
       {:stop, :invalid_cache_writer}
@@ -87,7 +88,8 @@ defmodule Derpex.Admission.Gentility.CacheWriter do
 
   @impl GenServer
   def handle_call(:write, _from, state) do
-    {:reply, write_snapshot(state), %{state | pending?: false}}
+    {result, state} = write_snapshot(state)
+    {:reply, result, %{state | pending?: false}}
   end
 
   def handle_call({:append, wires}, _from, state) do
@@ -107,7 +109,8 @@ defmodule Derpex.Admission.Gentility.CacheWriter do
   def handle_info(:flush, %{pending?: false} = state), do: {:noreply, state}
 
   def handle_info(:flush, state) do
-    send(state.owner, {__MODULE__, :write_result, write_snapshot(state)})
+    {result, state} = write_snapshot(state)
+    send(state.owner, {__MODULE__, :write_result, result})
     {:noreply, %{state | pending?: false}}
   end
 
@@ -119,18 +122,41 @@ defmodule Derpex.Admission.Gentility.CacheWriter do
   end
 
   # The journal only has to cover revocations the last snapshot missed, so it is
-  # rewritten from the live record set once it has grown past what a snapshot
-  # would hold anyway.
-  defp compact(%{appended: appended} = state) when appended <= @journal_compaction_floor,
-    do: state
-
+  # rewritten from the live record set once it has appended more than that set is
+  # worth. The threshold follows the size of the set: a relay holding fifty
+  # thousand revocations must not rewrite the journal on every append.
   defp compact(state) do
+    if state.appended > compaction_threshold(state) do
+      rewrite(state)
+    else
+      state
+    end
+  end
+
+  defp compaction_threshold(state),
+    do: max(2 * state.journalled, @journal_compaction_floor)
+
+  defp rewrite(state) do
     {_leases, revocations} = snapshot(state.table)
 
     case Cache.compact_journal(state.path, revocations) do
       {:ok, journal} ->
         Cache.close_journal(state.journal)
-        %{state | journal: journal, appended: length(revocations)}
+        %{state | journal: journal, appended: 0, journalled: length(revocations)}
+
+      {:error, _reason} ->
+        close(state)
+    end
+  end
+
+  # A snapshot carries every revocation the journal held, so the journal starts
+  # over: it exists only to cover what the newest snapshot has not yet recorded.
+  # Appends run in this process too, so nothing can slip between the two.
+  defp truncate_journal(state) do
+    case Cache.compact_journal(state.path, []) do
+      {:ok, journal} ->
+        Cache.close_journal(state.journal)
+        %{state | journal: journal, appended: 0, journalled: 0}
 
       {:error, _reason} ->
         close(state)
@@ -147,12 +173,16 @@ defmodule Derpex.Admission.Gentility.CacheWriter do
 
   defp close(state) do
     Cache.close_journal(state.journal)
-    %{state | journal: nil, appended: 0}
+    %{state | journal: nil, appended: 0, journalled: 0}
   end
 
   defp write_snapshot(state) do
     {leases, revocations} = snapshot(state.table)
-    Cache.write(state.path, Cache.encode(leases, revocations))
+
+    case Cache.write(state.path, Cache.encode(leases, revocations)) do
+      :ok -> {:ok, truncate_journal(state)}
+      {:error, _reason} = error -> {error, state}
+    end
   end
 
   # The table is an ordered set, so folding from the right yields both record

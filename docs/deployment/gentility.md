@@ -158,9 +158,23 @@ Revocations are never deferred, and they do not wait for a snapshot of every
 cached lease either. Each one is appended to a small journal beside the
 snapshot — `<cache path>.revocations` — and flushed before the call returns, so
 a revocation is durable by the time Gentility is told it was applied and that
-cost does not grow with the size of the lease cache. The journal is rewritten
-from the live record set once it outgrows what a snapshot would hold, and a
-torn final record after a crash costs that record and nothing else.
+cost does not grow with the size of the lease cache. The journal is rewritten from the live record set
+once it has appended more than twice what that set holds, so a relay carrying
+tens of thousands of revocations does not rewrite it on every append, and it is
+truncated the moment a snapshot subsumes it. A torn final record after a crash
+costs that record and nothing else.
+
+The journal is created inside a `0700` directory and narrowed to `0600` before
+a record reaches it, and a path that is not a regular file is refused rather
+than appended to. If a revocation cannot be made durable, `revoke/2` and
+`reconcile/2` answer `{:error, :not_durable}`: the node is still closed and
+still denied in memory, but a control plane that was told `:applied` might stop
+replaying it, so it is never told that on a lost record.
+
+When a journal holds more records than `DERPEX_GENTILITY_MAX_REVOCATIONS`, the
+**newest** are the ones recovered. A running relay evicts its oldest revocation
+when the table is full, so recovering the oldest would resurrect exactly the
+nodes it had already decided it could forget.
 Verification-key rotation still flushes a full snapshot when its sweep
 completes.
 

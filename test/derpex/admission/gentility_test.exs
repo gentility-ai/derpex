@@ -464,6 +464,61 @@ defmodule Derpex.Admission.GentilityTest do
     Process.exit(connection, :kill)
   end
 
+  @tag timeout: 600_000
+  test "renews a whole fleet that came due together before any lease expires" do
+    parent = self()
+    count = 2_000
+    lifetime = 900_000
+
+    controller =
+      start_controller(
+        authority: fn request ->
+          now = Manual.system_time(:millisecond)
+
+          {:ok,
+           signed_lease(request.node_key,
+             issued_at_ms: now,
+             expires_at_ms: now + lifetime,
+             organization_connection_limit: 1_000_000
+           )}
+        end,
+        max_lease_ms: lifetime,
+        max_concurrent_requests: 64,
+        max_cache_entries: 100_000,
+        renewal_retry_ms: 60_000,
+        close_peer: fn key -> send(parent, {:closed, key}) end
+      )
+
+    policy = Gentility.policy(controller)
+
+    connections =
+      Enum.map(1..count, fn index ->
+        node_key = <<index::256>>
+        {:ok, context} = Gentility.authorize(request(node_key), policy)
+        connection = spawn(fn -> Process.sleep(:infinity) end)
+        assert {:ok, ^context} = Gentility.claim(request(node_key), context, connection, policy)
+        connection
+      end)
+
+    # Every lease comes due at once, as a fleet that reconnected together does.
+    # Renewal concurrency is capped, so this only finishes if a completed
+    # renewal hands its slot to the next lease waiting rather than pushing it a
+    # retry interval away.
+    Manual.advance(div(lifetime * 4, 5) + 100)
+
+    eventually(
+      fn -> Gentility.stats(controller).renewals_in_flight == 0 end,
+      2_000
+    )
+
+    # Past the original expiry: not one lease was left behind.
+    Manual.advance(div(lifetime, 5) + 1_000)
+    refute_receive {:closed, _key}, 200
+    assert Gentility.stats(controller).cache_entries == count
+
+    Enum.each(connections, &Process.exit(&1, :kill))
+  end
+
   test "a failed renewal keeps serving the lease until it expires" do
     parent = self()
     node_key = node_key(41)
@@ -1066,6 +1121,107 @@ defmodule Derpex.Admission.GentilityTest do
     aside = Path.wildcard(Path.join(tmp_dir, "usage.spool.corrupt-*"))
     assert [kept] = aside
     assert File.read!(kept) == :binary.copy(<<0xEE>>, 19)
+  end
+
+  @tag :tmp_dir
+  test "creates the revocation journal privately", %{tmp_dir: tmp_dir} do
+    node_key = node_key(75)
+    directory = Path.join(tmp_dir, "state")
+    path = Path.join(directory, "admission.cache")
+
+    controller =
+      start_controller(
+        authority: fn request -> {:ok, signed_lease(request.node_key)} end,
+        cache_path: path
+      )
+
+    assert {:ok, _context} = Gentility.authorize(request(node_key), Gentility.policy(controller))
+    assert Gentility.revoke(controller, signed_revocation(node_key, 10)) == {:ok, :applied}
+
+    journal = Cache.journal_path(path)
+    assert {:ok, stat} = File.stat(journal)
+    assert Bitwise.band(stat.mode, 0o777) == 0o600
+    assert {:ok, directory_stat} = File.stat(directory)
+    assert Bitwise.band(directory_stat.mode, 0o777) == 0o700
+  end
+
+  @tag :tmp_dir
+  test "says so when a revocation cannot be made durable", %{tmp_dir: tmp_dir} do
+    node_key = node_key(76)
+    path = Path.join(tmp_dir, "admission.cache")
+
+    # The journal path is not a regular file, so it must not be appended to.
+    :ok = File.mkdir_p!(Cache.journal_path(path))
+
+    controller =
+      start_controller(
+        authority: fn request -> {:ok, signed_lease(request.node_key)} end,
+        cache_path: path,
+        close_peer: fn _key -> 0 end
+      )
+
+    assert {:ok, _context} = Gentility.authorize(request(node_key), Gentility.policy(controller))
+
+    log =
+      ExUnit.CaptureLog.capture_log(fn ->
+        assert Gentility.revoke(controller, signed_revocation(node_key, 10)) ==
+                 {:error, :not_durable}
+      end)
+
+    assert log =~ "could not make a revocation durable"
+
+    # The node is still denied: durability failed, the decision did not.
+    assert Gentility.stats(controller).revocations == 1
+    assert Gentility.stats(controller).cache_entries == 0
+  end
+
+  @tag :tmp_dir
+  test "a crash keeps the newest revocations, not the oldest", %{tmp_dir: tmp_dir} do
+    path = Path.join(tmp_dir, "admission.cache")
+    maximum = 20
+    count = 100
+
+    controller =
+      start_supervised!(
+        {Gentility,
+         [
+           authority: fn _request -> {:error, :unavailable} end,
+           verification_keys: %{@signing_key_id => @public_key},
+           clock: Manual,
+           max_lease_ms: 1_000,
+           max_future_skew_ms: 0,
+           max_revocations: maximum,
+           cache_path: path,
+           cache_persist_ms: 3_600_000,
+           close_peer: fn _key -> 0 end
+         ]}
+      )
+
+    for index <- 1..count do
+      assert {:ok, :applied} =
+               Gentility.revoke(controller, signed_revocation(<<index::256>>, 10, 1_000 + index))
+    end
+
+    assert Gentility.stats(controller).revocations == maximum
+
+    # A hard kill leaves only what was made durable as it went.
+    Process.exit(controller, :kill)
+
+    assert {:ok, {_leases, wires}} = Cache.load(path, 100_000, maximum)
+
+    recovered =
+      wires
+      |> Enum.map(fn wire ->
+        {:ok, %{node_key: <<index::256>>}} =
+          Contract.verify_revocation(wire, %{@signing_key_id => @public_key})
+
+        index
+      end)
+      |> Enum.sort()
+
+    # The running relay had already evicted the oldest; recovery must not bring
+    # them back in place of the revocations it actually still held.
+    assert recovered == Enum.to_list((count - maximum + 1)..count)
   end
 
   @tag :tmp_dir
@@ -2172,12 +2328,12 @@ defmodule Derpex.Admission.GentilityTest do
     Enum.at(sorted, index)
   end
 
-  defp signed_revocation(node_key, revision) do
+  defp signed_revocation(node_key, revision, revoked_at_ms \\ 1_100) do
     revocation = %Revocation{
       key_id: @signing_key_id,
       node_key: node_key,
       policy_revision: revision,
-      revoked_at_ms: 1_100,
+      revoked_at_ms: revoked_at_ms,
       reason: "node-disabled"
     }
 
