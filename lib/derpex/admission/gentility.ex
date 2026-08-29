@@ -28,7 +28,7 @@ defmodule Derpex.Admission.Gentility do
   alias Derpex.Clock
   alias Derpex.Router
 
-  @default_max_cache_entries 10_000
+  @default_max_cache_entries 100_000
   @default_max_revocations 10_000
   @default_max_concurrent_requests 64
   @default_authority_timeout 2_000
@@ -224,6 +224,7 @@ defmodule Derpex.Admission.Gentility do
       active_requests: :atomics.get(state.policy.gate, 1),
       max_cache_entries: state.max_cache_entries,
       max_revocations: state.max_revocations,
+      cache_full: state.cache_full,
       load_error: state.load_error,
       persist_error: state.persist_error
     }
@@ -373,6 +374,7 @@ defmodule Derpex.Admission.Gentility do
          node_budgets: %{},
          organization_budgets: %{},
          closing_connections: MapSet.new(),
+         cache_full: 0,
          sequence: 0,
          expiry_timer: nil,
          expiry_token: nil,
@@ -490,7 +492,17 @@ defmodule Derpex.Admission.Gentility do
   defp install_live_lease(state, wire, lease) do
     sequence = state.sequence + 1
     entry = %{wire: wire, lease: lease, accessed: sequence}
-    {leases, evicted} = put_bounded(state.leases, lease.node_key, entry, state.max_cache_entries)
+
+    case admit_lease(state, lease.node_key, entry) do
+      {:ok, leases, evicted} ->
+        install_admitted_lease(state, lease, leases, evicted, sequence)
+
+      {:error, :cache_full} ->
+        {:reply, {:error, :cache_full}, %{state | cache_full: state.cache_full + 1}}
+    end
+  end
+
+  defp install_admitted_lease(state, lease, leases, evicted, sequence) do
     revocations = Map.delete(state.revocations, lease.node_key)
 
     candidate =
@@ -510,6 +522,36 @@ defmodule Derpex.Admission.Gentility do
         {:reply, {:error, {:cache_persist, reason}}, state}
     end
   end
+
+  # Admits a lease into the bounded cache. An entry an active connection is
+  # claiming is never evicted while its lease is valid, so a saturated cache
+  # rejects the new admission instead of closing an established peer.
+  defp admit_lease(state, node_key, entry) do
+    leases = Map.put(state.leases, node_key, entry)
+
+    if map_size(leases) <= state.max_cache_entries do
+      {:ok, leases, nil}
+    else
+      case evictable_lease(state, leases, node_key) do
+        nil -> {:error, :cache_full}
+        {key, evicted} -> {:ok, Map.delete(leases, key), {key, evicted}}
+      end
+    end
+  end
+
+  defp evictable_lease(state, leases, admitted_key) do
+    now = now_ms(state)
+
+    leases
+    |> Enum.reject(fn {key, entry} ->
+      key == admitted_key or (entry.lease.expires_at_ms > now and claimed?(state, key))
+    end)
+    |> Enum.min_by(fn {_key, entry} -> {entry.lease.expires_at_ms, entry.accessed} end, fn ->
+      nil
+    end)
+  end
+
+  defp claimed?(state, node_key), do: Map.get(state.node_connections, node_key, 0) > 0
 
   defp stale_lease?(nil, _lease), do: false
 
@@ -571,14 +613,8 @@ defmodule Derpex.Admission.Gentility do
       revoked_at_ms: revocation.revoked_at_ms
     }
 
-    {revocations, _evicted} =
-      put_bounded(
-        state.revocations,
-        revocation.node_key,
-        entry,
-        state.max_revocations,
-        & &1.revoked_at_ms
-      )
+    revocations =
+      put_bounded(state.revocations, revocation.node_key, entry, state.max_revocations)
 
     {%{state | leases: leases, revocations: revocations} |> rebuild_budgets(), close?}
   end
@@ -967,14 +1003,16 @@ defmodule Derpex.Admission.Gentility do
     Cache.store(state.cache_path, leases, revocations)
   end
 
-  defp put_bounded(entries, key, entry, maximum, ordering \\ & &1.accessed) do
+  defp put_bounded(entries, key, entry, maximum) do
     entries = Map.put(entries, key, entry)
 
     if map_size(entries) <= maximum do
-      {entries, nil}
+      entries
     else
-      {evicted_key, evicted} = Enum.min_by(entries, fn {_key, value} -> ordering.(value) end)
-      {Map.delete(entries, evicted_key), {evicted_key, evicted}}
+      {evicted_key, _evicted} =
+        Enum.min_by(entries, fn {_key, value} -> value.revoked_at_ms end)
+
+      Map.delete(entries, evicted_key)
     end
   end
 

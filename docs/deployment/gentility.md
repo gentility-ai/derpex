@@ -33,6 +33,44 @@ proxy or load balancer.
   `/debug/check` remain nonexistent until `DERPEX_OPERATIONS_TOKEN` is set and
   then require its bearer credential on every request.
 
+## Admission lease tuning
+
+The lease controller is configured entirely from the environment. Every value
+below applies only when `DERPEX_GENTILITY_ADAPTER` is set, and every one is
+validated at boot: an out-of-range value refuses to start the release rather
+than silently reverting to its default.
+
+| Variable | Default | Meaning |
+| --- | --- | --- |
+| `DERPEX_GENTILITY_MAX_CACHE_ENTRIES` | `100000` | Hard bound on cached authorization leases. |
+| `DERPEX_GENTILITY_MAX_REVOCATIONS` | `10000` | Hard bound on retained revocation records. |
+| `DERPEX_GENTILITY_MAX_CONCURRENT_REQUESTS` | `64` | Live authorizations in flight; excess is shed as `admission_overloaded`. |
+| `DERPEX_GENTILITY_AUTHORITY_TIMEOUT_MS` | `2000` | Deadline for one live authorization call. |
+| `DERPEX_GENTILITY_MAX_LEASE_MS` | `900000` | Longest lease lifetime accepted, and so the worst-case missed-revocation window. |
+| `DERPEX_GENTILITY_MAX_FUTURE_SKEW_MS` | `30000` | Clock skew allowed on a lease issue time. It never extends expiry. |
+| `DERPEX_GENTILITY_MAX_BYTE_DELAY_MS` | `30000` | Pacing delay above which a connection is closed instead of paced. |
+
+Size `DERPEX_GENTILITY_MAX_CACHE_ENTRIES` above the number of distinct nodes an
+instance expects to serve within one lease lifetime, not above its concurrent
+connection count: the cache holds every node that may reconnect during a
+Gentility outage. All budgets are per instance and must be divided by the
+number of instances in the region.
+
+### Cache eviction
+
+The cache never sacrifices an established peer to admit a new one. When it is
+at its bound, a new lease evicts, in order:
+
+1. an expired entry, claimed or not, because an expired lease must close anyway;
+2. otherwise the soonest-expiring entry that no connection is claiming, ties
+   broken by least recently used.
+
+If every entry holds a valid lease with a live claim, the *new* admission is
+rejected with `cache_full` and the counter behind
+`derpex_gentility_cache_full` increments. Sustained growth in that counter
+means the cache bound is below the instance's working set: raise
+`DERPEX_GENTILITY_MAX_CACHE_ENTRIES` or reduce the nodes homed on the instance.
+
 ## Milestone 0 launch inputs
 
 The following values must be jointly fixed before Milestone 0 exits:

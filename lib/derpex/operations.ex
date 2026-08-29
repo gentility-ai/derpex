@@ -313,7 +313,8 @@ defmodule Derpex.Operations do
       active_organizations: "derpex_gentility_active_organizations",
       active_requests: "derpex_gentility_active_requests",
       max_cache_entries: "derpex_gentility_max_cache_entries",
-      max_revocations: "derpex_gentility_max_revocations"
+      max_revocations: "derpex_gentility_max_revocations",
+      cache_full: "derpex_gentility_cache_full"
     }
 
     metrics
