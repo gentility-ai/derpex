@@ -95,10 +95,16 @@ defmodule Derpex.HTTPClient do
 
   defp connect(_target, _deadline, _options), do: {:error, :invalid_target}
 
+  # Caller options are applied first and the security-critical ones are forced
+  # after, so no caller can turn peer verification or the hostname check off by
+  # passing `verify: :verify_none`. A caller may still *tighten* trust — pinning
+  # its own `cacerts` is the reason this option exists — because replacing the
+  # trust anchors narrows what is accepted rather than widening it.
   defp tls_options(host, options) do
-    [
+    [cacerts: :public_key.cacerts_get()]
+    |> Keyword.merge(Keyword.get(options, :tls_options, []))
+    |> Keyword.merge(
       verify: :verify_peer,
-      cacerts: :public_key.cacerts_get(),
       server_name_indication: String.to_charlist(host),
       customize_hostname_check: [
         match_fun: :public_key.pkix_verify_hostname_match_fun(:https)
@@ -106,11 +112,7 @@ defmodule Derpex.HTTPClient do
       mode: :binary,
       packet: :raw,
       active: false
-    ]
-    |> Keyword.merge(Keyword.get(options, :tls_options, []))
-    |> Keyword.put(:mode, :binary)
-    |> Keyword.put(:packet, :raw)
-    |> Keyword.put(:active, false)
+    )
   end
 
   defp send_data({:tcp, socket}, data), do: :gen_tcp.send(socket, data)

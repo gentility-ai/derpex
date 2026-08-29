@@ -144,7 +144,10 @@ connection arrives on, which is upstream's `--acme-ip-certs`. `gcp` is the same
 flow against Google's endpoint and additionally requires
 `DERPEX_ACME_EAB_KID`, `DERPEX_ACME_EAB_KEY`, and `DERPEX_ACME_EMAIL`.
 `DERPEX_ACME_DIRECTORY_URL` overrides the directory, which is how the tests
-point the client at a fake authority.
+point the client at a fake authority. It must be HTTPS unless its host is
+loopback, and every URL the authority hands out afterwards has to share that
+directory's scheme, host, and port — a certificate authority cannot redirect
+this relay onto another host.
 
 The account key is created once at `DERPEX_CERT_DIR/acme-account.key` with mode
 `0600` and reused for every order.
