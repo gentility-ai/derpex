@@ -73,8 +73,10 @@ defmodule Derpex.WebSocket.FrameTest do
 
     # Holding a sub-binary of the buffer defeats the in-place append, so every
     # push copied everything buffered so far: 400 KB dripped a byte at a time
-    # took about eight seconds. Appending in place costs milliseconds.
-    assert div(microseconds, 1_000) < 500,
+    # took about eight seconds even on a fast machine. Appending in place costs
+    # milliseconds; the budget is sized for a contended CI runner (717 ms
+    # observed) while staying under the quadratic mode's floor.
+    assert div(microseconds, 1_000) < 5_000,
            "one-byte-at-a-time push of #{payload_bytes} payload bytes took " <>
              "#{div(microseconds, 1_000)} ms"
   end

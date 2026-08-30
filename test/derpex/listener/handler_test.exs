@@ -1353,7 +1353,9 @@ defmodule Derpex.Listener.HandlerTest do
       else: {:error, :too_many_reads}
   end
 
-  defp assert_eventually(assertion, attempts \\ 50)
+  # 2ms polls for up to 5s: a contended CI runner has blown the previous
+  # 100ms window; the condition still binds, only the patience is bounded.
+  defp assert_eventually(assertion, attempts \\ 2_500)
 
   defp assert_eventually(assertion, attempts) when attempts > 0 do
     if assertion.() do
