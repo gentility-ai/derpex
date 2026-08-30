@@ -1,7 +1,7 @@
 defmodule Derpex.MixProject do
   use Mix.Project
 
-  @version "0.1.0-rc.1"
+  @version "0.1.0-rc.2"
   @source_url "https://github.com/jtippett/derpex"
 
   # Kept byte-identical to the "Smoke relay benchmark harness" step in
