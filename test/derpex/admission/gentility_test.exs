@@ -1567,8 +1567,13 @@ defmodule Derpex.Admission.GentilityTest do
         # Revoking is what must not scale with the cache: it makes the record
         # durable before it answers, and that cost is one flush, not one
         # snapshot of every cached lease.
+        # The minimum of several samples, not the median: on a shared cloud
+        # disk a revocation's fsync can queue behind the debounced cache
+        # writer's snapshot and cost tens of milliseconds, but that inflates
+        # some samples. A per-revocation cost that grows with the cache
+        # inflates every sample, so the minimum still catches it.
         samples =
-          Enum.map(1..3, fn attempt ->
+          Enum.map(1..5, fn attempt ->
             key = <<size + 1_000_000 * attempt::256>>
 
             {microseconds, {:ok, :applied}} =
@@ -1577,7 +1582,7 @@ defmodule Derpex.Admission.GentilityTest do
             microseconds
           end)
 
-        {size, [{size, samples |> Enum.sort() |> Enum.at(1)} | timings]}
+        {size, [{size, Enum.min(samples)} | timings]}
       end)
 
     timings = Enum.reverse(timings)
