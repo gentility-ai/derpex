@@ -1,5 +1,5 @@
-// Copyright (c) 2026 DERPEX contributors.
-// SPDX-License-Identifier: BSD-3-Clause
+// Copyright (c) 2026 Gentility AI & DERPEX contributors.
+// SPDX-License-Identifier: MIT
 
 // Command relay_smoke uses two unchanged official Go DERP HTTP clients to
 // prove authenticated packet relay through a running DERPEX listener.

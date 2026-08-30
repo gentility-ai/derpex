@@ -1327,10 +1327,9 @@ These decisions are intentionally deferred until evidence is available:
   OTP release;
 - whether metrics must be byte-for-byte Prometheus compatible or only preserve
   all documented names, values, and labels;
-- the project-wide license for original DERPEX code. `interop/PROVENANCE.md`
-  records the upstream licenses DERPEX derives from and states that it selects
-  none for this repository. That is still a product-owner decision, and the
-  repository carries no `LICENSE` file until it is made.
+- ~~the project-wide license for original DERPEX code~~ — decided 2026-08-30:
+  MIT for original code (`LICENSE`), with adapted files retaining their
+  upstream BSD-3-Clause headers as recorded in `interop/PROVENANCE.md`.
 
 ACME provider dependency selection is no longer deferred: no published Hex
 library carried IP identifiers or the RFC 8555 profiles extension, so

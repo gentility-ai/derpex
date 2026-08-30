@@ -16,5 +16,7 @@ their file header. The upstream checkouts and Go/Rust reference toolchains are
 development and isolated-CI inputs; they are not copied into the DERPEX runtime
 image.
 
-This notice does not select a license for original DERPEX code. A project-wide
-license remains a product-owner decision.
+Original DERPEX code is licensed under the MIT license (see `LICENSE`,
+decided 2026-08-30). Adapted files retain their upstream BSD-3-Clause headers
+as described above; the two licenses are compatible and the MIT `LICENSE`
+file carries a notice pointing back here.

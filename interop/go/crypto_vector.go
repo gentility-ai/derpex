@@ -1,5 +1,5 @@
-// Copyright (c) 2026 DERPEX contributors.
-// SPDX-License-Identifier: BSD-3-Clause
+// Copyright (c) 2026 Gentility AI & DERPEX contributors.
+// SPDX-License-Identifier: MIT
 
 // Command crypto_vector emits the deterministic NaCl box vector used by the
 // Elixir/NIF compatibility test. Run it from the pinned Tailscale checkout so
