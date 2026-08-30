@@ -223,8 +223,23 @@ if [[ "$self_issuer_up" -ne 1 ]]; then
   exit 1
 fi
 
-if ! docker exec "$self_issuer_container" test -f /tmp/derpex-certs/127.0.0.1.crt; then
-  echo "self issuer did not cache its certificate" >&2
+# The listener binds a self-signed placeholder and serves TLS while the real
+# per-IP certificate is still being issued, so TLS answering does not mean the
+# certificate has been cached yet. Poll for the cache the same way TLS was
+# polled for.
+self_issuer_cached=0
+
+for _attempt in {1..40}; do
+  if docker exec "$self_issuer_container" test -f /tmp/derpex-certs/127.0.0.1.crt; then
+    self_issuer_cached=1
+    break
+  fi
+
+  sleep 0.25
+done
+
+if [[ "$self_issuer_cached" -ne 1 ]]; then
+  echo "self issuer did not cache its certificate within ten seconds" >&2
   docker logs "$self_issuer_container" >&2
   exit 1
 fi
