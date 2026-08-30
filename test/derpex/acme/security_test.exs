@@ -182,6 +182,10 @@ defmodule Derpex.ACME.SecurityTest do
       case :ssl.transport_accept(listener, 5_000) do
         {:ok, socket} ->
           with {:ok, socket} <- :ssl.handshake(socket, 5_000) do
+            # Read the request before answering: a server that closes without
+            # reading races the client's send, which then reports :closed
+            # instead of ever seeing the response.
+            _request = :ssl.recv(socket, 0, 5_000)
             :ssl.send(socket, "HTTP/1.1 204 No Content\r\nContent-Length: 0\r\n\r\n")
             :ssl.close(socket)
           end
