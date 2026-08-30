@@ -751,6 +751,12 @@ defmodule Derpex.Admission.GentilityTest do
                  {:ok, %{applied: 3, stale: 0}}
 
         eventually(fn -> Gentility.stats(controller).close_peer_failures == 1 end)
+
+        # The failure counter moves per close, but the batch summary is logged
+        # only after the last close task returns. A synchronous call to the
+        # closer cannot be answered until that cast — and its log line — has
+        # finished.
+        :sys.get_state(:sys.get_state(controller).closer)
       end)
 
     assert log =~ "could not close 1 of 3 peers"
