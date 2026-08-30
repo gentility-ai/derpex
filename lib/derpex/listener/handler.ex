@@ -201,7 +201,7 @@ defmodule Derpex.Listener.Handler do
   def handle_data(data, socket, %{wire_mode: :websocket} = state) do
     case receive_websocket_data(socket, state, data) do
       {:ok, state} ->
-        {:continue, state}
+        continue(state)
 
       {:pace, delay, state, actions, events} ->
         pause_reads(socket, pace(state, delay, actions, events))
@@ -355,10 +355,22 @@ defmodule Derpex.Listener.Handler do
     end
   end
 
+  # Go stops timing out a client once it is registered ("At this point we
+  # trust the client so we don't time out", derpserver.go): an idle client
+  # can legitimately send nothing for minutes while the server-side keepalive
+  # keeps the connection alive, so the accept-time read timeout must not
+  # outlive the handshake. The persistent :infinity survives every later
+  # continuation, so paced and resumed reads inherit it as well.
+  defp continue(%{client_public_key: key} = state) when is_binary(key) do
+    {:continue, state, {:persistent, :infinity}}
+  end
+
+  defp continue(state), do: {:continue, state}
+
   defp continue_after_actions(socket, state, actions) do
     case execute_actions(socket, state, actions) do
       {:ok, state} ->
-        {:continue, state}
+        continue(state)
 
       {:pace, delay, state, pending_actions, pending_events} ->
         pause_reads(socket, pace(state, delay, pending_actions, pending_events))
@@ -482,7 +494,7 @@ defmodule Derpex.Listener.Handler do
     # Back through Thousand Island's own continuation, so re-arming the socket
     # also resets its read timer, and so a FIN that arrived while the socket
     # was passive is delivered as {:tcp_closed, _} as soon as it is re-armed.
-    resume(socket, {:continue, state})
+    resume(socket, continue(state))
   end
 
   defp resume_paced_data(socket, %{wire_mode: :websocket} = state) do

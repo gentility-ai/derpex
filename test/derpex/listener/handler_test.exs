@@ -1325,6 +1325,44 @@ defmodule Derpex.Listener.HandlerTest do
     end)
   end
 
+  test "an authenticated client can idle past the read timeout, an unauthenticated one cannot" do
+    {server_public, server_private} = Crypto.generate_keypair()
+    {_client_public, client_private} = Crypto.generate_keypair()
+
+    {:ok, server} =
+      ThousandIsland.start_link(
+        port: 0,
+        read_timeout: 250,
+        transport_options: [ip: {127, 0, 0, 1}],
+        num_acceptors: 1,
+        handler_module: Handler,
+        handler_options: [
+          server_private_key: Secret.wrap(server_private),
+          server_public_key: server_public
+        ]
+      )
+
+    stop_server_on_exit(server)
+    {:ok, {_ip, port}} = ThousandIsland.listener_info(server)
+
+    # Before the handshake completes, the accept-time read timeout applies.
+    {:ok, silent} = :gen_tcp.connect({127, 0, 0, 1}, port, [:binary, active: false])
+    assert {:error, :closed} = :gen_tcp.recv(silent, 0, 2_000)
+
+    # After registration the client is trusted and may send nothing for far
+    # longer than the read timeout, exactly as the pinned Go server clears
+    # its deadline ("At this point we trust the client so we don't time
+    # out"). A tailscale client idles between keepalives, and 0.1.0 closed
+    # it every read timeout, churning the relay connection.
+    socket = connect_and_send_info(port, server_public, client_private, %ClientInfo{version: 2})
+    assert {:ok, <<type, length::unsigned-big-32>>} = :gen_tcp.recv(socket, 5, 2_000)
+    assert type == Frame.type(:server_info)
+    assert {:ok, _server_info} = :gen_tcp.recv(socket, length, 2_000)
+
+    assert {:error, :timeout} = :gen_tcp.recv(socket, 0, 1_000)
+    :gen_tcp.close(socket)
+  end
+
   defp connect_and_send_info(port, server_public, client_private, client_info) do
     {:ok, socket} = :gen_tcp.connect({127, 0, 0, 1}, port, [:binary, active: false])
 
