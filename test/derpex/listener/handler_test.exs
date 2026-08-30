@@ -305,7 +305,10 @@ defmodule Derpex.Listener.HandlerTest do
           server_private_key: Secret.wrap(server_private),
           server_public_key: server_public,
           event_handler: event_handler,
-          rate_controller: rate_controller
+          rate_controller: rate_controller,
+          # On Linux the TCP RTT sampler arms a third Manual-clock timer at
+          # registration, which makes pending_timer_count platform-dependent.
+          tcp_rtt: false
         ]
       )
 
@@ -392,7 +395,10 @@ defmodule Derpex.Listener.HandlerTest do
           server_private_key: Secret.wrap(server_private),
           server_public_key: server_public,
           event_handler: event_handler,
-          rate_controller: rate_controller
+          rate_controller: rate_controller,
+          # On Linux the TCP RTT sampler arms a third Manual-clock timer at
+          # registration, which makes pending_timer_count platform-dependent.
+          tcp_rtt: false
         ]
       )
 
@@ -465,7 +471,10 @@ defmodule Derpex.Listener.HandlerTest do
           server_private_key: Secret.wrap(server_private),
           server_public_key: server_public,
           event_handler: event_handler,
-          rate_controller: rate_controller
+          rate_controller: rate_controller,
+          # On Linux the TCP RTT sampler arms a third Manual-clock timer at
+          # registration, which makes pending_timer_count platform-dependent.
+          tcp_rtt: false
         ]
       )
 
@@ -563,7 +572,10 @@ defmodule Derpex.Listener.HandlerTest do
           server_private_key: Secret.wrap(server_private),
           server_public_key: server_public,
           event_handler: event_handler,
-          rate_controller: rate_controller
+          rate_controller: rate_controller,
+          # On Linux the TCP RTT sampler arms a third Manual-clock timer at
+          # registration, which makes pending_timer_count platform-dependent.
+          tcp_rtt: false
         ]
       )
 
@@ -655,7 +667,10 @@ defmodule Derpex.Listener.HandlerTest do
           server_private_key: Secret.wrap(server_private),
           server_public_key: server_public,
           event_handler: event_handler,
-          rate_controller: rate_controller
+          rate_controller: rate_controller,
+          # On Linux the TCP RTT sampler arms a third Manual-clock timer at
+          # registration, which makes pending_timer_count platform-dependent.
+          tcp_rtt: false
         ]
       )
 
@@ -736,7 +751,10 @@ defmodule Derpex.Listener.HandlerTest do
           server_private_key: Secret.wrap(server_private),
           server_public_key: server_public,
           event_handler: event_handler,
-          rate_controller: rate_controller
+          rate_controller: rate_controller,
+          # On Linux the TCP RTT sampler arms a third Manual-clock timer at
+          # registration, which makes pending_timer_count platform-dependent.
+          tcp_rtt: false
         ]
       )
 
