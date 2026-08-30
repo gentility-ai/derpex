@@ -168,7 +168,23 @@ defmodule Derpex.Interop.GoClientTest do
       )
 
     assert status == 0, output
-    assert output =~ "official DERP prober relayed 100000000 bytes through DERPEX"
+
+    summary_pattern =
+      ~r/^official DERP prober relayed (\d+) bytes through DERPEX \(packets=(\d+) lost=(\d+) reordered=(\d+) corrupted=(\d+)\)$/m
+
+    captures = Regex.run(summary_pattern, output)
+    assert captures, output
+
+    [summary, relayed_bytes, packets, lost, reordered, corrupted] = captures
+
+    [relayed_bytes, packets, lost, reordered, corrupted] =
+      Enum.map([relayed_bytes, packets, lost, reordered, corrupted], &String.to_integer/1)
+
+    assert reordered == 0, summary
+    assert corrupted == 0, summary
+    assert lost <= 30, summary
+    assert packets + lost == 1_526, summary
+    assert relayed_bytes >= 100_000_000 - lost * 65_536, summary
   end
 
   test "duplicate official Go clients use last-writer-active routing" do

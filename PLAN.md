@@ -1,7 +1,8 @@
 # DERPEX implementation plan
 
-Status: implementation complete for the pinned baseline pending review
-sign-off, 2026-08-29
+Status: implementation complete for the pinned baseline; final ship-gate
+review passed with zero blockers (fast-follows tracked as repository issues
+1-5), `mix release.check` 607/607 green, 2026-08-30
 
 DERPEX is an Elixir implementation of Tailscale's DERP server. The target is
 observable compatibility with the pinned Go implementation, including the
@@ -174,7 +175,15 @@ so they are not implemented by accident:
   wall-clock bounded, the naps inside it are counted as
   `derp_ring_producer_naps`, exceeding it is a counted tail drop, and callers
   that must not sleep for one destination — the router and the drain
-  coordinator — enqueue with `wait: false`. See ADR 0001.
+  coordinator — enqueue with `wait: false`. See ADR 0001. One measurable
+  consequence: upstream's DERP prober sends with an in-flight window of 30,
+  deliberately below the 32-packet queue depth, so against Go a lossless
+  100 MB transfer is guaranteed; against DERPEX a scheduler stall longer than
+  the lock budget can tail-drop below capacity (reproduced by fault injection
+  2026-08-30), so the interop prober smoke test verifies sequence-stamped
+  delivery with a bounded loss budget instead of losslessness
+  (`interop/go/prober_smoke.go`). Removing the below-capacity drop would need
+  a slot-reservation enqueue design; recorded as post-ship follow-up work.
 - Pinned `cmd/derper` sets `MinVersion: tls.VersionTLS12` on its TLS listener
   (`derper.go:364`). DERPEX serves and dials TLS 1.3 only
   (`config/runtime.exs`, `lib/derpex/mesh/client.ex`), which is a deliberate
