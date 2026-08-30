@@ -9,6 +9,30 @@ defmodule Derpex.RouterTest do
   alias Derpex.Router
   alias Derpex.Router.ReversePaths
 
+  setup do
+    # These tests count connections in the application's router. A previous
+    # test's connection is reaped on an asynchronous DOWN, so on a slow
+    # scheduler its registration can still be counted here; wait for the
+    # router to quiesce before asserting exact counts.
+    wait_until_quiescent()
+    :ok
+  end
+
+  defp wait_until_quiescent(attempts \\ 2_500)
+
+  defp wait_until_quiescent(0) do
+    flunk("router did not quiesce: #{inspect(Router.stats())}")
+  end
+
+  defp wait_until_quiescent(attempts) do
+    if Router.stats().current_connections == 0 do
+      :ok
+    else
+      Process.sleep(2)
+      wait_until_quiescent(attempts - 1)
+    end
+  end
+
   test "successful routing looks up ETS and publishes directly to a bounded ring" do
     source = :crypto.strong_rand_bytes(32)
     destination = :crypto.strong_rand_bytes(32)
