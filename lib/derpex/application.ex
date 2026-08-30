@@ -3,6 +3,8 @@ defmodule Derpex.Application do
 
   use Application
 
+  alias Derpex.Certificates.Boot
+
   @impl true
   def start(_type, _args) do
     with {:ok, children} <- runtime_children() do
@@ -26,7 +28,11 @@ defmodule Derpex.Application do
   defp runtime_children do
     gentility = Application.fetch_env!(:derpex, :gentility)
 
-    with {:ok, relay_children} <- relay_children(gentility) do
+    # A certificate mode DERPEX cannot honour must stop the boot here, before a
+    # listener binds, rather than quietly falling back to another certificate.
+    certificates = Boot.plan!(Application.get_env(:derpex, :certificates, []))
+
+    with {:ok, relay_children} <- relay_children(gentility, certificates) do
       stun_children =
         :derpex
         |> Application.fetch_env!(:stun_listeners)
@@ -61,13 +67,15 @@ defmodule Derpex.Application do
          accept_limiter,
          {Derpex.Drain, profile: if(is_nil(gentility), do: :baseline, else: :gentility)}
        ] ++
+         Boot.children(certificates) ++
          gentility_controller_children(gentility) ++
          relay_children ++
+         Boot.post_listener_children(certificates) ++
          stun_children ++ gentility_event_children(gentility) ++ signal_children()}
     end
   end
 
-  defp relay_children(gentility) do
+  defp relay_children(gentility, certificates) do
     listeners = Application.fetch_env!(:derpex, :listeners)
     mesh_peers = Application.fetch_env!(:derpex, :mesh_peers)
 
@@ -80,21 +88,31 @@ defmodule Derpex.Application do
 
       with {:ok, {_public_key, private_key}} <-
              Derpex.Identity.load_or_create_keypair(identity_path) do
+        private_key = Derpex.Secret.wrap(private_key)
+
         {:ok,
-         listener_children(listeners, private_key, gentility) ++
-           mesh_children(
-             mesh_peers,
-             private_key,
-             Application.fetch_env!(:derpex, :mesh_key)
-           )}
+         listener_children(listeners, private_key, gentility, certificates) ++
+           mesh_children(mesh_peers, private_key)}
       end
     end
   end
 
-  defp listener_children([], _private_key, _gentility), do: []
+  defp listener_children([], _private_key, _gentility, _certificates), do: []
 
-  defp listener_children(listeners, private_key, gentility) do
-    listeners = Enum.map(listeners, &put_gentility_admission(&1, gentility))
+  # Listener configuration carries the mesh key as raw bytes. Wrap it here,
+  # before the child specification exists, because both this supervisor and
+  # Derpex.ListenerSupervisor retain their start arguments for restarts.
+  defp listener_children(listeners, private_key, gentility, certificates) do
+    listeners =
+      Enum.map(listeners, fn listener ->
+        listener
+        |> put_gentility_admission(gentility)
+        |> then(&Boot.listener_options(certificates, &1))
+        |> Keyword.replace_lazy(:handler_options, fn handler_options ->
+          Keyword.replace_lazy(handler_options, :mesh_key, &Derpex.Secret.wrap/1)
+        end)
+      end)
+
     [{Derpex.ListenerSupervisor, {listeners, private_key}}]
   end
 
@@ -153,13 +171,18 @@ defmodule Derpex.Application do
     end
   end
 
-  defp mesh_children([], _private_key, _mesh_key), do: []
+  defp mesh_children([], _private_key), do: []
 
-  defp mesh_children(mesh_peers, private_key, <<mesh_key::binary-size(32)>>) do
-    [{Derpex.Mesh.Supervisor, {mesh_peers, private_key, mesh_key}}]
-  end
+  # The mesh key stays raw in application environment, where operators and
+  # `config/runtime.exs` expect it. It is wrapped here, at its only read site,
+  # so no child specification or process state below carries the bytes.
+  defp mesh_children(mesh_peers, private_key) do
+    case Application.fetch_env!(:derpex, :mesh_key) do
+      <<mesh_key::binary-size(32)>> ->
+        [{Derpex.Mesh.Supervisor, {mesh_peers, private_key, Derpex.Secret.wrap(mesh_key)}}]
 
-  defp mesh_children(_mesh_peers, _private_key, _mesh_key) do
-    raise "configure :derpex, :mesh_key before enabling mesh peers"
+      _unconfigured ->
+        raise "configure :derpex, :mesh_key before enabling mesh peers"
+    end
   end
 end

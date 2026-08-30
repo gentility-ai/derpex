@@ -44,6 +44,10 @@ defmodule Derpex.SocketOptions do
     |> append_new_raw(raw_options(keepalive_ms, user_timeout_ms))
   end
 
+  @doc "Returns the write timeout a connection gets before it is trusted."
+  @spec default_write_timeout_ms() :: pos_integer()
+  def default_write_timeout_ms, do: @default_write_timeout_ms
+
   @doc "Returns the privileged write timeout used after mesh authentication."
   @spec mesh_write_timeout_ms() :: pos_integer()
   def mesh_write_timeout_ms, do: @mesh_write_timeout_ms

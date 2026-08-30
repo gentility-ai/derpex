@@ -1,6 +1,8 @@
 defmodule Derpex.WebSocket.Frame do
   @moduledoc "Bounded RFC 6455 framing for the DERP binary byte-stream adapter."
 
+  import Bitwise
+
   @default_max_message_length 1 * 1_024 * 1_024
 
   defstruct buffer: "",
@@ -32,13 +34,23 @@ defmodule Derpex.WebSocket.Frame do
     parse(%{state | buffer: state.buffer <> data}, [])
   end
 
-  @doc "Encodes one unmasked server binary message."
-  @spec encode_binary(iodata()) :: binary()
-  def encode_binary(data), do: encode(0x2, IO.iodata_to_binary(data))
+  @doc """
+  Encodes one unmasked server binary message.
+
+  Returns iodata: a DERP frame is already a list of a header and a packet, and
+  flattening it here would copy every relayed packet.
+  """
+  @spec encode_binary(iodata()) :: iodata()
+  def encode_binary(data), do: encode(0x2, data)
 
   @doc "Encodes one unmasked server pong control message."
-  @spec encode_pong(binary()) :: binary()
+  @spec encode_pong(binary()) :: iodata()
   def encode_pong(payload) when byte_size(payload) <= 125, do: encode(0xA, payload)
+
+  @doc "Encodes one unmasked server close control message."
+  @spec encode_close(0..65_535, binary()) :: iodata()
+  def encode_close(status, reason \\ "") when byte_size(reason) <= 123,
+    do: encode(0x8, <<status::unsigned-big-16, reason::binary>>)
 
   defp parse(state, events) do
     case decode_frame(state.buffer, state.max_message_length) do
@@ -59,74 +71,72 @@ defmodule Derpex.WebSocket.Frame do
     end
   end
 
+  # Every check before the frame is complete reads integers out of the buffer
+  # with :binary.at/2 and never binds a sub-binary of it. A sub-binary marks the
+  # buffer unwritable, which turns the next `buffer <> data` from an in-place
+  # append into a full copy - quadratic in the size of a frame that arrives in
+  # small segments. Only a complete frame is destructured, and there the split
+  # has to happen anyway.
   defp decode_frame(buffer, _maximum) when byte_size(buffer) < 2, do: :more
 
-  defp decode_frame(<<fin::1, rsv::3, opcode::4, masked::1, length::7, rest::binary>>, maximum) do
+  defp decode_frame(buffer, maximum) do
+    first = :binary.at(buffer, 0)
+    second = :binary.at(buffer, 1)
+    rsv = first &&& 0x70
+    opcode = first &&& 0x0F
+    fin? = (first &&& 0x80) != 0
+    masked? = (second &&& 0x80) != 0
+    length_field = second &&& 0x7F
+
     cond do
       rsv != 0 -> {:error, :reserved_websocket_bits}
-      masked != 1 -> {:error, :unmasked_client_frame}
-      opcode >= 0x8 and (fin != 1 or length > 125) -> {:error, :invalid_control_frame}
-      true -> decode_extended_length(fin == 1, opcode, length, rest, maximum)
+      not masked? -> {:error, :unmasked_client_frame}
+      opcode >= 0x8 and (not fin? or length_field > 125) -> {:error, :invalid_control_frame}
+      true -> decode_length(buffer, fin?, opcode, length_field, maximum)
     end
   end
 
-  defp decode_extended_length(fin?, opcode, length, rest, maximum) when length < 126 do
-    decode_masked_payload(fin?, opcode, length, rest, maximum)
-  end
+  defp decode_length(buffer, fin?, opcode, length_field, maximum) when length_field < 126,
+    do: decode_payload(buffer, fin?, opcode, 2, length_field, maximum)
 
-  defp decode_extended_length(_fin?, _opcode, 126, rest, _maximum) when byte_size(rest) < 2,
-    do: :more
+  defp decode_length(buffer, _fin?, _opcode, 126, _maximum) when byte_size(buffer) < 4, do: :more
 
-  defp decode_extended_length(
-         fin?,
-         opcode,
-         126,
-         <<length::unsigned-big-16, rest::binary>>,
-         maximum
-       ) do
-    if length < 126 do
-      {:error, :noncanonical_websocket_length}
-    else
-      decode_masked_payload(fin?, opcode, length, rest, maximum)
+  defp decode_length(buffer, fin?, opcode, 126, maximum) do
+    case unsigned(buffer, 2, 2) do
+      length when length < 126 -> {:error, :noncanonical_websocket_length}
+      length -> decode_payload(buffer, fin?, opcode, 4, length, maximum)
     end
   end
 
-  defp decode_extended_length(_fin?, _opcode, 127, rest, _maximum) when byte_size(rest) < 8,
-    do: :more
+  defp decode_length(buffer, _fin?, _opcode, 127, _maximum) when byte_size(buffer) < 10, do: :more
 
-  defp decode_extended_length(
-         fin?,
-         opcode,
-         127,
-         <<0::1, length::unsigned-big-63, rest::binary>>,
-         maximum
-       ) do
-    if length < 65_536 do
-      {:error, :noncanonical_websocket_length}
-    else
-      decode_masked_payload(fin?, opcode, length, rest, maximum)
+  defp decode_length(buffer, fin?, opcode, 127, maximum) do
+    cond do
+      (:binary.at(buffer, 2) &&& 0x80) != 0 -> {:error, :invalid_websocket_length}
+      unsigned(buffer, 2, 8) < 65_536 -> {:error, :noncanonical_websocket_length}
+      true -> decode_payload(buffer, fin?, opcode, 10, unsigned(buffer, 2, 8), maximum)
     end
   end
 
-  defp decode_extended_length(_fin?, _opcode, 127, _rest, _maximum),
-    do: {:error, :invalid_websocket_length}
+  defp decode_payload(_buffer, _fin?, _opcode, _header_length, length, maximum)
+       when length > maximum,
+       do: {:error, :websocket_message_too_large}
 
-  defp decode_masked_payload(_fin?, _opcode, length, _rest, maximum) when length > maximum,
-    do: {:error, :websocket_message_too_large}
-
-  defp decode_masked_payload(_fin?, _opcode, length, rest, _maximum)
-       when byte_size(rest) < 4 + length,
+  defp decode_payload(buffer, _fin?, _opcode, header_length, length, _maximum)
+       when byte_size(buffer) < header_length + 4 + length,
        do: :more
 
-  defp decode_masked_payload(
-         fin?,
-         opcode,
-         length,
-         <<mask::binary-size(4), rest::binary>>,
-         _maximum
-       ) do
-    <<masked_payload::binary-size(^length), remainder::binary>> = rest
+  defp decode_payload(buffer, fin?, opcode, header_length, length, _maximum) do
+    <<_header::binary-size(^header_length), mask::binary-size(4),
+      masked_payload::binary-size(^length), remainder::binary>> = buffer
+
     {:ok, fin?, opcode, unmask(masked_payload, mask), remainder}
+  end
+
+  defp unsigned(buffer, offset, count) do
+    Enum.reduce(offset..(offset + count - 1), 0, fn index, value ->
+      value <<< 8 ||| :binary.at(buffer, index)
+    end)
   end
 
   defp apply_frame(%{fragmented?: false} = state, true, 0x2, payload),
@@ -173,7 +183,7 @@ defmodule Derpex.WebSocket.Frame do
   defp bxor_binary(mask, payload), do: :crypto.exor(mask, payload)
 
   defp encode(opcode, payload) do
-    length = byte_size(payload)
+    length = IO.iodata_length(payload)
 
     header =
       cond do
@@ -182,6 +192,6 @@ defmodule Derpex.WebSocket.Frame do
         true -> <<1::1, 0::3, opcode::4, 0::1, 127::7, length::unsigned-big-64>>
       end
 
-    header <> payload
+    [header, payload]
   end
 end

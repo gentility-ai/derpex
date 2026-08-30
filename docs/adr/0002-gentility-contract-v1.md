@@ -33,6 +33,26 @@ policy revision, revocation Unix time in milliseconds, and a bounded reason.
 Revocation revision `R` invalidates leases for that node whose policy revision
 is at most `R`.
 
+Gentility prunes revocations older than the configured maximum lease lifetime:
+every lease such a record could still deny has expired by then, so
+reconciliation only ever has to replay that window. Reconciliation is paged —
+each call returns a bounded batch and the position after it, and a `nil`
+position ends the pass — so replaying that window never depends on one
+unbounded response.
+
+Authorization has exactly two authoritative answers, and both are signed
+records: a lease admits the requested node key, and a revocation for that node
+key denies it, dropping any cached lease and closing its established
+connections. An error returned by the control-plane transport is a failure to
+answer, never a denial, whatever its reason term. DERPEX therefore treats every
+error tuple, timeout, exit, and unrecognized return value identically: it
+serves the cached lease for that node key while one is unexpired, and rejects
+the connection once none is. Encoding a denial as an error — an HTTP 403, for
+instance — would make a control-plane outage indistinguishable from a mass
+denial and would darken every relay the moment Gentility became unreachable.
+Denial during an outage is expressed by a previously published revocation or by
+lease expiry, which bounds the worst case at the maximum lease lifetime.
+
 Verification keys are configured as a bounded key-ID map. Rotation publishes
 the new public key before Gentility signs with it and retains the old key until
 every lease it signed has expired. DERPEX rejects unknown key IDs, signatures
@@ -48,8 +68,10 @@ Usage export uses a separate canonical `DXUB` version-1 record. It identifies
 the DERPEX instance, region, fixed window, and sorted sender-attribution
 entries. Entries contain Gentility node, organization, owner kind, deployment,
 and accepted/dropped packet and byte totals. They never contain a destination,
-peer relationship, payload, source IP, or packet timing. The SHA-256 digest of
-the complete record is its idempotency key. Export transport must authenticate
+peer relationship, payload, source IP, or packet timing. A batch carries at most 10 000
+entries and at most 8 MiB of wire; a window exceeding either bound is exported
+as several batches that share its bounds, each content-addressed independently. The SHA-256 digest
+of the complete record is its idempotency key. Export transport must authenticate
 the DERPEX instance; usage records are not bearer authorization and are not
 individually signed. `UsageContractTest` fixes the cross-language vector.
 
@@ -61,5 +83,10 @@ individually signed. `UsageContractTest` fixes the cross-language vector.
 - The format deliberately avoids JSON canonicalization and serialization
   libraries in the relay critical path.
 - Contract evolution requires a new version; unknown versions fail closed.
+- A batch that cannot be encoded is bisected, not discarded. Only a single row
+  that still fails alone is dropped: it is logged, counted in
+  `derpex_gentility_usage_dropped_rows`, and deleted. Losing one row of
+  accounting is preferable to a window that can never drain and therefore sheds
+  every relayed packet behind it; losing the window with it is not.
 - Regional budgets are authoritative local allocations. Global coordination
   and billing export remain separate protocols layered on the lease fields.

@@ -1,5 +1,5 @@
 // Copyright (c) 2026 James Tippett
-// SPDX-License-Identifier: BSD-3-Clause
+// SPDX-License-Identifier: MIT
 
 // stun_smoke sends the official Tailscale STUN request and parses the response
 // with the official implementation. Run it from the pinned Tailscale module.

@@ -58,6 +58,8 @@ defmodule Derpex.Bench.Relay do
   @moduledoc false
 
   alias Derpex.Bench.Transport
+  alias Derpex.Outbox
+  alias Derpex.Outbox.LifecycleQueue
   alias Derpex.Outbox.Ring
   alias Derpex.Router
   alias Derpex.Writer
@@ -68,7 +70,21 @@ defmodule Derpex.Bench.Relay do
     queue_depth: 32,
     slow_packets: 10_000,
     slow_delay_ms: 1_000,
-    output: nil
+    output: nil,
+    fail_on: %{}
+  }
+
+  # `--fail-on NAME=VALUE` thresholds. Upstream's TestLookupDestHashTrieNoAlloc
+  # asserts the Go relay allocates nothing on the packet path; DERPEX cannot
+  # assert allocations, so it asserts the observable consequences instead —
+  # bounded memory growth, bounded latency, sustained throughput, and a queue
+  # that never has to replace a packet in a healthy flow.
+  @thresholds %{
+    "memory_delta_bytes" => {:maximum, "per-flow BEAM memory growth in bytes"},
+    "latency_p99_us" => {:maximum, "per-flow p99 relay latency in microseconds"},
+    "latency_maximum_us" => {:maximum, "per-flow worst relay latency in microseconds"},
+    "queue_replacements" => {:maximum, "per-flow queue head replacements"},
+    "packets_per_second" => {:minimum, "per-flow sustained relay throughput"}
   }
 
   def run(arguments) do
@@ -82,8 +98,48 @@ defmodule Derpex.Bench.Relay do
       encoded = report |> :json.encode() |> IO.iodata_to_binary()
       IO.puts(encoded)
       if options.output, do: File.write!(options.output, encoded <> "\n")
+      enforce_thresholds!(report, options.fail_on)
     end
   end
+
+  # Reporting a regression is only a gate if it fails the build, so the
+  # violations are collected and raised after the report has been written.
+  defp enforce_thresholds!(_report, thresholds) when map_size(thresholds) == 0, do: :ok
+
+  defp enforce_thresholds!(report, thresholds) do
+    violations =
+      for flow <- report["relay_flows"],
+          {name, limit} <- thresholds,
+          violation = violation(flow, name, limit),
+          do: violation
+
+    unless violations == [] do
+      raise "benchmark thresholds violated:\n  " <> Enum.join(violations, "\n  ")
+    end
+
+    :ok
+  end
+
+  defp violation(flow, name, limit) do
+    {direction, description} = Map.fetch!(@thresholds, name)
+    observed = observed(flow, name)
+    size = flow["packet_size_bytes"]
+
+    case direction do
+      :maximum when observed > limit ->
+        "#{size} B flow: #{description} was #{observed}, above the #{limit} ceiling"
+
+      :minimum when observed < limit ->
+        "#{size} B flow: #{description} was #{observed}, below the #{limit} floor"
+
+      _within_threshold ->
+        nil
+    end
+  end
+
+  defp observed(flow, "latency_p99_us"), do: flow["latency_us"]["p99"]
+  defp observed(flow, "latency_maximum_us"), do: flow["latency_us"]["maximum"]
+  defp observed(flow, name), do: flow[name]
 
   defp benchmark(options) do
     :erlang.garbage_collect()
@@ -91,6 +147,7 @@ defmodule Derpex.Bench.Relay do
 
     flows = Enum.map(options.sizes, &run_flow(&1, options))
     soak = run_slow_client_soak(options)
+    idle = measure_idle_connection(options)
 
     :erlang.garbage_collect()
     memory_after = :erlang.memory(:total)
@@ -108,10 +165,11 @@ defmodule Derpex.Bench.Relay do
       },
       "relay_flows" => flows,
       "slow_client_isolation" => soak,
+      "idle_connection" => idle,
       "beam_total_memory_before_bytes" => memory_before,
       "beam_total_memory_after_bytes" => memory_after,
       "beam_total_memory_delta_bytes" => memory_after - memory_before,
-      "thresholds_applied" => false
+      "thresholds_applied" => options.fail_on
     }
   end
 
@@ -248,6 +306,40 @@ defmodule Derpex.Bench.Relay do
     end
   end
 
+  # What one connected, silent client costs: four ring tables, their atomics,
+  # and the writer process.
+  defp measure_idle_connection(options) do
+    :erlang.garbage_collect()
+    before_bytes = :erlang.memory(:total)
+    connections = 64
+
+    started =
+      Enum.map(1..connections, fn _index ->
+        start_destination(Transport.new(0), options.queue_depth)
+      end)
+
+    :erlang.garbage_collect()
+    after_bytes = :erlang.memory(:total)
+
+    # Three rings and one lifecycle queue, the way a real connection is built.
+    ring_words =
+      started
+      |> Enum.flat_map(fn {_writer, rings, _destination} -> Map.values(rings) end)
+      |> Enum.map(&outbox_memory_words/1)
+      |> Enum.sum()
+
+    Enum.each(started, fn {writer, rings, destination} ->
+      stop_destination(writer, rings, destination)
+    end)
+
+    %{
+      "connections" => connections,
+      "bytes_per_idle_connection" => div(after_bytes - before_bytes, connections),
+      "ring_table_bytes_per_idle_connection" =>
+        div(ring_words * :erlang.system_info(:wordsize), connections)
+    }
+  end
+
   defp start_destination(socket, queue_depth) do
     {:ok, writer} =
       Writer.start_link(owner: self(), transport: Transport, socket: socket)
@@ -257,8 +349,8 @@ defmodule Derpex.Bench.Relay do
     rings = %{
       ordinary: Ring.new(queue_depth, notifier: writer, wake_message: Writer.wake_message()),
       disco: Ring.new(queue_depth, notifier: writer, wake_message: Writer.wake_message()),
-      pong: Ring.new(1, notifier: writer, wake_message: Writer.wake_message()),
-      lifecycle: Ring.new(queue_depth, notifier: writer, wake_message: Writer.wake_message())
+      pong: Ring.new(1, notifier: writer, wake_message: Writer.wake_message(), full: :reject),
+      lifecycle: LifecycleQueue.new(notifier: writer, wake_message: Writer.wake_message())
     }
 
     :ok = Writer.attach(writer, rings)
@@ -273,10 +365,14 @@ defmodule Derpex.Bench.Relay do
     if Process.alive?(writer), do: Process.exit(writer, :kill)
   end
 
-  defp close_ring(ring) do
-    case Ring.close(ring) do
+  defp outbox_memory_words(%Ring{} = ring), do: Ring.memory_words(ring)
+
+  defp outbox_memory_words(%LifecycleQueue{} = queue), do: LifecycleQueue.memory_words(queue)
+
+  defp close_ring(outbox) do
+    case Outbox.close(outbox) do
       :ok -> :ok
-      :busy -> close_ring(ring)
+      :busy -> close_ring(outbox)
     end
   end
 
@@ -377,19 +473,38 @@ defmodule Derpex.Bench.Relay do
           slow_packets: :integer,
           slow_delay_ms: :integer,
           output: :string,
+          fail_on: :keep,
           help: :boolean
         ]
       )
 
     if positional != [] or invalid != [], do: raise("invalid benchmark arguments")
 
+    {fail_on, parsed} = Keyword.pop_values(parsed, :fail_on)
+
     options =
       @defaults
       |> Map.merge(Map.new(parsed))
+      |> Map.put(:fail_on, parse_thresholds(fail_on))
       |> Map.update!(:sizes, &parse_sizes/1)
       |> Map.put_new(:help, false)
 
     validate_options!(options)
+  end
+
+  defp parse_thresholds(thresholds) do
+    Map.new(thresholds, fn threshold ->
+      with [name, value] <- String.split(threshold, "=", parts: 2),
+           true <- Map.has_key?(@thresholds, name),
+           {limit, ""} <- Float.parse(value) do
+        {name, limit}
+      else
+        _invalid ->
+          raise "--fail-on takes NAME=VALUE with NAME in " <>
+                  "#{@thresholds |> Map.keys() |> Enum.sort() |> Enum.join(", ")}, got " <>
+                  inspect(threshold)
+      end
+    end)
   end
 
   defp parse_sizes(sizes) when is_list(sizes), do: sizes
@@ -425,6 +540,13 @@ defmodule Derpex.Bench.Relay do
       --slow-packets N     saturation attempts in the slow-client soak (default 10000)
       --slow-delay-ms N    simulated blocked write duration (default 1000)
       --output PATH        also write the JSON report to PATH
+      --fail-on NAME=N     fail the run when a healthy flow crosses a threshold;
+                           repeatable. NAME is one of:
+                             memory_delta_bytes    ceiling
+                             latency_p99_us        ceiling
+                             latency_maximum_us    ceiling
+                             queue_replacements    ceiling
+                             packets_per_second    floor
     """)
   end
 end

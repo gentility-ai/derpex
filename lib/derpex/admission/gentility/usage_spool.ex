@@ -31,11 +31,31 @@ defmodule Derpex.Admission.Gentility.UsageSpool do
       bytes: 0
     }
 
-    case path && File.read(path) do
+    case path && readable(path, max_bytes + max_batches * 36 + 64) do
       nil -> {:ok, spool}
+      :missing -> {:ok, spool}
+      {:error, _reason} = error -> error
+      :ok -> read_and_decode(spool, path)
+    end
+  end
+
+  defp read_and_decode(spool, path) do
+    case File.read(path) do
+      {:ok, data} -> decode(spool, data)
       {:error, :enoent} -> {:ok, spool}
       {:error, reason} -> {:error, {:read, reason}}
-      {:ok, data} -> decode(spool, data)
+    end
+  end
+
+  # A symlink or an oversized file where the spool belongs is refused before it
+  # is read: the spool is this relay's own durable state, not shared input.
+  defp readable(path, maximum) do
+    case File.lstat(path) do
+      {:ok, %File.Stat{type: :regular, size: size}} when size <= maximum -> :ok
+      {:ok, %File.Stat{type: :regular}} -> {:error, :spool_too_large}
+      {:ok, %File.Stat{}} -> {:error, :spool_not_a_regular_file}
+      {:error, :enoent} -> :missing
+      {:error, reason} -> {:error, {:read, reason}}
     end
   end
 

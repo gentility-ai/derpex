@@ -1,5 +1,5 @@
-// Copyright (c) 2026 DERPEX contributors.
-// SPDX-License-Identifier: BSD-3-Clause
+// Copyright (c) 2026 Gentility AI & DERPEX contributors.
+// SPDX-License-Identifier: MIT
 
 // Command protocol_edges uses the official low-level DERP client around raw
 // frame writes to cover behavior the high-level client intentionally forbids.
@@ -25,6 +25,10 @@ type connection struct {
 }
 
 func connect(rawURL string) *connection {
+	return connectWithKey(rawURL, key.NewNode())
+}
+
+func connectWithKey(rawURL string, private key.NodePrivate) *connection {
 	u, err := url.Parse(rawURL)
 	if err != nil {
 		panic(err)
@@ -56,7 +60,7 @@ func connect(rawURL string) *connection {
 	}
 
 	client, err := derp.NewClient(
-		key.NewNode(),
+		private,
 		conn,
 		bufio.NewReadWriter(reader, writer),
 		func(string, ...any) {},
@@ -80,7 +84,8 @@ func main() {
 		os.Exit(2)
 	}
 
-	unknown := connect(os.Args[1])
+	rawURL := os.Args[1]
+	unknown := connect(rawURL)
 	const unknownLength = 2 << 20
 	if err := derp.WriteFrameHeader(unknown.writer, derp.FrameType(0xfe), unknownLength); err != nil {
 		panic(err)
@@ -112,7 +117,7 @@ func main() {
 		panic(err)
 	}
 
-	oversize := connect(os.Args[1])
+	oversize := connect(rawURL)
 	oversize.conn.SetReadDeadline(time.Now().Add(5 * time.Second))
 	length := uint32(derp.KeyLen + derp.MaxPacketSize + 1)
 	if err := derp.WriteFrameHeader(oversize.writer, derp.FrameSendPacket, length); err != nil {
@@ -126,5 +131,36 @@ func main() {
 	}
 	oversize.conn.Close()
 
+	// A flood aimed at a key that is connecting must not overtake that
+	// connection's server info: Go writes server info before its send loop
+	// starts, so the first frame a client sees is always FrameServerInfo.
+	// connectWithKey panics when it is not.
+	recipientKey := key.NewNode()
+	sender := connect(rawURL)
+	stop := make(chan struct{})
+	flooded := make(chan struct{})
+	go func() {
+		defer close(flooded)
+		payload := make([]byte, 512)
+		for {
+			select {
+			case <-stop:
+				return
+			default:
+			}
+			if err := sender.client.Send(recipientKey.Public(), payload); err != nil {
+				return
+			}
+		}
+	}()
+	for range 20 {
+		recipient := connectWithKey(rawURL, recipientKey)
+		recipient.conn.Close()
+	}
+	close(stop)
+	<-flooded
+	sender.conn.Close()
+
 	fmt.Println("official low-level client discarded a 2-MiB unknown frame and rejected an oversize packet header")
+	fmt.Println("server info preceded a packet flood aimed at a connecting key")
 }

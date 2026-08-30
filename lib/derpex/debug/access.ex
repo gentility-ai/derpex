@@ -1,5 +1,15 @@
 defmodule Derpex.Debug.Access do
-  @moduledoc "Authorization rules for the pinned protected debug surface."
+  @moduledoc """
+  Authorization rules for the pinned protected debug surface.
+
+  Loopback and the Tailscale IPv6 ULA (`fd7a:115c:a1e0::/48`) are always
+  granted: neither is reachable from the public internet. The Tailscale IPv4
+  CGNAT range (`100.64.0.0/10`) is **not** granted by default, because a relay
+  on a public port can see a carrier-NAT source address that belongs to no
+  tailnet. Set `allow_tailscale_cgnat: true` (from
+  `DERPEX_DEBUG_ALLOW_TAILSCALE_CGNAT=1`) on a relay whose only CGNAT peers are
+  tailnet nodes.
+  """
 
   import Bitwise
 
@@ -55,7 +65,7 @@ defmodule Derpex.Debug.Access do
 
   defp source_authorized?(ip, options) do
     valid_ip?(ip) and
-      (loopback?(ip) or tailscale_ip?(ip) or allowed_ip?(ip, options) or
+      (loopback?(ip) or tailscale_ip?(ip, options) or allowed_ip?(ip, options) or
          trusted_cidr?(ip, Keyword.get(options, :trusted_cidrs, [])))
   end
 
@@ -94,11 +104,12 @@ defmodule Derpex.Debug.Access do
   defp loopback?({0, 0, 0, 0, 0, 0, 0, 1}), do: true
   defp loopback?(_ip), do: false
 
-  defp tailscale_ip?({100, second, _c, _d}), do: second in 64..127
+  defp tailscale_ip?({0xFD7A, 0x115C, 0xA1E0, _d, _e, _f, _g, _h}, _options), do: true
 
-  defp tailscale_ip?({0xFD7A, 0x115C, 0xA1E0, _d, _e, _f, _g, _h}), do: true
+  defp tailscale_ip?({100, second, _c, _d}, options) when second in 64..127,
+    do: Keyword.get(options, :allow_tailscale_cgnat, false) == true
 
-  defp tailscale_ip?(_ip), do: false
+  defp tailscale_ip?(_ip, _options), do: false
 
   defp valid_ip?(ip), do: :inet.is_ip_address(ip)
 

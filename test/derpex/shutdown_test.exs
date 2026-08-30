@@ -42,10 +42,18 @@ defmodule Derpex.ShutdownTest do
     monitor = Process.monitor(missing)
     assert_receive {:DOWN, ^monitor, :process, ^missing, _reason}
 
-    assert %{outcome: :unavailable, forced_connections: 0, elapsed_ms: elapsed} =
-             Shutdown.run(missing, deadline_ms: 100)
+    # The property is that the run does not sit out its own deadline, so the
+    # comparison is against that deadline arriving, not against a wall-clock
+    # budget that a loaded machine can blow through.
+    deadline_ms = 1_000
+    deadline = Process.send_after(self(), :deadline_reached, deadline_ms)
 
-    assert elapsed < 10
+    assert %{outcome: :unavailable, forced_connections: 0, elapsed_ms: elapsed} =
+             Shutdown.run(missing, deadline_ms: deadline_ms)
+
+    refute_received :deadline_reached
+    Process.cancel_timer(deadline)
+    assert elapsed < deadline_ms
   end
 
   defp relay(parent) do

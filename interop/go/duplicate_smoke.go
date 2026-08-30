@@ -1,5 +1,5 @@
-// Copyright (c) 2026 DERPEX contributors.
-// SPDX-License-Identifier: BSD-3-Clause
+// Copyright (c) 2026 Gentility AI & DERPEX contributors.
+// SPDX-License-Identifier: MIT
 
 // Command duplicate_smoke proves the pinned server's default last-writer-active
 // duplicate-key behavior using only unchanged official DERP HTTP clients.

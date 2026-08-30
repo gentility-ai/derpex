@@ -11,9 +11,11 @@ defmodule Derpex.Listener.HandlerTest do
   alias Derpex.Handshake
   alias Derpex.Listener.Handler
   alias Derpex.Metrics
+  alias Derpex.Outbox.LifecycleQueue
   alias Derpex.Outbox.Ring
   alias Derpex.RateConfig
   alias Derpex.RateController
+  alias Derpex.Secret
 
   defmodule LifecyclePolicy do
     @behaviour Derpex.Admission
@@ -65,7 +67,11 @@ defmodule Derpex.Listener.HandlerTest do
         transport_options: [ip: {127, 0, 0, 1}],
         num_acceptors: 1,
         handler_module: Handler,
-        handler_options: [server_private_key: server_private, event_handler: event_handler]
+        handler_options: [
+          server_private_key: Secret.wrap(server_private),
+          server_public_key: server_public,
+          event_handler: event_handler
+        ]
       )
 
     stop_server_on_exit(server)
@@ -121,7 +127,11 @@ defmodule Derpex.Listener.HandlerTest do
         transport_options: [ip: {127, 0, 0, 1}],
         num_acceptors: 1,
         handler_module: Handler,
-        handler_options: [server_private_key: server_private, event_handler: event_handler]
+        handler_options: [
+          server_private_key: Secret.wrap(server_private),
+          server_public_key: server_public,
+          event_handler: event_handler
+        ]
       )
 
     stop_server_on_exit(server)
@@ -167,8 +177,9 @@ defmodule Derpex.Listener.HandlerTest do
         num_acceptors: 1,
         handler_module: Handler,
         handler_options: [
-          server_private_key: server_private,
-          mesh_key: mesh_key,
+          server_private_key: Secret.wrap(server_private),
+          server_public_key: server_public,
+          mesh_key: Secret.wrap(mesh_key),
           client_verifier: verifier,
           admission: admission,
           disallowed_app_names: ["badapp"]
@@ -225,7 +236,8 @@ defmodule Derpex.Listener.HandlerTest do
         num_acceptors: 1,
         handler_module: Handler,
         handler_options: [
-          server_private_key: server_private,
+          server_private_key: Secret.wrap(server_private),
+          server_public_key: server_public,
           admission: {LifecyclePolicy, self()}
         ]
       )
@@ -290,7 +302,8 @@ defmodule Derpex.Listener.HandlerTest do
         num_acceptors: 1,
         handler_module: Handler,
         handler_options: [
-          server_private_key: server_private,
+          server_private_key: Secret.wrap(server_private),
+          server_public_key: server_public,
           event_handler: event_handler,
           rate_controller: rate_controller
         ]
@@ -340,9 +353,34 @@ defmodule Derpex.Listener.HandlerTest do
     :gen_tcp.close(socket)
   end
 
-  test "accept limiting closes excess sockets before HTTP session allocation" do
-    limiter = start_supervised!({AcceptLimiter, name: nil, config: {0, 1}})
-    {_server_public, server_private} = Crypto.generate_keypair()
+  test "a paced connection still keeps alive and still closes on demand" do
+    start_supervised!({Manual, monotonic_time: 0})
+    previous_clock = Application.fetch_env!(:derpex, :clock)
+    Application.put_env(:derpex, :clock, Manual)
+    on_exit(fn -> Application.put_env(:derpex, :clock, previous_clock) end)
+
+    # One byte per second, with the smallest burst the config allows: the first
+    # frame is admitted from the burst, the second waits most of a day.
+    rate_controller =
+      start_supervised!(
+        {RateController,
+         name: nil,
+         config: %RateConfig{
+           per_client_rate_limit_bytes_per_second: 1,
+           per_client_rate_burst_bytes: RateConfig.minimum_burst()
+         }}
+      )
+
+    {server_public, server_private} = Crypto.generate_keypair()
+    {_client_public, client_private} = Crypto.generate_keypair()
+    destination = :crypto.strong_rand_bytes(32)
+    payload = :binary.copy(<<0xA5>>, 65_536)
+    parent = self()
+
+    event_handler = fn event ->
+      send(parent, {:handler_event, self(), event})
+      :ok
+    end
 
     {:ok, server} =
       ThousandIsland.start_link(
@@ -350,7 +388,548 @@ defmodule Derpex.Listener.HandlerTest do
         transport_options: [ip: {127, 0, 0, 1}],
         num_acceptors: 1,
         handler_module: Handler,
-        handler_options: [server_private_key: server_private, accept_limiter: limiter]
+        handler_options: [
+          server_private_key: Secret.wrap(server_private),
+          server_public_key: server_public,
+          event_handler: event_handler,
+          rate_controller: rate_controller
+        ]
+      )
+
+    stop_server_on_exit(server)
+    {:ok, {_ip, port}} = ThousandIsland.listener_info(server)
+    socket = connect_and_send_info(port, server_public, client_private, %ClientInfo{version: 2})
+    assert_receive {:handler_event, handler, {:authenticated, _key, %ClientInfo{}}}, 2_000
+    assert {:ok, <<_server_info_type, length::unsigned-big-32>>} = :gen_tcp.recv(socket, 5, 2_000)
+    assert {:ok, _server_info} = :gen_tcp.recv(socket, length, 2_000)
+
+    packet = IO.iodata_to_binary(Frame.encode(:send_packet, [destination, payload]))
+    :ok = :gen_tcp.send(socket, packet)
+
+    assert_receive {:handler_event, ^handler,
+                    {:client_message, {:send_packet, ^destination, ^payload}}},
+                   2_000
+
+    :ok = :gen_tcp.send(socket, packet)
+    assert_eventually(fn -> Manual.pending_timer_count() == 2 end)
+
+    # The keepalive is due long before the pace is: a handler that parked in a
+    # selective receive would answer neither.
+    :ok = Manual.advance(65_000)
+    assert {:ok, <<keep_alive_type, 0::unsigned-big-32>>} = :gen_tcp.recv(socket, 5, 2_000)
+    assert keep_alive_type == Frame.type(:keep_alive)
+
+    monitor = Process.monitor(handler)
+    send(handler, {:derpex_drain_close, make_ref()})
+    assert_receive {:DOWN, ^monitor, :process, ^handler, _reason}, 100
+    :gen_tcp.close(socket)
+  end
+
+  @tag :performance
+  test "a paced connection cannot be made to buffer without limit" do
+    start_supervised!({Manual, monotonic_time: 0})
+    previous_clock = Application.fetch_env!(:derpex, :clock)
+    Application.put_env(:derpex, :clock, Manual)
+    on_exit(fn -> Application.put_env(:derpex, :clock, previous_clock) end)
+
+    rate_controller =
+      start_supervised!(
+        {RateController,
+         name: nil,
+         config: %RateConfig{
+           per_client_rate_limit_bytes_per_second: 1,
+           per_client_rate_burst_bytes: RateConfig.minimum_burst()
+         }}
+      )
+
+    {server_public, server_private} = Crypto.generate_keypair()
+    {_client_public, client_private} = Crypto.generate_keypair()
+    destination = :crypto.strong_rand_bytes(32)
+    payload = :binary.copy(<<0xA5>>, 65_536)
+    parent = self()
+
+    event_handler = fn event ->
+      send(parent, {:handler_event, self(), event})
+      :ok
+    end
+
+    {:ok, server} =
+      ThousandIsland.start_link(
+        port: 0,
+        # Room for a client to keep sending: with a small kernel buffer the
+        # socket stops it long before the handler's own limit matters.
+        transport_options: [ip: {127, 0, 0, 1}, recbuf: 4 * 1_024 * 1_024],
+        num_acceptors: 1,
+        handler_module: Handler,
+        handler_options: [
+          server_private_key: Secret.wrap(server_private),
+          server_public_key: server_public,
+          event_handler: event_handler,
+          rate_controller: rate_controller
+        ]
+      )
+
+    stop_server_on_exit(server)
+    {:ok, {_ip, port}} = ThousandIsland.listener_info(server)
+    socket = connect_and_send_info(port, server_public, client_private, %ClientInfo{version: 2})
+    :ok = :inet.setopts(socket, sndbuf: 4 * 1_024 * 1_024)
+    assert_receive {:handler_event, handler, {:authenticated, _key, %ClientInfo{}}}, 2_000
+    assert {:ok, <<_type, length::unsigned-big-32>>} = :gen_tcp.recv(socket, 5, 2_000)
+    assert {:ok, _server_info} = :gen_tcp.recv(socket, length, 2_000)
+
+    packet = IO.iodata_to_binary(Frame.encode(:send_packet, [destination, payload]))
+    :ok = :gen_tcp.send(socket, packet)
+
+    assert_receive {:handler_event, ^handler,
+                    {:client_message, {:send_packet, ^destination, ^payload}}},
+                   2_000
+
+    :ok = :gen_tcp.send(socket, packet)
+    assert_eventually(fn -> Manual.pending_timer_count() == 2 end)
+
+    # A paced client that keeps sending is handed one segment per cycle by
+    # Thousand Island. Half a megabyte of it must not become half a megabyte of
+    # handler; the fault this covers retained 403 MiB in one second.
+    monitor = Process.monitor(handler)
+    # The client must not block on a server that has stopped reading: a send
+    # that times out is the backpressure working.
+    :ok = :inet.setopts(socket, send_timeout: 100)
+    junk = :binary.copy(<<0x5A>>, 64 * 1_024)
+    peak = flood_paced(socket, junk, 16, 0, handler)
+
+    assert peak < 1_048_576,
+           "a paced handler held #{div(peak, 1_024)} KiB of binaries"
+
+    # Whatever Thousand Island hands over while the socket is meant to be
+    # passive, the handler holds one delivery of it, not a delivery per cycle.
+    # The 256 KiB backstop is far above this; reaching it would mean the socket
+    # kept sending after it was told to stop.
+    {_socket, paced_state} = :sys.get_state(handler)
+    assert byte_size(paced_state.paced_data) <= 128 * 1_024
+    assert Process.alive?(handler)
+    refute_received {:DOWN, ^monitor, :process, ^handler, _reason}
+
+    :gen_tcp.close(socket)
+  end
+
+  # Go's read loop waits on its rate limiter and lets the kernel receive buffer
+  # slow the client down; it never disconnects a client for reading too fast.
+  # A paced read cap smaller than one frame the server itself accepts made the
+  # relay do exactly that: a client sending maximum-size packets — nothing
+  # malformed, nothing oversized — was closed with a paced-read overrun.
+  test "a client that outruns its byte rate is throttled rather than closed" do
+    scenarios = [
+      # A maximum-size packet is 65,573 bytes on the wire, larger than a 64 KiB
+      # cap on its own, and its rate allows exactly one of them per second.
+      {65_536, 65_568, 6},
+      # Nothing about the fault needs large frames: ordinary 1280-byte packets
+      # at 100 KB/s pace once the burst is spent, and then buffer just the same.
+      {1_280, 100_000, 400},
+      # The extreme: a rate no packet can be paid for inside the test.
+      {65_536, 1, 3}
+    ]
+
+    Enum.each(scenarios, &assert_throttled_not_closed/1)
+  end
+
+  defp assert_throttled_not_closed({payload_size, rate, frames}) do
+    rate_controller =
+      start_supervised!(
+        {RateController,
+         name: nil,
+         config: %RateConfig{
+           per_client_rate_limit_bytes_per_second: rate,
+           per_client_rate_burst_bytes: RateConfig.minimum_burst()
+         }},
+        id: {:rate_controller, payload_size, rate}
+      )
+
+    {server_public, server_private} = Crypto.generate_keypair()
+    {client_public, client_private} = Crypto.generate_keypair()
+    parent = self()
+
+    event_handler = fn event ->
+      send(parent, {:handler_event, self(), event})
+      :ok
+    end
+
+    {:ok, server} =
+      ThousandIsland.start_link(
+        port: 0,
+        transport_options: [ip: {127, 0, 0, 1}],
+        num_acceptors: 1,
+        handler_module: Handler,
+        handler_options: [
+          server_private_key: Secret.wrap(server_private),
+          server_public_key: server_public,
+          event_handler: event_handler,
+          rate_controller: rate_controller
+        ]
+      )
+
+    stop_server_on_exit(server)
+    {:ok, {_ip, port}} = ThousandIsland.listener_info(server)
+    socket = connect_and_send_info(port, server_public, client_private, %ClientInfo{version: 2})
+    assert_receive {:handler_event, handler, {:authenticated, ^client_public, _info}}, 2_000
+    monitor = Process.monitor(handler)
+
+    # A send that times out is the backpressure working: the server is meant to
+    # stop reading, not to stop the connection.
+    :ok = :inet.setopts(socket, send_timeout: 200)
+    destination = :crypto.strong_rand_bytes(32)
+    payload = :binary.copy(<<0xA5>>, payload_size)
+    frame = IO.iodata_to_binary(Frame.encode(:send_packet, [destination, payload]))
+    send_until_refused(socket, frame, frames)
+
+    refute_receive {:DOWN, ^monitor, :process, ^handler, _reason}, 1_000
+    assert Process.alive?(handler)
+    :gen_tcp.close(socket)
+  end
+
+  defp send_until_refused(_socket, _frame, 0), do: :ok
+
+  defp send_until_refused(socket, frame, remaining) do
+    case :gen_tcp.send(socket, frame) do
+      :ok -> send_until_refused(socket, frame, remaining - 1)
+      {:error, _blocked_or_closed} -> :ok
+    end
+  end
+
+  defp flood_paced(_socket, _junk, 0, peak, _handler), do: peak
+
+  defp flood_paced(socket, junk, remaining, peak, handler) do
+    case :gen_tcp.send(socket, junk) do
+      :ok ->
+        peak = max(peak, handler_binary_bytes(handler))
+        flood_paced(socket, junk, remaining - 1, peak, handler)
+
+      {:error, _closed} ->
+        peak
+    end
+  end
+
+  defp handler_binary_bytes(handler) do
+    case Process.info(handler, :binary) do
+      {:binary, binaries} ->
+        Enum.reduce(binaries, 0, fn {_id, size, _refs}, total -> total + size end)
+
+      nil ->
+        0
+    end
+  end
+
+  test "a paced WebSocket connection is paced, not crashed" do
+    start_supervised!({Manual, monotonic_time: 0})
+    previous_clock = Application.fetch_env!(:derpex, :clock)
+    Application.put_env(:derpex, :clock, Manual)
+    on_exit(fn -> Application.put_env(:derpex, :clock, previous_clock) end)
+
+    rate_controller =
+      start_supervised!(
+        {RateController,
+         name: nil,
+         config: %RateConfig{
+           per_client_rate_limit_bytes_per_second: 1,
+           per_client_rate_burst_bytes: RateConfig.minimum_burst()
+         }}
+      )
+
+    {server_public, server_private} = Crypto.generate_keypair()
+    {_client_public, client_private} = Crypto.generate_keypair()
+    destination = :crypto.strong_rand_bytes(32)
+    payload = :binary.copy(<<0xA5>>, 65_536)
+    parent = self()
+
+    event_handler = fn event ->
+      send(parent, {:handler_event, self(), event})
+      :ok
+    end
+
+    {:ok, server} =
+      ThousandIsland.start_link(
+        port: 0,
+        transport_options: [ip: {127, 0, 0, 1}],
+        num_acceptors: 1,
+        handler_module: Handler,
+        handler_options: [
+          server_private_key: Secret.wrap(server_private),
+          server_public_key: server_public,
+          event_handler: event_handler,
+          rate_controller: rate_controller
+        ]
+      )
+
+    stop_server_on_exit(server)
+    {:ok, {_ip, port}} = ThousandIsland.listener_info(server)
+    socket = connect_websocket(port, server_public, client_private)
+    assert_receive {:handler_event, handler, {:authenticated, _key, %ClientInfo{}}}, 2_000
+    monitor = Process.monitor(handler)
+
+    packet = IO.iodata_to_binary(Frame.encode(:send_packet, [destination, payload]))
+    :ok = :gen_tcp.send(socket, websocket_client_frame(packet))
+
+    assert_receive {:handler_event, ^handler,
+                    {:client_message, {:send_packet, ^destination, ^payload}}},
+                   2_000
+
+    # The second message is the one that pauses: it is a rate-limit decision
+    # the WebSocket path used to have no branch for, and the connection died of
+    # a CaseClauseError instead of waiting.
+    :ok = :gen_tcp.send(socket, websocket_client_frame(packet))
+    assert_eventually(fn -> Manual.pending_timer_count() == 2 end)
+    refute_received {:DOWN, ^monitor, :process, ^handler, _reason}
+
+    # Paced, and still answering: a drain close closes it without the clock
+    # ever reaching the pace deadline.
+    send(handler, {:derpex_drain_close, make_ref()})
+    assert_receive {:DOWN, ^monitor, :process, ^handler, _reason}, 100
+    :gen_tcp.close(socket)
+  end
+
+  # A client is allowed to pipeline its whole opening burst behind the upgrade
+  # request. Everything after the request is read-ahead, and the handler runs it
+  # from inside the action list the upgrade produced rather than from a socket
+  # read, so a rate limit reached there is reached on a path that never had a
+  # branch for pacing: the connection died of a CaseClauseError with the client
+  # doing nothing wrong.
+  test "read-ahead pipelined with the upgrade is paced, not crashed" do
+    start_supervised!({Manual, monotonic_time: 0})
+    previous_clock = Application.fetch_env!(:derpex, :clock)
+    Application.put_env(:derpex, :clock, Manual)
+    on_exit(fn -> Application.put_env(:derpex, :clock, previous_clock) end)
+
+    rate_controller =
+      start_supervised!(
+        {RateController,
+         name: nil,
+         config: %RateConfig{
+           per_client_rate_limit_bytes_per_second: 1,
+           per_client_rate_burst_bytes: RateConfig.minimum_burst()
+         }}
+      )
+
+    {server_public, server_private} = Crypto.generate_keypair()
+    {_client_public, client_private} = Crypto.generate_keypair()
+    destination = :crypto.strong_rand_bytes(32)
+    payload = :binary.copy(<<0xA5>>, 65_536)
+    parent = self()
+
+    event_handler = fn event ->
+      send(parent, {:handler_event, self(), event})
+      :ok
+    end
+
+    {:ok, server} =
+      ThousandIsland.start_link(
+        port: 0,
+        # Buffers large enough that the opening burst is one read: the fault
+        # needs the frames to arrive with the request they were pipelined
+        # behind, which is what a client that writes them together does.
+        transport_options: [
+          ip: {127, 0, 0, 1},
+          recbuf: 4 * 1_024 * 1_024,
+          buffer: 4 * 1_024 * 1_024
+        ],
+        num_acceptors: 1,
+        handler_module: Handler,
+        handler_options: [
+          server_private_key: Secret.wrap(server_private),
+          server_public_key: server_public,
+          event_handler: event_handler,
+          rate_controller: rate_controller
+        ]
+      )
+
+    stop_server_on_exit(server)
+    {:ok, {_ip, port}} = ThousandIsland.listener_info(server)
+    {:ok, socket} = :gen_tcp.connect({127, 0, 0, 1}, port, [:binary, active: false])
+    key = Base.encode64(:crypto.strong_rand_bytes(16))
+
+    request =
+      "GET /derp HTTP/1.1\r\nHost: localhost\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n" <>
+        "Sec-WebSocket-Version: 13\r\nSec-WebSocket-Key: #{key}\r\n" <>
+        "Sec-WebSocket-Protocol: derp\r\n\r\n"
+
+    info = %ClientInfo{version: 2, can_ack_pings: true, app_name: "ws-pipelined"}
+    {:ok, client_info} = Handshake.client_info_frame(client_private, server_public, info)
+    packet = IO.iodata_to_binary(Frame.encode(:send_packet, [destination, payload]))
+
+    # The first packet exactly consumes the burst, which is sized for one
+    # maximum DERP frame, so the second one has to wait.
+    :ok =
+      :gen_tcp.send(
+        socket,
+        request <>
+          websocket_client_frame(IO.iodata_to_binary(client_info)) <>
+          websocket_client_frame(packet) <> websocket_client_frame(packet)
+      )
+
+    assert_receive {:handler_event, handler, {:authenticated, _key, %ClientInfo{}}}, 2_000
+    monitor = Process.monitor(handler)
+
+    assert_receive {:handler_event, ^handler,
+                    {:client_message, {:send_packet, ^destination, ^payload}}},
+                   2_000
+
+    assert_eventually(fn -> Manual.pending_timer_count() == 2 end)
+    refute_received {:DOWN, ^monitor, :process, ^handler, _reason}
+    assert Process.alive?(handler)
+
+    # Paced, and still answering: a drain close closes it without the clock
+    # ever reaching the pace deadline.
+    send(handler, {:derpex_drain_close, make_ref()})
+    assert_receive {:DOWN, ^monitor, :process, ^handler, _reason}, 100
+    :gen_tcp.close(socket)
+  end
+
+  defp connect_websocket(port, server_public, client_private) do
+    {:ok, socket} = :gen_tcp.connect({127, 0, 0, 1}, port, [:binary, active: false])
+    key = Base.encode64(:crypto.strong_rand_bytes(16))
+
+    request =
+      "GET /derp HTTP/1.1\r\nHost: localhost\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n" <>
+        "Sec-WebSocket-Version: 13\r\nSec-WebSocket-Key: #{key}\r\n" <>
+        "Sec-WebSocket-Protocol: derp\r\n\r\n"
+
+    :ok = :gen_tcp.send(socket, request)
+    :ok = read_until_blank_line(socket)
+
+    {:ok, :server_key, greeting} = recv_websocket_frame(socket)
+    {:ok, ^server_public} = Handshake.decode_server_key(greeting)
+
+    info = %ClientInfo{version: 2, can_ack_pings: true, app_name: "ws-pacing"}
+    {:ok, client_info} = Handshake.client_info_frame(client_private, server_public, info)
+    :ok = :gen_tcp.send(socket, websocket_client_frame(IO.iodata_to_binary(client_info)))
+    {:ok, :server_info, _payload} = recv_websocket_frame(socket)
+    socket
+  end
+
+  defp read_until_blank_line(socket, seen \\ "") do
+    {:ok, data} = :gen_tcp.recv(socket, 0, 2_000)
+    seen = seen <> data
+
+    if String.contains?(seen, "\r\n\r\n") do
+      [_headers, rest] = String.split(seen, "\r\n\r\n", parts: 2)
+      Process.put({:ws_buffer, socket}, rest)
+      :ok
+    else
+      read_until_blank_line(socket, seen)
+    end
+  end
+
+  defp recv_websocket_frame(socket) do
+    <<0x82, first>> = read_exactly(socket, 2)
+
+    length =
+      case first do
+        126 -> :binary.decode_unsigned(read_exactly(socket, 2))
+        127 -> :binary.decode_unsigned(read_exactly(socket, 8))
+        length -> length
+      end
+
+    <<type, frame_length::unsigned-big-32, payload::binary-size(frame_length)>> =
+      read_exactly(socket, length)
+
+    {:ok, name} = Frame.type_name(type)
+    {:ok, name, payload}
+  end
+
+  defp read_exactly(socket, length) do
+    buffered = Process.get({:ws_buffer, socket}, "")
+
+    if byte_size(buffered) >= length do
+      <<wanted::binary-size(^length), rest::binary>> = buffered
+      Process.put({:ws_buffer, socket}, rest)
+      wanted
+    else
+      {:ok, data} = :gen_tcp.recv(socket, 0, 2_000)
+      Process.put({:ws_buffer, socket}, buffered <> data)
+      read_exactly(socket, length)
+    end
+  end
+
+  defp websocket_client_frame(payload) do
+    mask = :crypto.strong_rand_bytes(4)
+    length = byte_size(payload)
+
+    header =
+      cond do
+        length < 126 -> <<1::1, 0::3, 0x2::4, 1::1, length::7>>
+        length <= 65_535 -> <<1::1, 0::3, 0x2::4, 1::1, 126::7, length::unsigned-big-16>>
+        true -> <<1::1, 0::3, 0x2::4, 1::1, 127::7, length::unsigned-big-64>>
+      end
+
+    repeated = :binary.copy(mask, div(length + 3, 4))
+    header <> mask <> :crypto.exor(binary_part(repeated, 0, length), payload)
+  end
+
+  test "a crashing mesh connection does not print the peer's mesh key" do
+    {server_public, server_private} = Crypto.generate_keypair()
+    mesh_key = :crypto.strong_rand_bytes(32)
+    parent = self()
+
+    event_handler = fn event ->
+      send(parent, {:handler_event, self(), event})
+      :ok
+    end
+
+    {:ok, server} =
+      ThousandIsland.start_link(
+        port: 0,
+        transport_options: [ip: {127, 0, 0, 1}],
+        num_acceptors: 1,
+        handler_module: Handler,
+        handler_options: [
+          server_private_key: Secret.wrap(server_private),
+          server_public_key: server_public,
+          mesh_key: Secret.wrap(mesh_key),
+          event_handler: event_handler
+        ]
+      )
+
+    stop_server_on_exit(server)
+    {:ok, {_ip, port}} = ThousandIsland.listener_info(server)
+    {_mesh_public, mesh_private} = Crypto.generate_keypair()
+
+    socket =
+      connect_and_send_info(port, server_public, mesh_private, %ClientInfo{
+        version: 2,
+        mesh_key: mesh_key
+      })
+
+    assert_receive {:handler_event, handler, {:authenticated, _key, %ClientInfo{}}}, 2_000
+    monitor = Process.monitor(handler)
+
+    # An unmatched message crashes the handler, and a crash report prints the
+    # process state - which holds the peer's ClientInfo.
+    log =
+      ExUnit.CaptureLog.capture_log(fn ->
+        send(handler, :derpex_unmatched_message)
+        assert_receive {:DOWN, ^monitor, :process, ^handler, _reason}, 2_000
+      end)
+
+    assert log =~ "terminating"
+    refute log =~ Base.encode16(mesh_key)
+    refute log =~ Base.encode16(mesh_key, case: :lower)
+    refute log =~ inspect(mesh_key, limit: :infinity, binaries: :as_binaries)
+    :gen_tcp.close(socket)
+  end
+
+  test "accept limiting closes excess sockets before HTTP session allocation" do
+    limiter = start_supervised!({AcceptLimiter, name: nil, config: {0, 1}})
+    {server_public, server_private} = Crypto.generate_keypair()
+
+    {:ok, server} =
+      ThousandIsland.start_link(
+        port: 0,
+        transport_options: [ip: {127, 0, 0, 1}],
+        num_acceptors: 1,
+        handler_module: Handler,
+        handler_options: [
+          server_private_key: Secret.wrap(server_private),
+          server_public_key: server_public,
+          accept_limiter: limiter
+        ]
       )
 
     stop_server_on_exit(server)
@@ -370,7 +949,7 @@ defmodule Derpex.Listener.HandlerTest do
         {AcceptLimiter, name: nil, config: [per_ip_connections: 1, max_tracked_ips: 16]}
       )
 
-    {_server_public, server_private} = Crypto.generate_keypair()
+    {server_public, server_private} = Crypto.generate_keypair()
 
     {:ok, server} =
       ThousandIsland.start_link(
@@ -378,7 +957,11 @@ defmodule Derpex.Listener.HandlerTest do
         transport_options: [ip: {127, 0, 0, 1}],
         num_acceptors: 1,
         handler_module: Handler,
-        handler_options: [server_private_key: server_private, accept_limiter: limiter]
+        handler_options: [
+          server_private_key: Secret.wrap(server_private),
+          server_public_key: server_public,
+          accept_limiter: limiter
+        ]
       )
 
     stop_server_on_exit(server)
@@ -412,7 +995,11 @@ defmodule Derpex.Listener.HandlerTest do
         transport_options: [ip: {127, 0, 0, 1}],
         num_acceptors: 1,
         handler_module: Handler,
-        handler_options: [server_private_key: server_private, drain: drain]
+        handler_options: [
+          server_private_key: Secret.wrap(server_private),
+          server_public_key: server_public,
+          drain: drain
+        ]
       )
 
     stop_server_on_exit(server)
@@ -459,7 +1046,10 @@ defmodule Derpex.Listener.HandlerTest do
         transport_options: [ip: {127, 0, 0, 1}],
         num_acceptors: 1,
         handler_module: Handler,
-        handler_options: [server_private_key: server_private]
+        handler_options: [
+          server_private_key: Secret.wrap(server_private),
+          server_public_key: server_public
+        ]
       )
 
     stop_server_on_exit(server)
@@ -516,7 +1106,8 @@ defmodule Derpex.Listener.HandlerTest do
         num_acceptors: 1,
         handler_module: Handler,
         handler_options: [
-          server_private_key: server_private,
+          server_private_key: Secret.wrap(server_private),
+          server_public_key: server_public,
           send_queue_depth: 64,
           event_handler: event_handler
         ]
@@ -530,13 +1121,15 @@ defmodule Derpex.Listener.HandlerTest do
     {_thousand_island_socket, state} = :sys.get_state(handler)
     assert Ring.stats(state.ordinary).capacity == 64
     assert Ring.stats(state.disco).capacity == 64
-    assert Ring.stats(state.lifecycle).capacity == 32
+    # Lifecycle frames are state changes, so their queue grows instead of
+    # replacing: it has a soft cap, not a capacity.
+    assert LifecycleQueue.stats(state.lifecycle).soft_cap == 65_536
     assert Ring.stats(state.pong).capacity == 1
     :gen_tcp.close(socket)
   end
 
   test "serves authorized traffic diagnostics as a live chunked stream" do
-    {_server_public, server_private} = Crypto.generate_keypair()
+    {server_public, server_private} = Crypto.generate_keypair()
     parent = self()
 
     run_ss = fn ->
@@ -551,7 +1144,8 @@ defmodule Derpex.Listener.HandlerTest do
         num_acceptors: 1,
         handler_module: Handler,
         handler_options: [
-          server_private_key: server_private,
+          server_private_key: Secret.wrap(server_private),
+          server_public_key: server_public,
           debug: [traffic: [run_ss: run_ss, interval_ms: 60_000]]
         ]
       )
@@ -592,7 +1186,8 @@ defmodule Derpex.Listener.HandlerTest do
         num_acceptors: 1,
         handler_module: Handler,
         handler_options: [
-          server_private_key: server_private,
+          server_private_key: Secret.wrap(server_private),
+          server_public_key: server_public,
           tcp_rtt: [reader: reader, interval_ms: 10_000]
         ]
       )
@@ -617,6 +1212,93 @@ defmodule Derpex.Listener.HandlerTest do
     :gen_tcp.close(socket)
     assert_receive {:DOWN, ^monitor, :process, ^handler, _reason}, 2_000
     assert_eventually(fn -> Manual.pending_timer_count() == 0 end)
+  end
+
+  test "a packet sent during a handshake is queued, and server_info still goes first" do
+    {server_public, server_private} = Crypto.generate_keypair()
+    {sender_public, sender_private} = Crypto.generate_keypair()
+    {recipient_public, recipient_private} = Crypto.generate_keypair()
+    parent = self()
+
+    # Registration makes the recipient routable; blocking here holds the handler
+    # at exactly that point, before its server info is written and before its
+    # send loop starts, while the sender floods the new route.
+    event_handler = fn
+      {:authenticated, ^recipient_public, _info} = event ->
+        send(parent, {:registering, self()})
+
+        receive do
+          :flooded -> :ok
+        after
+          2_000 -> :ok
+        end
+
+        send(parent, event)
+        :ok
+
+      event ->
+        send(parent, event)
+        :ok
+    end
+
+    {:ok, server} =
+      ThousandIsland.start_link(
+        port: 0,
+        transport_options: [ip: {127, 0, 0, 1}],
+        num_acceptors: 1,
+        handler_module: Handler,
+        handler_options: [
+          server_private_key: Secret.wrap(server_private),
+          server_public_key: server_public,
+          event_handler: event_handler
+        ]
+      )
+
+    stop_server_on_exit(server)
+    {:ok, {_ip, port}} = ThousandIsland.listener_info(server)
+
+    sender = connect_and_send_info(port, server_public, sender_private, %ClientInfo{version: 2})
+    assert_receive {:authenticated, ^sender_public, _sender_info}, 2_000
+    assert {:ok, <<_type, length::unsigned-big-32>>} = :gen_tcp.recv(sender, 5, 2_000)
+    assert {:ok, _server_info} = :gen_tcp.recv(sender, length, 2_000)
+
+    recipient =
+      connect_and_send_info(port, server_public, recipient_private, %ClientInfo{version: 2})
+
+    assert_receive {:registering, handler}, 2_000
+
+    packet = IO.iodata_to_binary(Frame.encode(:send_packet, [recipient_public, "flood"]))
+    before = Metrics.snapshot()
+    for _ <- 1..64, do: :ok = :gen_tcp.send(sender, packet)
+    assert_receive {:client_message, {:send_packet, ^recipient_public, "flood"}}, 2_000
+
+    # The flood is in the recipient's queues, which no writer is draining yet.
+    Process.sleep(50)
+    send(handler, :flooded)
+
+    assert {:ok, <<first_type, first_length::unsigned-big-32>>} =
+             :gen_tcp.recv(recipient, 5, 2_000)
+
+    assert first_type == Frame.type(:server_info)
+    assert {:ok, body} = :gen_tcp.recv(recipient, first_length, 2_000)
+
+    assert Handshake.decode_server_info(body, recipient_private, server_public) ==
+             {:ok, %Derpex.ServerInfo{version: 2}}
+
+    # The packets that arrived mid-handshake were queued, not refused: the
+    # recipient was already registered when they were routed.
+    assert {:ok, <<packet_type, _length::unsigned-big-32>>} = :gen_tcp.recv(recipient, 5, 2_000)
+    assert packet_type == Frame.type(:recv_packet)
+
+    current = Metrics.snapshot()
+
+    for kind <- [:disco, :other] do
+      assert current[{:packets_dropped, :unknown_dest, kind}] ==
+               before[{:packets_dropped, :unknown_dest, kind}]
+    end
+
+    :gen_tcp.close(sender)
+    :gen_tcp.close(recipient)
   end
 
   defp stop_server_on_exit(server) do

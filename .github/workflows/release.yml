@@ -15,6 +15,12 @@ permissions:
   contents: read
 
 jobs:
+  gate:
+    name: Full continuous integration gate
+    permissions:
+      contents: read
+    uses: ./.github/workflows/ci.yml
+
   version:
     name: Validate version
     runs-on: ubuntu-24.04
@@ -39,9 +45,35 @@ jobs:
           test "$MIX_VERSION" = "$VERSION"
           echo "value=$VERSION" >> "$GITHUB_OUTPUT"
 
+      # The manifest is committed, not generated at publish time: publish-native
+      # only compares it against the archives this run built. An empty manifest
+      # therefore ships a release whose consumers must compile the NIF from
+      # source, which a stable tag must never do silently.
+      - name: Require a published checksum manifest on a stable tag
+        env:
+          VERSION: ${{ steps.version.outputs.value }}
+        run: |
+          MANIFEST=checksum-Elixir.Derpex.Crypto.Native.exs
+
+          if [[ "$GITHUB_REF" != refs/tags/v* ]]; then
+            echo "not a tag push: $MANIFEST is not required"
+            exit 0
+          fi
+
+          if [[ "$VERSION" == *-* ]]; then
+            echo "prerelease $VERSION: consumers build the NIF from source, so an empty $MANIFEST is expected"
+            exit 0
+          fi
+
+          if [[ "$(tr -d '[:space:]' < "$MANIFEST")" == "%{}" ]]; then
+            echo "$MANIFEST is empty on stable tag v$VERSION." >&2
+            echo "Tag a prerelease, commit the manifest that run publishes, then tag v$VERSION." >&2
+            exit 1
+          fi
+
   build-native:
     name: NIF ${{ matrix.target }}
-    needs: version
+    needs: [gate, version]
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
@@ -96,7 +128,7 @@ jobs:
 
   manifest:
     name: Generate checksum manifest
-    needs: [version, build-native]
+    needs: [gate, version, build-native]
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
@@ -129,7 +161,7 @@ jobs:
   publish-native:
     name: Publish native release
     if: startsWith(github.ref, 'refs/tags/v')
-    needs: [version, build-native, manifest]
+    needs: [gate, version, build-native, manifest]
     runs-on: ubuntu-24.04
     permissions:
       contents: write
@@ -163,7 +195,7 @@ jobs:
   runtime-smoke:
     name: Verify tagged runtime image
     if: startsWith(github.ref, 'refs/tags/v')
-    needs: [version, publish-native]
+    needs: [gate, version, publish-native]
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
@@ -193,7 +225,7 @@ jobs:
   publish-runtime:
     name: Publish multi-architecture runtime image
     if: startsWith(github.ref, 'refs/tags/v')
-    needs: [version, runtime-smoke]
+    needs: [gate, version, runtime-smoke]
     runs-on: ubuntu-24.04
     permissions:
       contents: read

@@ -2,10 +2,13 @@ defmodule Derpex.Connection do
   @moduledoc """
   Pure protocol state machine for one DERP connection.
 
-  Socket adapters execute returned actions in order. In particular,
-  authentication/registration precedes server-info transmission, so packets
-  cannot overtake handshake completion. No action sends packet data through a
-  process mailbox; packet messages are consumed synchronously by the reader.
+  Socket adapters execute returned actions in order, and the order is Go's: a
+  client is admitted, registered for routing, sent its server info, and only
+  then does its send loop start. Registering first means a packet sent to the
+  new client during its handshake is queued rather than dropped as unknown;
+  starting the send loop last means no queued packet can overtake the server
+  info. No action sends packet data through a process mailbox; packet messages
+  are consumed synchronously by the reader.
   """
 
   alias Derpex.ClientInfo
@@ -14,13 +17,24 @@ defmodule Derpex.Connection do
   alias Derpex.Frame.Decoder
   alias Derpex.Handshake
   alias Derpex.MeshKey
+  alias Derpex.Secret
   alias Derpex.ServerInfo
 
   @handshake_timeout 10_000
-  @max_client_info_length 256 * 1_024
 
+  # The pinned Go server accepts a client-info frame up to 256 KiB
+  # (`recvClientKey`). Real ClientInfo is under 200 bytes, so DERPEX caps the
+  # pre-authentication frame at 16 KiB. Recorded as a compatibility exception
+  # in PLAN.md Section 2.3.
+  @max_client_info_length 16 * 1_024
+
+  # Go's `recvClientKey` rejects `fl < derp.KeyLen + derp.NonceLen` as "short
+  # client info" before reading the body.
+  @min_client_info_length Frame.key_length() + Frame.nonce_length()
+
+  @derive {Inspect, except: [:private_key, :mesh_key]}
   defstruct [
-    :server_private_key,
+    :private_key,
     :server_info,
     :decoder,
     :phase,
@@ -38,33 +52,40 @@ defmodule Derpex.Connection do
           | {:set_timeout, :handshake, pos_integer()}
           | {:cancel_timeout, :handshake}
           | {:authenticated, binary(), ClientInfo.t(), boolean()}
+          | {:register, binary(), ClientInfo.t(), boolean()}
+          | :start_send_loop
           | {:rate_limit, non_neg_integer()}
           | :activity
           | {:server_message, Body.server_message()}
           | {:client_message, Body.client_message()}
 
   @opaque t :: %__MODULE__{
-            server_private_key: binary(),
+            private_key: Secret.t(),
             server_info: ServerInfo.t(),
             decoder: Decoder.t(),
             phase: phase(),
             client_public_key: nil | binary(),
             client_info: nil | ClientInfo.t(),
-            mesh_key: nil | MeshKey.t(),
+            mesh_key: nil | Secret.t(),
             can_mesh: boolean(),
             keep_alive_interval: pos_integer(),
             close_reason: nil | term()
           }
 
-  @doc "Creates a connection and returns its greeting and handshake deadline actions."
-  @spec new(binary(), keyword()) :: {:ok, t(), [action()]} | {:error, atom()}
-  def new(server_private_key, options \\ []) do
+  @doc """
+  Creates a connection and returns its greeting and handshake deadline actions.
+
+  Both `private_key` and the `:mesh_key` option are `Derpex.Secret` references,
+  wrapped once by the caller that read them from configuration or disk.
+  """
+  @spec new(Secret.t(), keyword()) :: {:ok, t(), [action()]} | {:error, atom()}
+  def new(private_key, options \\ []) do
     server_info =
       Keyword.get(options, :server_info, %ServerInfo{version: Handshake.protocol_version()})
 
-    with {:ok, greeting} <- Handshake.server_key_frame(server_private_key) do
+    with {:ok, greeting} <- Handshake.server_key_frame(Secret.reveal(private_key)) do
       state = %__MODULE__{
-        server_private_key: server_private_key,
+        private_key: private_key,
         server_info: server_info,
         decoder: Decoder.new(frame_policy: &handshake_frame_policy/2),
         phase: :awaiting_client_info,
@@ -90,14 +111,54 @@ defmodule Derpex.Connection do
   def receive_data(%__MODULE__{} = state, chunk) when is_binary(chunk) do
     case Decoder.push(state.decoder, chunk) do
       {:ok, frames, decoder} ->
+        {actions, decoder} = charge(state, decoder)
+
         state
         |> Map.put(:decoder, decoder)
-        |> process_frames(frames, [])
+        |> process_frames(frames, actions)
+        |> charge_after_authentication()
 
       {:error, reason} ->
         close(state, reason, [])
     end
   end
+
+  # The limiter is charged once per frame, for every byte that frame's header
+  # declared, before the frames in this chunk are acted on and before the rest
+  # of a large body has arrived. One charge per frame rather than one per chunk,
+  # because the limiter clamps each charge to the minimum burst: a chunk full of
+  # pipelined frames would otherwise cost what a single frame costs.
+  #
+  # Before authentication there is no per-client limiter - as in Go, where
+  # rateLimit runs only in the authenticated read loop - so what a pipelined
+  # frame declared stays on the decoder's tally.
+  defp charge(%__MODULE__{phase: :authenticated}, decoder) do
+    {charges, decoder} = Decoder.take_charge(decoder)
+    {Enum.map(charges, &{:rate_limit, &1}), decoder}
+  end
+
+  defp charge(_state, decoder), do: {[], decoder}
+
+  # The phase is read before the frames are acted on, so the chunk carrying the
+  # ClientInfo frame is charged as unauthenticated. What was pipelined behind
+  # it is this connection's first real traffic, and it was never charged at all:
+  # by the next chunk the tally has been cleared with it. The handshake frame
+  # itself is discharged when it authenticates, so what is left here is traffic.
+  defp charge_after_authentication(
+         {:ok, %__MODULE__{phase: :authenticated} = state, actions} = result
+       ) do
+    case Decoder.take_charge(state.decoder) do
+      # The ordinary case: this chunk's headers were charged before its frames
+      # were acted on, and nothing has been added to the tally since.
+      {[], _decoder} ->
+        result
+
+      {charges, decoder} ->
+        {:ok, %{state | decoder: decoder}, actions ++ Enum.map(charges, &{:rate_limit, &1})}
+    end
+  end
+
+  defp charge_after_authentication(result), do: result
 
   @doc "Applies a named protocol deadline."
   @spec timeout(t(), atom()) :: {:ok, t(), []} | {:close, t(), atom(), []}
@@ -141,10 +202,10 @@ defmodule Derpex.Connection do
 
   defp process_frames(
          %__MODULE__{phase: :authenticated} = state,
-         [{_type, {:discarded, length}} | rest],
+         [{_type, {:discarded, _length}} | rest],
          actions
        ) do
-    process_frames(state, rest, [:activity, {:rate_limit, length} | actions])
+    process_frames(state, rest, [:activity | actions])
   end
 
   defp process_frames(%__MODULE__{phase: :authenticated} = state, [frame | rest], actions) do
@@ -155,21 +216,15 @@ defmodule Derpex.Connection do
   end
 
   defp process_buffered_frame(state, rest, actions, frame) do
-    length = frame |> elem(1) |> byte_size()
-
     case decode_client_frame(state, frame) do
       {:ok, message} ->
-        process_frames(
-          state,
-          rest,
-          [{:client_message, message}, :activity, {:rate_limit, length} | actions]
-        )
+        process_frames(state, rest, [{:client_message, message}, :activity | actions])
 
       :ignore ->
-        process_frames(state, rest, [:activity, {:rate_limit, length} | actions])
+        process_frames(state, rest, [:activity | actions])
 
       {:error, reason} ->
-        close(state, reason, Enum.reverse([:activity, {:rate_limit, length} | actions]))
+        close(state, reason, Enum.reverse([:activity | actions]))
     end
   end
 
@@ -182,15 +237,17 @@ defmodule Derpex.Connection do
   end
 
   defp authenticate_client_info(state, body) do
+    private_key = Secret.reveal(state.private_key)
+
     with {:ok, client_public_key, client_info} <-
-           Handshake.decode_client_info(body, state.server_private_key),
+           Handshake.decode_client_info(body, private_key),
          {:ok, server_info} <-
            Handshake.server_info_frame(
-             state.server_private_key,
+             private_key,
              client_public_key,
              state.server_info
            ) do
-      can_mesh = MeshKey.trusted?(state.mesh_key, client_info.mesh_key)
+      can_mesh = MeshKey.trusted?(Secret.reveal(state.mesh_key), client_info.mesh_key)
 
       state = %{
         state
@@ -199,15 +256,16 @@ defmodule Derpex.Connection do
           client_info: client_info,
           can_mesh: can_mesh,
           decoder:
-            Decoder.with_frame_policy(
-              state.decoder,
-              &authenticated_frame_policy(&1, &2, can_mesh)
-            )
+            state.decoder
+            |> Decoder.discharge(byte_size(body))
+            |> Decoder.with_frame_policy(&authenticated_frame_policy(&1, &2, can_mesh))
       }
 
       actions = [
         {:authenticated, client_public_key, client_info, can_mesh},
+        {:register, client_public_key, client_info, can_mesh},
         {:send, server_info},
+        :start_send_loop,
         {:cancel_timeout, :handshake},
         {:set_timeout, :keep_alive, state.keep_alive_interval}
       ]
@@ -232,18 +290,28 @@ defmodule Derpex.Connection do
 
   defp authorize_client_message(_state, message), do: {:ok, message}
 
+  # Go's `recvClientKey` rejects a first frame whose header type is not
+  # `client_info`, so the body of such a frame is never read. Once the
+  # client-info header is admitted, later headers pipelined into the same chunk
+  # are governed by the authenticated policy with mesh permission still pending.
   defp handshake_frame_policy(type, length) do
     cond do
-      type == Frame.type(:client_info) and length > @max_client_info_length ->
+      type != Frame.type(:client_info) ->
+        {:error, {:unexpected_handshake_frame, type}}
+
+      length > @max_client_info_length ->
         {:error, {:frame_too_large, length, @max_client_info_length}}
 
-      type == Frame.type(:client_info) ->
-        :buffer
+      length < @min_client_info_length ->
+        {:error, {:frame_too_small, length, @min_client_info_length}}
 
       true ->
-        authenticated_frame_policy(type, length, :pending)
+        {:buffer, &pending_frame_policy/2}
     end
   end
+
+  defp pending_frame_policy(type, length),
+    do: authenticated_frame_policy(type, length, :pending)
 
   defp authenticated_frame_policy(type, length, mesh_permission) do
     case Frame.type_name(type) do

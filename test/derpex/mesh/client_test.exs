@@ -1,13 +1,16 @@
 defmodule Derpex.Mesh.ClientTest do
   use ExUnit.Case, async: false
 
+  alias Derpex.Certificates.Manual
   alias Derpex.ClientInfo
+  alias Derpex.Clock.Manual, as: ManualClock
   alias Derpex.Crypto
   alias Derpex.Frame
   alias Derpex.Frame.Body
   alias Derpex.Handshake
   alias Derpex.Mesh.Client
   alias Derpex.Router
+  alias Derpex.Secret
   alias Derpex.ServerInfo
 
   test "watches, forwards, withdraws, and reconnects without a second hop" do
@@ -42,8 +45,8 @@ defmodule Derpex.Mesh.ClientTest do
         {Client,
          url: "http://mesh.example.test:#{port}/derp",
          dial_host: "127.0.0.1",
-         private_key: local_private,
-         mesh_key: mesh_key,
+         private_key: Secret.wrap(local_private),
+         mesh_key: Secret.wrap(mesh_key),
          reconnect_interval: 25,
          event_handler: event_handler}
       )
@@ -140,8 +143,8 @@ defmodule Derpex.Mesh.ClientTest do
       start_supervised!(
         {Client,
          url: "http://127.0.0.1:#{port}/derp",
-         private_key: local_private,
-         mesh_key: mesh_key,
+         private_key: Secret.wrap(local_private),
+         mesh_key: Secret.wrap(mesh_key),
          reconnect_interval: 10,
          event_handler: fn event -> send(parent, {:self_event, event}) end}
       )
@@ -174,8 +177,8 @@ defmodule Derpex.Mesh.ClientTest do
       start_supervised!(
         {Client,
          url: "http://127.0.0.1:#{unavailable_port}/derp",
-         private_key: private_key,
-         mesh_key: mesh_key,
+         private_key: Secret.wrap(private_key),
+         mesh_key: Secret.wrap(mesh_key),
          connect_timeout: 250,
          reconnect_interval: 60_000,
          event_handler: fn event -> send(parent, {:dial_event, event}) end}
@@ -221,8 +224,8 @@ defmodule Derpex.Mesh.ClientTest do
         {Client,
          url: "http://127.0.0.1:#{derp_port}/derp",
          proxy_url: "http://127.0.0.1:#{proxy_port}",
-         private_key: local_private,
-         mesh_key: mesh_key,
+         private_key: Secret.wrap(local_private),
+         mesh_key: Secret.wrap(mesh_key),
          reconnect_interval: 60_000}
       )
 
@@ -230,6 +233,529 @@ defmodule Derpex.Mesh.ClientTest do
     assert_receive {:proxy_target, ^expected_target}, 2_000
     assert_receive :proxy_derp_authenticated, 2_000
     assert %{connected?: true} = Client.status(client)
+  end
+
+  test "a peer that stops reading trips the send timeout and reconnects" do
+    parent = self()
+    {_server_public, server_private} = Crypto.generate_keypair()
+    {_local_public, local_private} = Crypto.generate_keypair()
+    mesh_key = :crypto.strong_rand_bytes(32)
+    remote_peer = :crypto.strong_rand_bytes(32)
+
+    {:ok, listener} =
+      :gen_tcp.listen(0, [
+        :binary,
+        packet: :raw,
+        active: false,
+        reuseaddr: true,
+        recbuf: 1_024,
+        buffer: 1_024
+      ])
+
+    {:ok, {_ip, port}} = :inet.sockname(listener)
+
+    fake =
+      spawn(fn -> stalled_server(listener, server_private, mesh_key, remote_peer, parent) end)
+
+    on_exit(fn ->
+      :gen_tcp.close(listener)
+      if Process.alive?(fake), do: Process.exit(fake, :kill)
+    end)
+
+    _client =
+      start_supervised!(
+        {Client,
+         url: "http://127.0.0.1:#{port}/derp",
+         private_key: Secret.wrap(local_private),
+         mesh_key: Secret.wrap(mesh_key),
+         send_timeout: 200,
+         reconnect_interval: 25,
+         queue_capacity: 64,
+         event_handler: fn event -> send(parent, {:mesh_event, event}) end}
+      )
+
+    assert_receive {:stalled_authenticated, 1}, 2_000
+    assert_receive {:mesh_event, {:peer_present, ^remote_peer}}, 2_000
+
+    source = :crypto.strong_rand_bytes(32)
+    packet = :binary.copy(<<0xAB>>, 60_000)
+    Enum.each(1..64, fn _index -> Router.route(source, remote_peer, packet) end)
+
+    assert_receive {:mesh_event, {:disconnected, :timeout}}, 6_000
+    assert_receive {:stalled_authenticated, 2}, 6_000
+  end
+
+  test "a stalled TLS peer trips the send timeout under TLS and reconnects" do
+    parent = self()
+    {_server_public, server_private} = Crypto.generate_keypair()
+    {_local_public, local_private} = Crypto.generate_keypair()
+    mesh_key = :crypto.strong_rand_bytes(32)
+    remote_peer = :crypto.strong_rand_bytes(32)
+
+    directory =
+      Path.join(System.tmp_dir!(), "derpex-mesh-tls-#{System.unique_integer([:positive])}")
+
+    on_exit(fn -> File.rm_rf!(directory) end)
+    {:ok, manual} = Manual.load_or_create(directory, "127.0.0.1")
+
+    listen_options =
+      Manual.tls_options(manual) ++
+        [
+          :binary,
+          packet: :raw,
+          active: false,
+          reuseaddr: true,
+          recbuf: 1_024,
+          buffer: 1_024,
+          versions: [:"tlsv1.3"]
+        ]
+
+    {:ok, listener} = :ssl.listen(0, listen_options)
+    {:ok, {_ip, port}} = :ssl.sockname(listener)
+
+    fake =
+      spawn(fn -> stalled_tls_server(listener, server_private, mesh_key, remote_peer, parent) end)
+
+    on_exit(fn ->
+      :ssl.close(listener)
+      if Process.alive?(fake), do: Process.exit(fake, :kill)
+    end)
+
+    _client =
+      start_supervised!(
+        {Client,
+         url: "https://127.0.0.1:#{port}/derp",
+         private_key: Secret.wrap(local_private),
+         mesh_key: Secret.wrap(mesh_key),
+         tls_options: [verify: :verify_none, cacerts: []],
+         send_timeout: 300,
+         reconnect_interval: 25,
+         queue_capacity: 64,
+         event_handler: fn event -> send(parent, {:mesh_event, event}) end}
+      )
+
+    assert_receive {:stalled_authenticated, 1}, 5_000
+    assert_receive {:mesh_event, {:peer_present, ^remote_peer}}, 5_000
+
+    source = :crypto.strong_rand_bytes(32)
+    packet = :binary.copy(<<0xCD>>, 60_000)
+    Enum.each(1..64, fn _index -> Router.route(source, remote_peer, packet) end)
+
+    assert_receive {:mesh_event, {:disconnected, :timeout}}, 6_000
+    assert_receive {:stalled_authenticated, 2}, 6_000
+  end
+
+  test "a silent peer trips the receive deadline, withdraws forwarders, and reconnects" do
+    parent = self()
+    previous_clock = Application.fetch_env!(:derpex, :clock)
+    Application.put_env(:derpex, :clock, ManualClock)
+    on_exit(fn -> Application.put_env(:derpex, :clock, previous_clock) end)
+    start_supervised!({ManualClock, monotonic_time: 0})
+
+    {_server_public, server_private} = Crypto.generate_keypair()
+    {_local_public, local_private} = Crypto.generate_keypair()
+    mesh_key = :crypto.strong_rand_bytes(32)
+    remote_peer = :crypto.strong_rand_bytes(32)
+
+    {:ok, listener} =
+      :gen_tcp.listen(0, [:binary, packet: :raw, active: false, reuseaddr: true])
+
+    {:ok, {_ip, port}} = :inet.sockname(listener)
+
+    fake =
+      spawn(fn -> stalled_server(listener, server_private, mesh_key, remote_peer, parent) end)
+
+    on_exit(fn ->
+      :gen_tcp.close(listener)
+      if Process.alive?(fake), do: Process.exit(fake, :kill)
+    end)
+
+    _client =
+      start_supervised!(
+        {Client,
+         url: "http://127.0.0.1:#{port}/derp",
+         private_key: Secret.wrap(local_private),
+         mesh_key: Secret.wrap(mesh_key),
+         reconnect_interval: 5_000,
+         event_handler: fn event -> send(parent, {:mesh_event, event}) end}
+      )
+
+    assert_receive {:stalled_authenticated, 1}, 2_000
+    assert_receive {:mesh_event, {:peer_present, ^remote_peer}}, 2_000
+    assert_receive {:mesh_event, {:connected, _server_key}}, 2_000
+
+    source = :crypto.strong_rand_bytes(32)
+    assert Router.route(source, remote_peer, "before") in [{:ok, :wake}, {:ok, :coalesced}]
+
+    ManualClock.advance(119_999)
+    refute_receive {:mesh_event, {:disconnected, _early_reason}}, 100
+
+    ManualClock.advance(1)
+    assert_receive {:mesh_event, {:disconnected, :recv_timeout}}, 2_000
+    assert Router.route(source, remote_peer, "after") == {:dropped, :unknown_destination}
+
+    ManualClock.advance(5_000)
+    assert_receive {:stalled_authenticated, 2}, 2_000
+    assert_receive {:mesh_event, {:connected, _reconnected_key}}, 2_000
+  end
+
+  test "a deep forwarding backlog yields to socket data between drains" do
+    parent = self()
+    {_server_public, server_private} = Crypto.generate_keypair()
+    {_local_public, local_private} = Crypto.generate_keypair()
+    mesh_key = :crypto.strong_rand_bytes(32)
+    remote_peer = :crypto.strong_rand_bytes(32)
+
+    {:ok, listener} =
+      :gen_tcp.listen(0, [:binary, packet: :raw, active: false, reuseaddr: true])
+
+    {:ok, {_ip, port}} = :inet.sockname(listener)
+
+    fake =
+      spawn(fn -> drain_order_server(listener, server_private, mesh_key, remote_peer, parent) end)
+
+    on_exit(fn ->
+      :gen_tcp.close(listener)
+      if Process.alive?(fake), do: Process.exit(fake, :kill)
+    end)
+
+    client =
+      start_supervised!(
+        {Client,
+         url: "http://127.0.0.1:#{port}/derp",
+         private_key: Secret.wrap(local_private),
+         mesh_key: Secret.wrap(mesh_key),
+         queue_capacity: 256,
+         reconnect_interval: 60_000,
+         event_handler: fn event -> send(parent, {:mesh_event, event}) end}
+      )
+
+    assert_receive :drain_ready, 2_000
+    assert_receive {:mesh_event, {:peer_present, ^remote_peer}}, 2_000
+
+    source = :crypto.strong_rand_bytes(32)
+    :ok = :sys.suspend(client)
+
+    Enum.each(1..200, fn _index ->
+      Router.route(source, remote_peer, :binary.copy(<<0x11>>, 100))
+    end)
+
+    send(fake, :send_ping)
+    await_queued_messages(client, 2)
+    :ok = :sys.resume(client)
+
+    assert_receive {:forwards_before_pong, forwarded}, 5_000
+    assert forwarded > 0
+    assert forwarded <= 64
+  end
+
+  test "a hundred reconnects leave no forwarding ring table behind" do
+    parent = self()
+    {_public_key, private_key} = Crypto.generate_keypair()
+    mesh_key = :crypto.strong_rand_bytes(32)
+
+    {:ok, listener} =
+      :gen_tcp.listen(0, [:binary, packet: :raw, active: false, reuseaddr: true])
+
+    {:ok, {_ip, unavailable_port}} = :inet.sockname(listener)
+    :gen_tcp.close(listener)
+
+    event_handler = fn
+      {:connect_error, _reason} -> send(parent, :connect_error)
+      _other -> :ok
+    end
+
+    client =
+      start_supervised!(
+        {Client,
+         url: "http://127.0.0.1:#{unavailable_port}/derp",
+         private_key: Secret.wrap(private_key),
+         mesh_key: Secret.wrap(mesh_key),
+         connect_timeout: 100,
+         reconnect_interval: 1,
+         event_handler: event_handler}
+      )
+
+    assert_receive :connect_error, 5_000
+    assert owned_table_count(client) == 1
+
+    Enum.each(1..100, fn _reconnect -> assert_receive :connect_error, 5_000 end)
+
+    assert owned_table_count(client) == 1
+  end
+
+  defp owned_table_count(client) do
+    :ok = :sys.suspend(client)
+
+    try do
+      Enum.count(:ets.all(), &(:ets.info(&1, :owner) == client))
+    after
+      :ok = :sys.resume(client)
+    end
+  end
+
+  defp await_queued_messages(client, wanted) do
+    {:message_queue_len, queued} = Process.info(client, :message_queue_len)
+
+    if queued >= wanted do
+      :ok
+    else
+      Process.sleep(5)
+      await_queued_messages(client, wanted)
+    end
+  end
+
+  defp drain_order_server(listener, server_private, mesh_key, remote_peer, parent) do
+    {:ok, socket} = :gen_tcp.accept(listener)
+    read_ahead = mesh_handshake(socket, server_private, mesh_key, remote_peer)
+    send(parent, :drain_ready)
+
+    receive do
+      :send_ping ->
+        {:ok, ping} = Body.encode_server({:ping, "ordering"})
+        :ok = :gen_tcp.send(socket, ping)
+    end
+
+    count_until_pong(socket, read_ahead, 0, parent)
+  rescue
+    error -> send(parent, {:fake_error, error, __STACKTRACE__})
+  end
+
+  defp count_until_pong(socket, buffer, forwarded, parent) do
+    {:ok, type, _body, rest} = receive_frame(socket, buffer)
+
+    if type == Frame.type(:pong) do
+      send(parent, {:forwards_before_pong, forwarded})
+      discard_frames(socket, rest)
+    else
+      count_until_pong(socket, rest, forwarded + 1, parent)
+    end
+  end
+
+  defp discard_frames(socket, buffer) do
+    case receive_frame(socket, buffer) do
+      {:ok, _type, _body, rest} -> discard_frames(socket, rest)
+      {:error, _reason} -> :ok
+    end
+  end
+
+  defp stalled_tls_server(listener, server_private, mesh_key, remote_peer, parent) do
+    Enum.each(1..2, fn generation ->
+      {:ok, pending} = :ssl.transport_accept(listener)
+      {:ok, socket} = :ssl.handshake(pending, 5_000)
+      _read_ahead = mesh_handshake({:ssl, socket}, server_private, mesh_key, remote_peer)
+      send(parent, {:stalled_authenticated, generation})
+    end)
+
+    receive do
+      :stop -> :ok
+    end
+  rescue
+    error -> send(parent, {:fake_error, error, __STACKTRACE__})
+  end
+
+  defp stalled_server(listener, server_private, mesh_key, remote_peer, parent) do
+    Enum.each(1..2, fn generation ->
+      {:ok, socket} = :gen_tcp.accept(listener)
+      _read_ahead = mesh_handshake(socket, server_private, mesh_key, remote_peer)
+      send(parent, {:stalled_authenticated, generation})
+    end)
+
+    receive do
+      :stop -> :ok
+    end
+  rescue
+    error -> send(parent, {:fake_error, error, __STACKTRACE__})
+  end
+
+  test "a frame error after a peer_present still withdraws that forwarder" do
+    parent = self()
+    {_server_public, server_private} = Crypto.generate_keypair()
+    {_local_public, local_private} = Crypto.generate_keypair()
+    mesh_key = :crypto.strong_rand_bytes(32)
+    remote_peer = :crypto.strong_rand_bytes(32)
+
+    {:ok, listener} =
+      :gen_tcp.listen(0, [:binary, packet: :raw, active: false, reuseaddr: true])
+
+    {:ok, {_ip, port}} = :inet.sockname(listener)
+
+    fake =
+      spawn(fn -> batch_error_server(listener, server_private, mesh_key, remote_peer, parent) end)
+
+    on_exit(fn ->
+      :gen_tcp.close(listener)
+      if Process.alive?(fake), do: Process.exit(fake, :kill)
+    end)
+
+    client =
+      start_supervised!(
+        {Client,
+         url: "http://127.0.0.1:#{port}/derp",
+         private_key: Secret.wrap(local_private),
+         mesh_key: Secret.wrap(mesh_key),
+         reconnect_interval: 25,
+         event_handler: fn event -> send(parent, {:mesh_event, event}) end}
+      )
+
+    assert_receive {:batch_ready, 1}, 2_000
+    assert_receive {:mesh_event, {:connected, _server_key}}, 2_000
+
+    :ok = :sys.suspend(client)
+    send(fake, :send_batch)
+    assert_receive :batch_sent, 2_000
+    await_queued_messages(client, 1)
+    send(fake, :abort)
+    Process.sleep(50)
+    :ok = :sys.resume(client)
+
+    assert_receive {:mesh_event, {:peer_present, ^remote_peer}}, 2_000
+    assert_receive {:mesh_event, {:disconnected, _reason}}, 2_000
+
+    source = :crypto.strong_rand_bytes(32)
+
+    assert Router.route(source, remote_peer, "between") ==
+             {:dropped, :unknown_destination}
+
+    assert_receive {:batch_ready, 2}, 5_000
+    assert_receive {:mesh_event, {:peer_present, ^remote_peer}}, 5_000
+
+    assert Router.route(source, remote_peer, "new ring") in [{:ok, :wake}, {:ok, :coalesced}]
+    assert_receive {:batch_forward, ^source, ^remote_peer, "new ring"}, 5_000
+  end
+
+  test "a peer dribbling its upgrade response is cut off at the connect timeout" do
+    parent = self()
+    previous_clock = Application.fetch_env!(:derpex, :clock)
+    Application.put_env(:derpex, :clock, ManualClock)
+    on_exit(fn -> Application.put_env(:derpex, :clock, previous_clock) end)
+    start_supervised!({ManualClock, monotonic_time: 0})
+
+    {_local_public, local_private} = Crypto.generate_keypair()
+    mesh_key = :crypto.strong_rand_bytes(32)
+
+    {:ok, listener} =
+      :gen_tcp.listen(0, [:binary, packet: :raw, active: false, reuseaddr: true])
+
+    {:ok, {_ip, port}} = :inet.sockname(listener)
+    fake = spawn(fn -> dribbling_server(listener, parent) end)
+
+    on_exit(fn ->
+      :gen_tcp.close(listener)
+      if Process.alive?(fake), do: Process.exit(fake, :kill)
+    end)
+
+    _client =
+      start_supervised!(
+        {Client,
+         url: "http://127.0.0.1:#{port}/derp",
+         private_key: Secret.wrap(local_private),
+         mesh_key: Secret.wrap(mesh_key),
+         connect_timeout: 10_000,
+         reconnect_interval: 60_000,
+         event_handler: fn event -> send(parent, {:mesh_event, event}) end}
+      )
+
+    assert_receive :dribble_ready, 2_000
+
+    Enum.each(1..3, fn _byte ->
+      send(fake, :dribble)
+      assert_receive :dribbled, 2_000
+      ManualClock.advance(9_000)
+    end)
+
+    assert_receive {:mesh_event, {:connect_error, {:handshake, :timeout}}}, 2_000
+  end
+
+  defp dribbling_server(listener, parent) do
+    {:ok, socket} = :gen_tcp.accept(listener)
+    {:ok, _request, _read_ahead} = receive_http_head(socket, "")
+    send(parent, :dribble_ready)
+    dribble_loop(socket, "HTTP/1.1 101 Switching Protocols\r\n\r\n", parent)
+  rescue
+    error -> send(parent, {:fake_error, error, __STACKTRACE__})
+  end
+
+  defp dribble_loop(socket, <<byte::binary-size(1), rest::binary>>, parent) do
+    receive do
+      :dribble ->
+        :ok = :gen_tcp.send(socket, byte)
+        send(parent, :dribbled)
+        dribble_loop(socket, rest, parent)
+    end
+  end
+
+  defp batch_error_server(listener, server_private, mesh_key, remote_peer, parent) do
+    {:ok, socket} = :gen_tcp.accept(listener)
+    _read_ahead = mesh_handshake(socket, server_private, mesh_key)
+    send(parent, {:batch_ready, 1})
+    abort_after_batch(socket, remote_peer, parent)
+
+    {:ok, reconnected} = :gen_tcp.accept(listener)
+    read_ahead = mesh_handshake(reconnected, server_private, mesh_key, remote_peer)
+    send(parent, {:batch_ready, 2})
+    {source, destination, packet} = receive_forward(reconnected, read_ahead, 2, parent)
+    send(parent, {:batch_forward, source, destination, packet})
+
+    receive do
+      :stop -> :gen_tcp.close(reconnected)
+    end
+  rescue
+    error -> send(parent, {:fake_error, error, __STACKTRACE__})
+  end
+
+  defp abort_after_batch(socket, remote_peer, parent) do
+    receive do
+      :send_batch ->
+        {:ok, ping} = Body.encode_server({:ping, "resetnow"})
+        :ok = :gen_tcp.send(socket, [peer_present_frame(remote_peer), ping])
+        send(parent, :batch_sent)
+    end
+
+    receive do
+      :abort ->
+        :ok = :inet.setopts(socket, linger: {true, 0})
+        :gen_tcp.close(socket)
+    end
+  end
+
+  defp mesh_handshake(socket, server_private, mesh_key, remote_peer) do
+    read_ahead = mesh_handshake(socket, server_private, mesh_key)
+    :ok = transport_send(socket, peer_present_frame(remote_peer))
+    read_ahead
+  end
+
+  defp peer_present_frame(remote_peer) do
+    {:ok, peer_present} =
+      Body.encode_server({:peer_present, remote_peer, <<0::128>>, 12_345, 0x01, "remote"})
+
+    peer_present
+  end
+
+  defp mesh_handshake(socket, server_private, mesh_key) do
+    {:ok, _request, read_ahead} = receive_http_head(socket, "")
+    {:ok, server_key} = Handshake.server_key_frame(server_private)
+
+    :ok =
+      transport_send(socket, [
+        "HTTP/1.1 101 Switching Protocols\r\nUpgrade: DERP\r\nConnection: Upgrade\r\n\r\n",
+        server_key
+      ])
+
+    {:ok, client_type, client_body, read_ahead} = receive_frame(socket, read_ahead)
+    true = client_type == Frame.type(:client_info)
+    {:ok, client_public, client_info} = Handshake.decode_client_info(client_body, server_private)
+    true = client_info.mesh_key == mesh_key
+
+    {:ok, watch_type, watch_body, read_ahead} = receive_frame(socket, read_ahead)
+    true = watch_type == Frame.type(:watch_connections)
+    {:ok, :watch_connections} = Body.decode_client(watch_type, watch_body)
+
+    {:ok, server_info} =
+      Handshake.server_info_frame(server_private, client_public, %ServerInfo{version: 2})
+
+    :ok = transport_send(socket, server_info)
+    read_ahead
   end
 
   defp fake_server(listener, server_private, mesh_key, remote_peer, parent) do
@@ -394,7 +920,7 @@ defmodule Derpex.Mesh.ClientTest do
         {:ok, request, read_ahead}
 
       :nomatch ->
-        with {:ok, data} <- :gen_tcp.recv(socket, 0, 2_000) do
+        with {:ok, data} <- transport_recv(socket) do
           receive_http_head(socket, buffer <> data)
         end
     end
@@ -413,8 +939,14 @@ defmodule Derpex.Mesh.ClientTest do
     do: {:ok, buffer}
 
   defp ensure_bytes(socket, buffer, wanted) do
-    with {:ok, data} <- :gen_tcp.recv(socket, 0, 2_000) do
+    with {:ok, data} <- transport_recv(socket) do
       ensure_bytes(socket, buffer <> data, wanted)
     end
   end
+
+  defp transport_recv({:ssl, socket}), do: :ssl.recv(socket, 0, 2_000)
+  defp transport_recv(socket), do: :gen_tcp.recv(socket, 0, 2_000)
+
+  defp transport_send({:ssl, socket}, data), do: :ssl.send(socket, data)
+  defp transport_send(socket, data), do: :gen_tcp.send(socket, data)
 end

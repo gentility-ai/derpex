@@ -1,5 +1,5 @@
-// Copyright (c) 2026 DERPEX contributors.
-// SPDX-License-Identifier: BSD-3-Clause
+// Copyright (c) 2026 Gentility AI & DERPEX contributors.
+// SPDX-License-Identifier: MIT
 
 // Command watch_smoke uses the official DERP HTTP client to exercise trusted
 // mesh connection snapshots and live presence updates.
@@ -79,7 +79,66 @@ func main() {
 		fail("disconnect update mismatch: %+v", gone)
 	}
 
+	// A hundred clients arrive while three watchers are connected, and a
+	// fourth joins afterwards. Every watcher must learn about every one of
+	// them: presence is state, not traffic, so none of it may be dropped.
+	// This mirrors TestWatch in derp_test.go.
+	const clientCount = 100
+
+	watchers := []*derphttp.Client{watcher}
+	for range 2 {
+		extra := connect(os.Args[1], "", meshKey, true)
+		defer extra.Close()
+		watchers = append(watchers, extra)
+	}
+
+	crowd := make([]*derphttp.Client, 0, clientCount)
+	expected := make(map[key.NodePublic]bool, clientCount)
+	for index := range clientCount {
+		client := connect(os.Args[1], fmt.Sprintf("crowd-%d", index), key.DERPMesh{}, false)
+		defer client.Close()
+		crowd = append(crowd, client)
+		expected[client.SelfPublicKey()] = true
+	}
+
+	for index, seeing := range watchers {
+		seen := collectPresent(seeing, expected)
+		for peer := range expected {
+			if !seen[peer] {
+				fail("watcher %d never saw peer %v", index, peer)
+			}
+		}
+	}
+
+	// The late joiner gets the whole region in its snapshot, crowd included.
+	late := connect(os.Args[1], "", meshKey, true)
+	defer late.Close()
+	snapshot := collectPresent(late, expected)
+	for peer := range expected {
+		if !snapshot[peer] {
+			fail("late watcher's snapshot omitted peer %v", peer)
+		}
+	}
+
+	fmt.Printf("official Go mesh watchers each saw all %d clients, and a late joiner saw them in its snapshot\n", len(crowd))
 	fmt.Println("official Go mesh watcher observed snapshot, app names, flags, and disconnects")
+}
+
+// collectPresent reads lifecycle frames until every wanted peer has been seen
+// present, ignoring peers and frames it is not waiting for.
+func collectPresent(client *derphttp.Client, wanted map[key.NodePublic]bool) map[key.NodePublic]bool {
+	seen := make(map[key.NodePublic]bool, len(wanted))
+	for len(seen) < len(wanted) {
+		message := recvTimeout(client)
+		present, ok := message.(derp.PeerPresentMessage)
+		if !ok {
+			continue
+		}
+		if wanted[present.Key] {
+			seen[present.Key] = true
+		}
+	}
+	return seen
 }
 
 func connect(url, appName string, meshKey key.DERPMesh, watch bool) *derphttp.Client {

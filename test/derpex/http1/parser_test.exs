@@ -54,4 +54,60 @@ defmodule Derpex.HTTP1.ParserTest do
     assert Parser.push(Parser.new(), "GET / HTTP/1.1\r\nX: bad\0value\r\n\r\n") ==
              {:error, :invalid_header}
   end
+
+  test "finds a terminator straddling the boundary at every split offset" do
+    head = "GET / HTTP/1.1\r\nHost: derp.example"
+
+    for split <- 0..3 do
+      <<first::binary-size(^split), second::binary>> = "\r\n\r\n"
+
+      assert {:more, parser} = Parser.push(Parser.new(), head <> first)
+
+      assert {:ok, request, "read-ahead", _parser} =
+               Parser.push(parser, second <> "read-ahead"),
+             "terminator split after #{split} of its 4 bytes was missed"
+
+      assert Request.header(request, "host") == "derp.example"
+    end
+  end
+
+  @tag :performance
+  test "scans only the new bytes for the header terminator" do
+    header_bytes = 400 * 1_024
+    prefix = "GET / HTTP/1.1\r\nHost: derp.example\r\nX-Filler: "
+    filler = :binary.copy("f", header_bytes - byte_size(prefix))
+
+    {microseconds, result} =
+      :timer.tc(fn ->
+        prefix
+        |> Kernel.<>(filler)
+        |> push_one_byte_at_a_time(Parser.new())
+      end)
+
+    assert {:more, parser} = result
+    assert {:ok, request, "", _parser} = Parser.push(parser, "\r\n\r\n")
+    assert Request.header(request, "x-filler") == filler
+
+    # Rescanning the whole buffer on every push is quadratic and took ~36_600 ms
+    # here; scanning only the new bytes costs ~125 ms. The ceiling sits an order
+    # of magnitude either side so a busy async suite cannot make it flap.
+    assert div(microseconds, 1_000) < 1_000,
+           "one-byte-at-a-time push of #{header_bytes} header bytes took #{div(microseconds, 1_000)} ms"
+  end
+
+  test "still enforces max_header_bytes across incremental pushes" do
+    parser = Parser.new(max_header_bytes: 32)
+
+    assert {:error, :headers_too_large} =
+             push_one_byte_at_a_time(:binary.copy("x", 64), parser)
+  end
+
+  defp push_one_byte_at_a_time(<<>>, parser), do: {:more, parser}
+
+  defp push_one_byte_at_a_time(<<byte, rest::binary>>, parser) do
+    case Parser.push(parser, <<byte>>) do
+      {:more, parser} -> push_one_byte_at_a_time(rest, parser)
+      other -> other
+    end
+  end
 end

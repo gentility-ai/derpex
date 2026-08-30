@@ -1,5 +1,5 @@
-// Copyright (c) 2026 DERPEX contributors.
-// SPDX-License-Identifier: BSD-3-Clause
+// Copyright (c) 2026 Gentility AI & DERPEX contributors.
+// SPDX-License-Identifier: MIT
 
 // Command pinned_cert_smoke verifies an unchanged official region client can
 // dial DERPEX by raw IP using the DERP-map sha256-raw certificate pin.

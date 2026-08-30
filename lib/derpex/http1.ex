@@ -12,17 +12,128 @@ defmodule Derpex.HTTP1 do
   alias Derpex.HTTP1.Request
   alias Derpex.HTTP1.Response
   alias Derpex.Operations
+  alias Derpex.WebSocket.Frame
+
+  @subprotocol_violation "client must speak the derp subprotocol"
+  @policy_violation_status 1008
+  @error_headers "\r\nContent-Type: text/plain; charset=utf-8\r\nConnection: close\r\n\r\n"
+
+  # httpguts.ValidHostHeader's byte set, minus the alphanumerics handled by range.
+  @host_punctuation ~c"!$%&'()*+,-.:;=[]_~"
 
   @doc "Routes a parsed request without consuming bytes read past its headers."
+  @acme_challenge_prefix "/.well-known/acme-challenge/"
+  @plaintext_paths ["/derp/probe", "/derp/latency-check", "/generate_204"]
+  @maximum_acme_token_bytes 128
+
   @spec route(Request.t(), binary(), keyword()) ::
           {:upgrade, :derp | :websocket, nil | iodata(), map()}
           | {:stream, :debug_traffic, iodata(), keyword()}
           | {:response, iodata()}
   def route(%Request{} = request, server_public_key, options \\ []) do
-    request
-    |> Request.path()
-    |> route_path(request, server_public_key, options)
+    case host_error(request) do
+      nil ->
+        request
+        |> Request.path()
+        |> route_plaintext(request, server_public_key, options)
+
+      error ->
+        reject_host(error)
+    end
   end
+
+  # A plaintext listener exists to answer HTTP-01 challenges and the
+  # unauthenticated probes, and to send everything else to HTTPS. This is Go's
+  # `tsweb.Port80Handler`: GET and HEAD are redirected, anything else is told to
+  # use HTTPS. The DERP upgrade is not offered in cleartext unless the operator
+  # asked for it, so a client cannot be talked down onto port 80.
+  defp route_plaintext(path, request, server_public_key, options) do
+    case Keyword.get(options, :plaintext) do
+      nil -> route_path(path, request, server_public_key, options)
+      plaintext -> restrict_plaintext(path, request, server_public_key, options, plaintext)
+    end
+  end
+
+  defp restrict_plaintext(path, request, server_public_key, options, plaintext) do
+    cond do
+      plaintext_path?(path, plaintext) ->
+        route_path(path, request, server_public_key, options)
+
+      request.method in ["GET", "HEAD"] ->
+        redirect_to_https(request, path)
+
+      true ->
+        use_https()
+    end
+  end
+
+  defp plaintext_path?(@acme_challenge_prefix <> _token, _plaintext), do: true
+  defp plaintext_path?(path, _plaintext) when path in @plaintext_paths, do: true
+
+  defp plaintext_path?(path, plaintext)
+       when path == "/derp" or binary_part(path, 0, min(byte_size(path), 6)) == "/derp/",
+       do: Keyword.get(plaintext, :allow_upgrade, false)
+
+  defp plaintext_path?(_path, _plaintext), do: false
+
+  defp redirect_to_https(request, path) do
+    target = if String.starts_with?(request.target, "/"), do: request.target, else: path
+    location = "https://" <> (Request.header(request, "host") || "") <> target
+
+    {:response,
+     Response.encode(
+       302,
+       [{"Location", location}, {"Cache-Control", "no-store"}, {"Content-Length", "0"}]
+     )}
+  end
+
+  defp use_https do
+    {:response,
+     Response.encode(
+       400,
+       [{"Content-Type", "text/plain; charset=utf-8"}, {"X-Content-Type-Options", "nosniff"}],
+       "Use HTTPS\n"
+     )}
+  end
+
+  # Go's net/http validates Host while reading the head, before any handler
+  # runs. Duplicates are rejected first, then a missing Host on HTTP/1.1
+  # (CONNECT excepted), then a value outside ValidHostHeader's byte set. An
+  # empty Host value is a present header and stays legal.
+  defp host_error(%Request{} = request) do
+    case Request.header_values(request, "host") do
+      [host] -> if valid_host?(host), do: nil, else: :malformed
+      [] -> if host_mandatory?(request), do: :missing, else: nil
+      _duplicates -> :too_many
+    end
+  end
+
+  defp host_mandatory?(%Request{version: "HTTP/1.1", method: method}), do: method != "CONNECT"
+  defp host_mandatory?(%Request{}), do: false
+
+  defp valid_host?(<<>>), do: true
+
+  defp valid_host?(<<byte, rest::binary>>)
+       when byte in ?0..?9 or byte in ?A..?Z or byte in ?a..?z or byte in @host_punctuation do
+    valid_host?(rest)
+  end
+
+  defp valid_host?(_host), do: false
+
+  # Byte-for-byte the responses Go's conn.serve writes for these three errors:
+  # the first two carry a statusError suffix, "too many Host headers" does not.
+  defp reject_host(:missing), do: host_status("400 Bad Request: missing required Host header")
+  defp reject_host(:malformed), do: host_status("400 Bad Request: malformed Host header")
+  defp reject_host(:too_many), do: host_status("400 Bad Request")
+
+  defp host_status(status), do: {:response, ["HTTP/1.1 ", status, @error_headers, status]}
+
+  # The certificate authority validating an HTTP-01 challenge connects to the
+  # plaintext port at the address being validated and reads this path. It is
+  # the first route, so nothing added later can shadow a challenge, and it
+  # answers only while a certificate is being ordered.
+  defp route_path(@acme_challenge_prefix <> token, request, _server_public_key, options),
+    do: acme_challenge(token, request, options)
 
   defp route_path(path, request, _server_public_key, _options)
        when path in ["/derp/probe", "/derp/latency-check"],
@@ -230,6 +341,53 @@ defmodule Derpex.HTTP1 do
     end
   end
 
+  # `:acme_challenges` names a `{module, server}` exporting `http_response/2`,
+  # which `Derpex.Certificates.IPManager` does. Without one configured the path
+  # is not special and falls through to the same 404 any unknown path gets.
+  #
+  # RFC 8555 section 8.3 tokens are base64url, so anything else is answered
+  # without consulting the challenge store at all: a token is attacker-supplied
+  # text on an unauthenticated path.
+  defp acme_challenge(token, request, options) do
+    with {module, server} <- Keyword.get(options, :acme_challenges),
+         true <- acme_token?(token) do
+      acme_response(module.http_response(server, @acme_challenge_prefix <> token), request)
+    else
+      _not_configured_or_malformed -> not_found()
+    end
+  end
+
+  defp acme_token?(token) do
+    token != "" and byte_size(token) <= @maximum_acme_token_bytes and
+      acme_token_bytes?(token)
+  end
+
+  defp acme_token_bytes?(<<byte, rest::binary>>)
+       when byte in ?A..?Z or byte in ?a..?z or byte in ?0..?9 or byte in [?-, ?_],
+       do: acme_token_bytes?(rest)
+
+  defp acme_token_bytes?(<<>>), do: true
+  defp acme_token_bytes?(_invalid), do: false
+
+  defp acme_response(_response, %Request{method: method}) when method != "GET",
+    do: method_not_allowed()
+
+  # A key authorization is single-use and short-lived, so nothing between the
+  # certificate authority and the relay may keep a copy.
+  defp acme_response({:ok, body}, _request) do
+    {:response,
+     Response.encode(
+       200,
+       [{"Content-Type", "text/plain"}, {"Cache-Control", "no-store"}],
+       body
+     )}
+  end
+
+  defp acme_response(_absent, _request), do: not_found()
+
+  defp not_found, do: {:response, Response.encode(404, [], "404 page not found
+")}
+
   defp robots(%Request{method: "GET"}) do
     {:response,
      Response.encode(200, [{"Content-Type", "text/plain"}], "User-agent: *\nDisallow: /\n")}
@@ -292,11 +450,14 @@ defmodule Derpex.HTTP1 do
     {:upgrade, :derp, response, upgrade_metadata(request)}
   end
 
+  # Upstream picks the WebSocket path on a case-sensitive substring test, then
+  # lets coder/websocket negotiate one exact (case-insensitive) token out of the
+  # offer. Anything else stays on the legacy native-DERP path.
   defp websocket_or_legacy_upgrade(request, server_public_key) do
     case Request.header(request, "sec-websocket-protocol") do
       protocols when is_binary(protocols) ->
         if String.contains?(protocols, "derp") do
-          websocket_upgrade(request)
+          websocket_upgrade(request, negotiated_subprotocol(request))
         else
           native_upgrade(request, server_public_key)
         end
@@ -306,7 +467,17 @@ defmodule Derpex.HTTP1 do
     end
   end
 
-  defp websocket_upgrade(request) do
+  # The path gate above reads only the first header value, as Go's Header.Get
+  # does, but negotiation unions the tokens of every value like headerTokens.
+  defp negotiated_subprotocol(request) do
+    request
+    |> Request.header_values("sec-websocket-protocol")
+    |> Enum.flat_map(&String.split(&1, ","))
+    |> Enum.map(&String.trim/1)
+    |> Enum.find(&(String.downcase(&1, :ascii) == "derp"))
+  end
+
+  defp websocket_upgrade(request, subprotocol) do
     with true <- request.method == "GET",
          true <- connection_upgrade?(Request.header(request, "connection")),
          "13" <- Request.header(request, "sec-websocket-version"),
@@ -314,23 +485,37 @@ defmodule Derpex.HTTP1 do
          {:ok, decoded_key} <- Base.decode64(key),
          true <- byte_size(decoded_key) == 16 do
       accept = Base.encode64(:crypto.hash(:sha, key <> "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"))
+      handshake = websocket_handshake(accept, subprotocol)
 
-      response = [
-        "HTTP/1.1 101 Switching Protocols\r\n",
-        "Upgrade: websocket\r\n",
-        "Connection: Upgrade\r\n",
-        "Sec-WebSocket-Accept: ",
-        accept,
-        "\r\n",
-        "Sec-WebSocket-Protocol: derp\r\n\r\n"
-      ]
-
-      {:upgrade, :websocket, response, upgrade_metadata(request)}
+      # Upstream compares the negotiated subprotocol to "derp" byte for byte
+      # after the handshake, so a near miss gets a 101 and then a close.
+      if subprotocol == "derp" do
+        {:upgrade, :websocket, handshake, upgrade_metadata(request)}
+      else
+        {:response,
+         [handshake, Frame.encode_close(@policy_violation_status, @subprotocol_violation)]}
+      end
     else
       _invalid ->
         {:response, Response.encode(400, [], "Bad Request\n")}
     end
   end
+
+  defp websocket_handshake(accept, subprotocol) do
+    [
+      "HTTP/1.1 101 Switching Protocols\r\n",
+      "Upgrade: websocket\r\n",
+      "Connection: Upgrade\r\n",
+      "Sec-WebSocket-Accept: ",
+      accept,
+      "\r\n",
+      subprotocol_header(subprotocol),
+      "\r\n"
+    ]
+  end
+
+  defp subprotocol_header(nil), do: []
+  defp subprotocol_header(subprotocol), do: ["Sec-WebSocket-Protocol: ", subprotocol, "\r\n"]
 
   defp connection_upgrade?(nil), do: false
 

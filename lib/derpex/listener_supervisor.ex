@@ -1,78 +1,144 @@
 defmodule Derpex.ListenerSupervisor do
-  @moduledoc "Supervises configured native TCP/TLS listeners."
+  @moduledoc """
+  Supervises configured native TCP/TLS listeners.
+
+  The server private key and each listener's `:mesh_key` handler option arrive
+  as `Derpex.Secret` references. A supervisor retains its start arguments for
+  restarts, so wrapping has to happen in the caller that builds this child
+  specification, not here.
+  """
 
   use Supervisor
 
+  @default_max_connections 65_536
+  @default_read_timeout_ms 60_000
+  @default_acceptors 100
+
+  require Logger
+
   alias Derpex.Admission.Gentility
   alias Derpex.Certificates
+  alias Derpex.Certificates.IPManager
+  alias Derpex.Certificates.Manual
   alias Derpex.Certificates.Reloader
   alias Derpex.Crypto
   alias Derpex.Listener.Handler
   alias Derpex.Listener.Transports
+  alias Derpex.MetaCertificate
+  alias Derpex.Secret
   alias Derpex.SocketOptions
 
-  @spec start_link({[keyword()], binary()}) :: Supervisor.on_start()
-  def start_link({listeners, server_private_key}) do
-    Supervisor.start_link(__MODULE__, {listeners, server_private_key}, name: __MODULE__)
+  @spec start_link({[keyword()], Secret.t()}) :: Supervisor.on_start()
+  def start_link({listeners, private_key}) do
+    Supervisor.start_link(__MODULE__, {listeners, private_key}, name: __MODULE__)
   end
 
   @impl true
-  def init({listeners, server_private_key}) do
+  def init({listeners, private_key}) do
     children =
       listeners
       |> Enum.with_index()
       |> Enum.flat_map(fn {options, index} ->
-        listener_children(options, index, server_private_key)
+        listener_children(options, index, private_key)
       end)
 
     Supervisor.init(children, strategy: :one_for_one)
   end
 
-  defp listener_children(options, index, server_private_key) do
+  # The public key is derived once here and threaded through the certificate
+  # reloader, the TLS options, and the handler options, so no connection pays
+  # for a scalar multiplication that only depends on the listener's identity.
+  defp listener_children(options, index, private_key) do
     {reload_interval_ms, options} =
       Keyword.pop(options, :certificate_reload_interval_ms, 0)
 
-    case certificate_reloader(options, index, server_private_key, reload_interval_ms) do
+    public_key = server_public_key!(private_key)
+
+    case certificate_reloader(options, index, public_key, reload_interval_ms) do
       {:ok, reloader, options} ->
-        [reloader, listener_child(options, index, server_private_key)]
+        [reloader, listener_child(options, index, private_key, public_key)]
 
       :disabled ->
-        [listener_child(options, index, server_private_key)]
+        [listener_child(options, index, private_key, public_key)]
     end
   end
 
-  defp listener_child(options, index, server_private_key) do
+  defp listener_child(options, index, private_key, public_key) do
     {socket_options, options} = Keyword.pop(options, :socket_options, [])
+    {certificate_manager, options} = Keyword.pop(options, :ip_certificate_manager)
 
     handler_options =
       options
       |> Keyword.get(:handler_options, [])
       |> resolve_admission()
       |> Keyword.put_new(:mesh_write_timeout, SocketOptions.mesh_write_timeout_ms())
-      |> Keyword.put(:server_private_key, server_private_key)
+      # A control write may not give up before the socket does, so the handler
+      # is told the same write timeout the listen socket was configured with.
+      |> Keyword.put_new(
+        :write_timeout_ms,
+        Keyword.get(socket_options, :write_timeout_ms, SocketOptions.default_write_timeout_ms())
+      )
+      |> Keyword.put(:server_private_key, private_key)
+      |> Keyword.put(:server_public_key, public_key)
+
+    {listener_maximum, options} = Keyword.pop(options, :max_connections)
 
     options =
       options
+      |> Keyword.put_new(:num_connections, connections_per_acceptor(options, listener_maximum))
+      |> Keyword.put_new(:read_timeout, read_timeout_ms())
       |> Keyword.put(:handler_module, Handler)
       |> Keyword.put(:handler_options, handler_options)
-      |> configure_tls(server_private_key)
+      |> configure_tls(public_key, certificate_manager)
       |> configure_socket(socket_options)
       |> configure_transport()
 
     Supervisor.child_spec({ThousandIsland, options}, id: {ThousandIsland, index})
   end
 
-  defp certificate_reloader(options, index, server_private_key, interval_ms)
+  # Thousand Island counts connections per acceptor, so a relay with a hundred
+  # acceptors and the library default would accept 1.6 million of them. The cap
+  # is a whole-listener number, divided by the acceptors that share it.
+  #
+  # A listener may carry its own maximum. Without that, two listeners would each
+  # take the configured global and the relay would accept twice what an operator
+  # asked for — with the extra headroom on the unauthenticated plaintext port.
+  defp connections_per_acceptor(options, listener_maximum) do
+    acceptors = Keyword.get(options, :num_acceptors, @default_acceptors)
+    max(div(listener_maximum || max_connections(), acceptors), 1)
+  end
+
+  defp max_connections do
+    Application.get_env(:derpex, :max_connections) || @default_max_connections
+  end
+
+  # A client that opens a socket, declares a frame and then stops sending holds
+  # a connection and its buffers until something closes it.
+  defp read_timeout_ms do
+    Application.get_env(:derpex, :read_timeout_ms, @default_read_timeout_ms)
+  end
+
+  defp server_public_key!(private_key) do
+    case Crypto.public_key(Secret.reveal(private_key)) do
+      {:ok, public_key} -> public_key
+      {:error, reason} -> raise "invalid DERP server private key: #{inspect(reason)}"
+    end
+  end
+
+  defp certificate_reloader(options, index, server_public_key, interval_ms)
        when is_integer(interval_ms) and interval_ms > 0 do
     transport_options = Keyword.get(options, :transport_options, [])
 
     with true <- Keyword.get(options, :transport_module) == ThousandIsland.Transports.SSL,
          certfile when is_binary(certfile) <- Keyword.get(transport_options, :certfile),
-         keyfile when is_binary(keyfile) <- Keyword.get(transport_options, :keyfile),
-         {:ok, server_public_key} <- Crypto.public_key(server_private_key) do
+         keyfile when is_binary(keyfile) <- Keyword.get(transport_options, :keyfile) do
       snapshot_key = {__MODULE__, :certificate_snapshot, make_ref()}
-      sni_fun = Reloader.sni_fun(snapshot_key)
-      transport_options = Keyword.put(transport_options, :sni_fun, sni_fun)
+
+      transport_options =
+        transport_options
+        |> put_transport_option(:sni_fun, Reloader.sni_fun(snapshot_key))
+        |> put_transport_option(Transports.SSL.snapshot_option(), snapshot_key)
+
       options = Keyword.put(options, :transport_options, transport_options)
 
       reloader =
@@ -92,7 +158,7 @@ defmodule Derpex.ListenerSupervisor do
     end
   end
 
-  defp certificate_reloader(_options, _index, _server_private_key, _interval_ms),
+  defp certificate_reloader(_options, _index, _server_public_key, _interval_ms),
     do: :disabled
 
   defp resolve_admission(handler_options) do
@@ -117,20 +183,40 @@ defmodule Derpex.ListenerSupervisor do
     Keyword.put(options, :transport_options, transport_options)
   end
 
-  defp configure_tls(options, server_private_key) do
+  # `DERPEX_IP_CERT_ISSUER=self` replaces the file-backed certificate with one
+  # the manager issues for this listener's own IP address. The manager is
+  # started before this supervisor, so the certificate exists by the time the
+  # listen socket is opened, and `sni_fun` keeps every named hello answering
+  # from the same manager.
+  defp configure_tls(options, server_public_key, {manager, hostname}) do
+    unless Keyword.get(options, :transport_module) == ThousandIsland.Transports.SSL do
+      raise "a managed certificate requires a TLS listener"
+    end
+
+    snapshot_key = {__MODULE__, :certificate_snapshot, make_ref()}
+
+    transport_options =
+      options
+      |> Keyword.get(:transport_options, [])
+      |> drop_transport_options([:certfile, :keyfile, :certs_keys, :sni_fun])
+      |> Kernel.++(
+        managed_certificate_options(manager, hostname, server_public_key, snapshot_key)
+      )
+      |> put_transport_option(Transports.SSL.snapshot_option(), snapshot_key)
+
+    Keyword.put(options, :transport_options, transport_options)
+  end
+
+  defp configure_tls(options, server_public_key, nil) do
     if Keyword.get(options, :transport_module) == ThousandIsland.Transports.SSL do
       transport_options = Keyword.get(options, :transport_options, [])
 
       with certfile when is_binary(certfile) <- Keyword.get(transport_options, :certfile),
-           keyfile when is_binary(keyfile) <- Keyword.get(transport_options, :keyfile),
-           {:ok, server_public_key} <- Crypto.public_key(server_private_key) do
+           keyfile when is_binary(keyfile) <- Keyword.get(transport_options, :keyfile) do
         loaded = Certificates.transport_options(certfile, keyfile, server_public_key)
 
         transport_options =
-          transport_options
-          |> Keyword.delete(:certfile)
-          |> Keyword.delete(:keyfile)
-          |> Keyword.merge(loaded)
+          drop_transport_options(transport_options, [:certfile, :keyfile, :certs_keys]) ++ loaded
 
         Keyword.put(options, :transport_options, transport_options)
       else
@@ -139,6 +225,78 @@ defmodule Derpex.ListenerSupervisor do
     else
       options
     end
+  end
+
+  # The metacertificate carries only the server node key, so it is generated
+  # once here and shared by the bound options and every SNI answer. Generating
+  # an RSA key pair per hello would cost more than the DERP handshake it
+  # advertises.
+  #
+  # `:ssl.listen/2` needs a certificate before the first connection exists, so
+  # the manager is asked for one and, when it cannot supply one — a certificate
+  # authority that is unreachable at boot — the listener still binds with a
+  # self-signed certificate for the same name. What clients actually receive is
+  # the snapshot the manager publishes on every issuance and renewal, which
+  # `Derpex.Listener.Transports.SSL` reads per connection, so an obtained or
+  # renewed certificate reaches hellos with and without SNI alike.
+  defp managed_certificate_options(manager, hostname, server_public_key, snapshot_key) do
+    meta_certificate = MetaCertificate.generate(server_public_key)
+
+    [
+      certs_keys: [bound_certificate(manager, hostname, snapshot_key, meta_certificate)],
+      sni_fun: IPManager.sni_fun(manager, hostname, meta_certificate)
+    ]
+  end
+
+  # Nothing here waits on a certificate authority. `publish_to/4` answers from
+  # the manager's disk cache, which is the usual case on restart, and otherwise
+  # says it is bootstrapping: the socket binds a self-signed placeholder and the
+  # manager orders the real certificate in the background, once the listener
+  # that answers HTTP-01 challenges is already accepting. Ordering here instead
+  # would deadlock the first order against the listener it needs.
+  defp bound_certificate(manager, hostname, snapshot_key, meta_certificate) do
+    case IPManager.publish_to(manager, snapshot_key, hostname, meta_certificate) do
+      {:ok, certs_keys} ->
+        certs_keys
+
+      :bootstrap ->
+        Logger.warning(
+          "DERP listener has no certificate for #{hostname} yet; binding a self-signed " <>
+            "placeholder while one is ordered"
+        )
+
+        self_signed_certificate(hostname, meta_certificate)
+    end
+  end
+
+  defp self_signed_certificate(hostname, meta_certificate) do
+    case Manual.generate_self_signed(hostname) do
+      {:ok, {certificate_der, private_key}} ->
+        type = elem(private_key, 0)
+
+        %{
+          cert: Certificates.append_meta_certificate([certificate_der], meta_certificate),
+          key: {type, :public_key.der_encode(type, private_key)}
+        }
+
+      {:error, reason} ->
+        raise "could not bind a certificate for #{hostname}: #{inspect(reason)}"
+    end
+  end
+
+  # `transport_options` reach `:ssl.listen/2` and `:gen_tcp.listen/2`, which
+  # accept bare atoms (`:inet6`, `:binary`) and `{:raw, _, _, _}` tuples
+  # alongside `{key, value}` pairs. `Keyword` functions raise on those, so
+  # rewriting the list has to go through proplist-tolerant helpers.
+  defp put_transport_option(options, key, value) do
+    drop_transport_options(options, [key]) ++ [{key, value}]
+  end
+
+  defp drop_transport_options(options, keys) do
+    Enum.reject(options, fn
+      {key, _value} -> key in keys
+      _other_option -> false
+    end)
   end
 
   defp configure_transport(options) do

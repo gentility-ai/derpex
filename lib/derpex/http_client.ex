@@ -1,6 +1,9 @@
 defmodule Derpex.HTTPClient do
   @moduledoc false
 
+  alias Derpex.HTTP1.Scan
+  alias Derpex.TLSVersion
+
   @default_timeout_ms 5_000
   @default_max_response_bytes 1_048_576
   @max_response_head_bytes 16_384
@@ -93,10 +96,27 @@ defmodule Derpex.HTTPClient do
 
   defp connect(_target, _deadline, _options), do: {:error, :invalid_target}
 
+  # A caller may replace the trust anchors, which narrows what is accepted, and
+  # nothing else. Every key that decides *whether* a peer is verified is dropped
+  # from what the caller passed and set here instead, so no caller can weaken a
+  # dial: not with `verify: :verify_none`, not with a permissive `verify_fun`,
+  # not by widening the path with `partial_chain` or a `cacertfile`.
+  #
+  # The minimum TLS version is a floor for the whole relay, so an outbound dial
+  # cannot negotiate lower than the listener will serve, whoever opened it.
+  @caller_forbidden [:verify, :verify_fun, :partial_chain, :cacertfile, :versions]
+
   defp tls_options(host, options) do
-    [
+    caller =
+      options
+      |> Keyword.get(:tls_options, [])
+      |> Keyword.drop(@caller_forbidden)
+
+    [cacerts: :public_key.cacerts_get()]
+    |> Keyword.merge(caller)
+    |> Keyword.merge(
       verify: :verify_peer,
-      cacerts: :public_key.cacerts_get(),
+      versions: tls_versions(),
       server_name_indication: String.to_charlist(host),
       customize_hostname_check: [
         match_fun: :public_key.pkix_verify_hostname_match_fun(:https)
@@ -104,11 +124,11 @@ defmodule Derpex.HTTPClient do
       mode: :binary,
       packet: :raw,
       active: false
-    ]
-    |> Keyword.merge(Keyword.get(options, :tls_options, []))
-    |> Keyword.put(:mode, :binary)
-    |> Keyword.put(:packet, :raw)
-    |> Keyword.put(:active, false)
+    )
+  end
+
+  defp tls_versions do
+    Application.get_env(:derpex, :tls_versions) || TLSVersion.parse!(nil)
   end
 
   defp send_data({:tcp, socket}, data), do: :gen_tcp.send(socket, data)
@@ -118,7 +138,7 @@ defmodule Derpex.HTTPClient do
   defp close({:ssl, socket}), do: :ssl.close(socket)
 
   defp receive_response(socket, deadline, max_response_bytes) do
-    case receive_head(socket, "", deadline) do
+    case receive_head(socket, "", 0, deadline) do
       {:ok, head, read_ahead} ->
         receive_parsed_response(socket, head, read_ahead, deadline, max_response_bytes)
 
@@ -140,8 +160,8 @@ defmodule Derpex.HTTPClient do
     end
   end
 
-  defp receive_head(socket, buffer, deadline) do
-    case :binary.match(buffer, "\r\n\r\n") do
+  defp receive_head(socket, buffer, scanned, deadline) do
+    case Scan.match_from(buffer, scanned, "\r\n\r\n") do
       {length, 4} when length <= @max_response_head_bytes ->
         <<head::binary-size(^length), "\r\n\r\n", read_ahead::binary>> = buffer
         {:ok, head, read_ahead}
@@ -154,7 +174,7 @@ defmodule Derpex.HTTPClient do
 
       :nomatch ->
         with {:ok, data} <- receive_data(socket, deadline) do
-          receive_head(socket, buffer <> data, deadline)
+          receive_head(socket, buffer <> data, byte_size(buffer), deadline)
         end
     end
   end
@@ -287,8 +307,10 @@ defmodule Derpex.HTTPClient do
     end
   end
 
-  defp receive_line(socket, buffer, deadline) do
-    case :binary.match(buffer, "\r\n") do
+  defp receive_line(socket, buffer, deadline), do: receive_line(socket, buffer, 0, deadline)
+
+  defp receive_line(socket, buffer, scanned, deadline) do
+    case Scan.match_from(buffer, scanned, "\r\n") do
       {length, 2} when length <= @max_chunk_line_bytes ->
         <<line::binary-size(^length), "\r\n", rest::binary>> = buffer
         {:ok, line, rest}
@@ -301,7 +323,7 @@ defmodule Derpex.HTTPClient do
 
       :nomatch ->
         with {:ok, data} <- receive_data(socket, deadline) do
-          receive_line(socket, buffer <> data, deadline)
+          receive_line(socket, buffer <> data, byte_size(buffer), deadline)
         end
     end
   end
@@ -324,11 +346,14 @@ defmodule Derpex.HTTPClient do
     end
   end
 
-  defp receive_trailers(_socket, "\r\n" <> _rest, _deadline, chunks),
+  defp receive_trailers(socket, buffer, deadline, chunks),
+    do: receive_trailers(socket, buffer, 0, deadline, chunks)
+
+  defp receive_trailers(_socket, "\r\n" <> _rest, _scanned, _deadline, chunks),
     do: {:ok, chunks |> Enum.reverse() |> IO.iodata_to_binary()}
 
-  defp receive_trailers(socket, buffer, deadline, chunks) do
-    case :binary.match(buffer, "\r\n\r\n") do
+  defp receive_trailers(socket, buffer, scanned, deadline, chunks) do
+    case Scan.match_from(buffer, scanned, "\r\n\r\n") do
       {length, 4} when length <= @max_response_head_bytes ->
         {:ok, chunks |> Enum.reverse() |> IO.iodata_to_binary()}
 
@@ -340,7 +365,7 @@ defmodule Derpex.HTTPClient do
 
       :nomatch ->
         with {:ok, data} <- receive_data(socket, deadline) do
-          receive_trailers(socket, buffer <> data, deadline, chunks)
+          receive_trailers(socket, buffer <> data, byte_size(buffer), deadline, chunks)
         end
     end
   end

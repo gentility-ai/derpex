@@ -11,6 +11,83 @@ if config_env() == :prod do
 
   config :derpex, shutdown: [deadline_ms: shutdown_deadline_ms, poll_ms: 25]
 
+  max_connections =
+    case Integer.parse(System.get_env("DERPEX_MAX_CONNECTIONS", "65536")) do
+      {value, ""} when value in 1..16_777_216 -> value
+      _invalid -> raise "DERPEX_MAX_CONNECTIONS must be an integer from 1 through 16777216"
+    end
+
+  read_timeout_ms =
+    case Integer.parse(System.get_env("DERPEX_READ_TIMEOUT_MS", "60000")) do
+      {value, ""} when value in 1_000..86_400_000 -> value
+      _invalid -> raise "DERPEX_READ_TIMEOUT_MS must be an integer from 1000 through 86400000"
+    end
+
+  config :derpex, max_connections: max_connections, read_timeout_ms: read_timeout_ms
+
+  certfile = System.get_env("DERPEX_TLS_CERTFILE")
+  keyfile = System.get_env("DERPEX_TLS_KEYFILE")
+
+  # An ACME certificate authority validates HTTP-01 over plaintext HTTP, so the
+  # cleartext port is part of the certificate configuration rather than an
+  # afterthought: without it an ACME mode could never complete an order.
+  http_port =
+    case System.get_env("DERPEX_HTTP_PORT") do
+      nil ->
+        nil
+
+      text ->
+        case Integer.parse(text) do
+          {port, ""} when port in 1..65_535 -> port
+          _invalid -> raise "DERPEX_HTTP_PORT must be an integer from 1 through 65535"
+        end
+    end
+
+  # Pinned cmd/derper accepts TLS 1.2; DERPEX serves and dials 1.3 only unless
+  # an operator lowers the floor, and the same floor applies in both directions
+  # so a mesh dial cannot quietly be weaker than the listener.
+  tls_versions =
+    case Derpex.TLSVersion.parse(System.get_env("DERPEX_TLS_MIN_VERSION")) do
+      {:ok, versions} -> versions
+      {:error, :invalid_tls_min_version} -> raise Derpex.TLSVersion.message()
+    end
+
+  # Published so every outbound dial reads the same floor, including the ones
+  # that are not configured with TLS options of their own: the ACME client and
+  # the client-verification callback both dial through `Derpex.HTTPClient`.
+  config :derpex, tls_versions: tls_versions
+
+  http_max_connections =
+    case Integer.parse(System.get_env("DERPEX_HTTP_MAX_CONNECTIONS", "256")) do
+      {value, ""} when value in 1..1_048_576 ->
+        value
+
+      _invalid ->
+        raise "DERPEX_HTTP_MAX_CONNECTIONS must be an integer from 1 through 1048576"
+    end
+
+  # The certificate plan is resolved before anything else so a mode DERPEX
+  # cannot honour is refused while the operator is still reading configuration
+  # errors, not after a listener has bound :443 — and it is refused whether or
+  # not a listener is configured, so a mesh-only or misconfigured node cannot
+  # hide the mistake.
+  certificate_options = [
+    mode: System.get_env("DERPEX_CERT_MODE", "manual"),
+    directory: System.get_env("DERPEX_CERT_DIR"),
+    hostname: System.get_env("DERPEX_CERT_HOSTNAME"),
+    ip_certificate_issuer: System.get_env("DERPEX_IP_CERT_ISSUER"),
+    email: System.get_env("DERPEX_ACME_EMAIL"),
+    eab_kid: System.get_env("DERPEX_ACME_EAB_KID"),
+    eab_key: System.get_env("DERPEX_ACME_EAB_KEY"),
+    directory_url: System.get_env("DERPEX_ACME_DIRECTORY_URL"),
+    challenge_listener: not is_nil(http_port),
+    certfile: certfile,
+    keyfile: keyfile
+  ]
+
+  certificate_plan = Derpex.Certificates.Boot.plan!(certificate_options)
+  config :derpex, certificates: certificate_options
+
   listen_port = System.get_env("DERPEX_LISTEN_PORT")
 
   if listen_port do
@@ -24,8 +101,6 @@ if config_env() == :prod do
       System.get_env("DERPEX_IDENTITY_PATH") ||
         raise "DERPEX_IDENTITY_PATH is required when a listener is enabled"
 
-    certfile = System.get_env("DERPEX_TLS_CERTFILE")
-    keyfile = System.get_env("DERPEX_TLS_KEYFILE")
     clear_http? = System.get_env("DERPEX_CLEAR_HTTP") == "1"
     mesh_key_text = System.get_env("DERPEX_MESH_KEY")
     mesh_with_text = System.get_env("DERPEX_MESH_WITH")
@@ -43,6 +118,8 @@ if config_env() == :prod do
     accept_max_tracked_ips_text =
       System.get_env("DERPEX_ACCEPT_MAX_TRACKED_IPS", "16384")
 
+    accept_ipv6_prefix_text = System.get_env("DERPEX_ACCEPT_IPV6_PREFIX", "64")
+
     gentility_adapter_text = System.get_env("DERPEX_GENTILITY_ADAPTER")
     verify_clients_text = System.get_env("DERPEX_VERIFY_CLIENTS", "0")
     tailscaled_socket = System.get_env("DERPEX_TAILSCALED_SOCKET")
@@ -51,6 +128,7 @@ if config_env() == :prod do
     debug_key_path = System.get_env("TS_DEBUG_KEY_PATH")
     debug_allow_ip = System.get_env("TS_ALLOW_DEBUG_IP")
     debug_trusted_cidrs_text = System.get_env("TS_DEBUG_TRUSTED_CIDRS")
+    debug_allow_cgnat? = System.get_env("DERPEX_DEBUG_ALLOW_TAILSCALE_CGNAT") == "1"
     disable_rtt_stats_text = System.get_env("TS_DERP_DISABLE_RTT_STATS", "false")
 
     send_queue_depth_text =
@@ -117,15 +195,19 @@ if config_env() == :prod do
           |> Enum.map(fn peer ->
             cond do
               String.starts_with?(peer, ["http://", "https://"]) ->
-                [url: peer]
+                [url: peer, tls_options: [versions: tls_versions]]
 
               true ->
                 case String.split(peer, "/", parts: 2) do
                   [host] when host != "" ->
-                    [url: "https://#{host}/derp"]
+                    [url: "https://#{host}/derp", tls_options: [versions: tls_versions]]
 
                   [host, dial_host] when host != "" and dial_host != "" ->
-                    [url: "https://#{host}/derp", dial_host: dial_host]
+                    [
+                      url: "https://#{host}/derp",
+                      dial_host: dial_host,
+                      tls_options: [versions: tls_versions]
+                    ]
 
                   _invalid ->
                     raise "DERPEX_MESH_WITH contains an invalid peer: #{inspect(peer)}"
@@ -198,6 +280,15 @@ if config_env() == :prod do
         _invalid -> raise "DERPEX_ACCEPT_MAX_TRACKED_IPS must be a positive integer"
       end
 
+    accept_ipv6_prefix =
+      case Integer.parse(accept_ipv6_prefix_text) do
+        {value, ""} when value in 1..128 ->
+          value
+
+        _invalid ->
+          raise "DERPEX_ACCEPT_IPV6_PREFIX must be an integer from 1 through 128"
+      end
+
     accept_limit =
       if is_nil(per_ip_accept_limit) and is_nil(per_ip_connections) do
         global_accept_limit
@@ -206,9 +297,20 @@ if config_env() == :prod do
           global: global_accept_limit,
           per_ip: per_ip_accept_limit,
           per_ip_connections: per_ip_connections,
-          max_tracked_ips: max_tracked_ips
+          max_tracked_ips: max_tracked_ips,
+          ipv6_prefix: accept_ipv6_prefix
         ]
       end
+
+    parse_bounded_integer = fn name, default, minimum, maximum ->
+      case Integer.parse(System.get_env(name, Integer.to_string(default))) do
+        {value, ""} when value >= minimum and value <= maximum ->
+          value
+
+        _invalid ->
+          raise "#{name} must be an integer from #{minimum} through #{maximum}"
+      end
+    end
 
     gentility =
       case gentility_adapter_text do
@@ -287,14 +389,54 @@ if config_env() == :prod do
             end
 
           events =
-            if System.get_env("DERPEX_GENTILITY_EVENTS") == "0",
-              do: nil,
-              else: [adapter: adapter]
+            case System.get_env("DERPEX_GENTILITY_EVENTS", "1") do
+              "1" -> [adapter: adapter]
+              "0" -> nil
+              _invalid -> raise "DERPEX_GENTILITY_EVENTS must be 0 or 1"
+            end
+
+          max_cache_entries =
+            parse_bounded_integer.("DERPEX_GENTILITY_MAX_CACHE_ENTRIES", 100_000, 1, 100_000_000)
+
+          max_revocations =
+            parse_bounded_integer.("DERPEX_GENTILITY_MAX_REVOCATIONS", 10_000, 1, 100_000_000)
+
+          max_concurrent_requests =
+            parse_bounded_integer.("DERPEX_GENTILITY_MAX_CONCURRENT_REQUESTS", 64, 1, 65_535)
+
+          authority_timeout =
+            parse_bounded_integer.(
+              "DERPEX_GENTILITY_AUTHORITY_TIMEOUT_MS",
+              2_000,
+              1,
+              0xFFFF_FFFF
+            )
+
+          max_lease_ms =
+            parse_bounded_integer.("DERPEX_GENTILITY_MAX_LEASE_MS", 900_000, 1, 0xFFFF_FFFF)
+
+          max_future_skew_ms =
+            parse_bounded_integer.("DERPEX_GENTILITY_MAX_FUTURE_SKEW_MS", 30_000, 0, 0xFFFF_FFFF)
+
+          max_byte_delay_ms =
+            parse_bounded_integer.("DERPEX_GENTILITY_MAX_BYTE_DELAY_MS", 30_000, 1, 0xFFFF_FFFF)
+
+          cache_persist_ms =
+            parse_bounded_integer.("DERPEX_GENTILITY_CACHE_PERSIST_MS", 5_000, 1, 0xFFFF_FFFF)
 
           [
             authority: adapter,
             verification_keys: verification_keys,
             cache_path: cache_path,
+            region_id: region_id,
+            max_cache_entries: max_cache_entries,
+            max_revocations: max_revocations,
+            max_concurrent_requests: max_concurrent_requests,
+            authority_timeout: authority_timeout,
+            max_lease_ms: max_lease_ms,
+            max_future_skew_ms: max_future_skew_ms,
+            max_byte_delay_ms: max_byte_delay_ms,
+            cache_persist_ms: cache_persist_ms,
             usage: [
               instance_id: instance_id,
               region_id: region_id,
@@ -307,6 +449,21 @@ if config_env() == :prod do
 
     listener =
       cond do
+        certificate_plan.ip_certificate_issuer != nil ->
+          [
+            port: port,
+            transport_module: ThousandIsland.Transports.SSL,
+            socket_options: [
+              keepalive_ms: tcp_keepalive_ms,
+              user_timeout_ms: tcp_user_timeout_ms,
+              write_timeout_ms: tcp_write_timeout_ms
+            ],
+            transport_options: [
+              versions: tls_versions,
+              alpn_preferred_protocols: ["http/1.1"]
+            ]
+          ]
+
         certfile && keyfile ->
           [
             port: port,
@@ -320,7 +477,7 @@ if config_env() == :prod do
             transport_options: [
               certfile: certfile,
               keyfile: keyfile,
-              versions: [:"tlsv1.3"],
+              versions: tls_versions,
               alpn_preferred_protocols: ["http/1.1"]
             ]
           ]
@@ -337,7 +494,33 @@ if config_env() == :prod do
           ]
 
         true ->
-          raise "set DERPEX_TLS_CERTFILE and DERPEX_TLS_KEYFILE, or explicitly opt into DERPEX_CLEAR_HTTP=1"
+          raise "set DERPEX_TLS_CERTFILE and DERPEX_TLS_KEYFILE, set DERPEX_CERT_MODE=letsencrypt or DERPEX_IP_CERT_ISSUER=self, or explicitly opt into DERPEX_CLEAR_HTTP=1"
+      end
+
+    # A plaintext listener whose only reason to exist is answering HTTP-01
+    # challenges and the unauthenticated probe endpoints. It never carries a
+    # certificate, and `Derpex.Certificates.Boot` gives it the challenge source.
+    challenge_listener =
+      if http_port do
+        [
+          [
+            port: http_port,
+            plaintext_challenge: true,
+            # Its own small cap: this listener answers challenges and redirects
+            # and nothing else, and DERPEX_MAX_CONNECTIONS is what an operator
+            # sized for the DERP listener, not for twice that across two.
+            max_connections: http_max_connections,
+            handler_options: [plaintext: [allow_upgrade: clear_http?]],
+            transport_module: ThousandIsland.Transports.TCP,
+            socket_options: [
+              keepalive_ms: tcp_keepalive_ms,
+              user_timeout_ms: tcp_user_timeout_ms,
+              write_timeout_ms: tcp_write_timeout_ms
+            ]
+          ]
+        ]
+      else
+        []
       end
 
     disallowed_app_names =
@@ -367,6 +550,13 @@ if config_env() == :prod do
     debug =
       [key_path: debug_key_path, allow_ip: debug_allow_ip, trusted_cidrs: debug_trusted_cidrs]
       |> Enum.reject(fn {_key, value} -> value in [nil, []] end)
+      |> then(fn options ->
+        if debug_allow_cgnat? do
+          Keyword.put(options, :allow_tailscale_cgnat, true)
+        else
+          options
+        end
+      end)
 
     client_verifiers =
       if verify_clients? do
@@ -446,7 +636,10 @@ if config_env() == :prod do
       accept_limit: accept_limit,
       gentility: gentility,
       identity_path: identity_path,
-      listeners: [listener],
+      # The plaintext listener is started first: an ACME order cannot complete
+      # until the challenge it publishes is reachable, and the TLS listener is
+      # what starts that order.
+      listeners: challenge_listener ++ [listener],
       mesh_key: mesh_key,
       mesh_peers: mesh_peers,
       rate_config_path: rate_config_path,

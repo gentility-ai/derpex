@@ -2,17 +2,24 @@ defmodule Derpex.Outbox.Ring do
   @moduledoc """
   Fixed-capacity, non-blocking packet storage for one writer.
 
-  Producers use a brief bounded acquisition window. Sustained contention is a
-  tail drop; a full ring replaces its oldest item. Packet references live only
-  in the preallocated ETS slots. The writer receives at most one coalesced atom
-  wakeup and pulls values directly from the ring.
+  A producer that meets a held lock retries inside a bounded wall-clock budget
+  and then tail-drops, counting the drop. It keeps no shared waiting state, so
+  it can be killed mid-attempt without wedging anyone. A full ring replaces its
+  oldest item. Packet references live only in the preallocated ETS slots. The
+  writer receives at most one coalesced atom wakeup and pulls values directly
+  from the ring.
+
+  Only the lock, the journal, the slots, and the atomics are touched inside the
+  critical section. Clock reads and drop metrics happen outside it.
 
   A tiny ETS journal makes interrupted mutations recoverable by the next
   producer or consumer. It contains indices and counters, never the packet.
   """
 
   alias Derpex.Clock
+  alias Derpex.Disco
   alias Derpex.Metrics
+  alias Derpex.Outbox.Lock
 
   @head 1
   @size 2
@@ -20,14 +27,12 @@ defmodule Derpex.Outbox.Ring do
   @head_drops 4
   @tail_drops 5
   @closed 6
-  @producer_waiters 7
-  @lock_retries 1_024
-  @producer_wait_attempts 5
 
   defstruct [
     :table,
     :state,
     :capacity,
+    :full_policy,
     :notifier,
     :wake_message,
     :test_hook,
@@ -39,11 +44,12 @@ defmodule Derpex.Outbox.Ring do
             table: :ets.tid(),
             state: :atomics.atomics_ref(),
             capacity: pos_integer(),
+            full_policy: :replace | :reject,
             notifier: pid(),
             wake_message: atom(),
             test_hook: nil | (atom() -> term()),
             metrics: Metrics.handle() | nil,
-            metric_kind: :disco | :other | nil
+            metric_kind: :disco | :other | :by_packet | nil
           }
 
   @type enqueue_result :: {:ok, :wake | :coalesced | :replaced} | {:dropped, atom()}
@@ -51,20 +57,24 @@ defmodule Derpex.Outbox.Ring do
   @doc "Creates a ring owned by the calling process."
   @spec new(pos_integer(), keyword()) :: t()
   def new(capacity, options \\ []) when is_integer(capacity) and capacity > 0 do
+    # Every read and write happens under the ring lock, so decorated
+    # concurrency options would only buy per-scheduler structures that cost
+    # tens of kilobytes per connection and are never contended.
     table =
       :ets.new(__MODULE__, [
         :set,
         :public,
-        read_concurrency: true,
-        write_concurrency: true
+        read_concurrency: false,
+        write_concurrency: false
       ])
 
     true = :ets.insert(table, for(index <- 0..(capacity - 1), do: {index, 0, 0, nil}))
 
     %__MODULE__{
       table: table,
-      state: :atomics.new(7, signed: false),
+      state: :atomics.new(6, signed: false),
       capacity: capacity,
+      full_policy: Keyword.get(options, :full, :replace),
       notifier: Keyword.get(options, :notifier, self()),
       wake_message: Keyword.get(options, :wake_message, :derpex_outbox_ready),
       test_hook: Keyword.get(options, :test_hook),
@@ -73,28 +83,68 @@ defmodule Derpex.Outbox.Ring do
     }
   end
 
-  @doc "Publishes an item without waiting. Full rings replace the oldest item."
-  @spec enqueue(t(), term()) :: enqueue_result()
-  def enqueue(%__MODULE__{} = ring, item) do
+  @doc """
+  Publishes an item. Full rings replace the oldest item.
+
+  A held lock is retried inside a bounded wall-clock budget. `wait: false`
+  keeps the retries free of naps, for callers such as the router that must
+  never sleep on behalf of one destination.
+  """
+  @spec enqueue(t(), term(), keyword()) :: enqueue_result()
+  def enqueue(%__MODULE__{} = ring, item, options \\ []) do
     if atomic_get(ring, @closed) == 1 do
       record_drop(ring, item, :gone_disconnected)
       {:dropped, :closed}
     else
-      case acquire_producer(ring) do
-        {:ok, lock_token} ->
+      enqueue_open(ring, item, Keyword.get(options, :wait, true))
+    end
+  end
+
+  defp enqueue_open(ring, item, wait?) do
+    # Reading the clock costs more than the critical section itself, so the
+    # queue timestamp is taken before the lock rather than inside it.
+    enqueued_at = Clock.monotonic_time(:microsecond)
+
+    case Lock.acquire_producer(ring.table, wait?, ring.metrics) do
+      {:ok, lock_token} ->
+        {result, pending_drop, wake} =
           try do
             recover(ring)
-            enqueue_locked(ring, item, lock_token)
+            enqueue_locked(ring, item, enqueued_at, lock_token)
           after
-            release(ring, lock_token)
+            Lock.release(ring.table, lock_token)
           end
 
-        :busy ->
-          :atomics.add_get(ring.state, @tail_drops, 1)
-          record_drop(ring, item, :queue_tail)
-          {:dropped, :contention}
-      end
+        # Waking the writer while still holding the lock hands it a collision:
+        # it wakes, misses, and waits for its retry timer, which is
+        # milliseconds where the overlap was microseconds. The wakeup is
+        # therefore claimed and sent after release, and the claim is one atomic
+        # compare-and-exchange, so the consumer's clear cannot land inside it.
+        result = signal_after_release(ring, result, wake)
+        record_pending_drop(ring, pending_drop)
+        result
+
+      :busy ->
+        :atomics.add_get(ring.state, @tail_drops, 1)
+        record_drop(ring, item, :queue_tail)
+        {:dropped, :contention}
     end
+  end
+
+  defp record_pending_drop(_ring, nil), do: :ok
+
+  defp record_pending_drop(ring, {item, reason}), do: record_drop(ring, item, reason)
+
+  # Go records a head-dropped packet's residence time in the same moving average
+  # as a delivered one, so a queue that is dropping still reports how long it is
+  # making packets wait.
+  defp record_pending_drop(ring, {item, reason, enqueued_at}) do
+    :ok = record_drop(ring, item, reason)
+
+    Metrics.observe_queue_duration(
+      ring.metrics,
+      max(Clock.monotonic_time(:microsecond) - enqueued_at, 0)
+    )
   end
 
   @doc "Takes the next item for the single writer."
@@ -109,13 +159,18 @@ defmodule Derpex.Outbox.Ring do
   @doc "Takes the next item with its non-negative queue residence time."
   @spec take_with_age(t()) :: {:ok, term(), non_neg_integer()} | :empty | :closed | :busy
   def take_with_age(%__MODULE__{} = ring) do
-    case acquire_consumer(ring) do
+    case Lock.acquire_consumer(ring.table) do
       {:ok, lock_token} ->
-        try do
-          recover(ring)
-          take_locked(ring, lock_token)
-        after
-          release(ring, lock_token)
+        taken =
+          try do
+            recover(ring)
+            take_locked(ring, lock_token)
+          after
+            Lock.release(ring.table, lock_token)
+          end
+
+        with {:ok, item, enqueued_at} <- taken do
+          {:ok, item, max(Clock.monotonic_time(:microsecond) - enqueued_at, 0)}
         end
 
       :busy ->
@@ -123,10 +178,18 @@ defmodule Derpex.Outbox.Ring do
     end
   end
 
+  @doc "True once the ring has been closed. One atomic read, no lock."
+  @spec closed?(t()) :: boolean()
+  def closed?(%__MODULE__{} = ring), do: atomic_get(ring, @closed) == 1
+
+  @doc "Returns the ring table's memory footprint in machine words."
+  @spec memory_words(t()) :: non_neg_integer()
+  def memory_words(%__MODULE__{} = ring), do: :ets.info(ring.table, :memory)
+
   @doc "Closes the ring and releases every retained item. Idempotent."
   @spec close(t()) :: :ok | :busy
   def close(%__MODULE__{} = ring) do
-    case acquire(ring) do
+    case Lock.acquire(ring.table) do
       {:ok, lock_token} ->
         try do
           recover(ring)
@@ -138,7 +201,7 @@ defmodule Derpex.Outbox.Ring do
           :ets.delete(ring.table, :journal)
           :ok
         after
-          release(ring, lock_token)
+          Lock.release(ring.table, lock_token)
         end
 
       :busy ->
@@ -149,13 +212,14 @@ defmodule Derpex.Outbox.Ring do
   @doc "Returns consistent queue and drop counters, or `:busy` under mutation."
   @spec stats(t()) :: map() | :busy
   def stats(%__MODULE__{} = ring) do
-    case acquire(ring) do
+    case Lock.acquire(ring.table) do
       {:ok, lock_token} ->
         try do
           recover(ring)
 
           %{
             capacity: ring.capacity,
+            full_policy: ring.full_policy,
             size: atomic_get(ring, @size),
             wake_pending: atomic_get(ring, @wake_pending) == 1,
             head_drops: atomic_get(ring, @head_drops),
@@ -164,7 +228,7 @@ defmodule Derpex.Outbox.Ring do
             packet_slots: packet_slot_count(ring)
           }
         after
-          release(ring, lock_token)
+          Lock.release(ring.table, lock_token)
         end
 
       :busy ->
@@ -172,41 +236,86 @@ defmodule Derpex.Outbox.Ring do
     end
   end
 
-  defp enqueue_locked(ring, item, lock_token) do
+  @doc """
+  Closes the ring and drops its ETS table. Idempotent.
+
+  A ring whose owner outlives it — the mesh client rebuilds one per reconnect —
+  must be deleted rather than merely closed, because the table is reclaimed
+  only when its owner dies. Call it from the process that owns the table.
+
+  The closed flag is raised before `close/1` rather than by it: `close/1`
+  reports `:busy` and leaves the flag alone when a producer holds the lock, and
+  the table is dropped either way. Without the flag first, a stale `%Ring{}`
+  still held by a producer would take the open path into a table identifier the
+  runtime is free to have handed to somebody else. With it, every later
+  `enqueue/2` answers `{:dropped, :closed}` off the atomics without touching
+  ETS at all.
+  """
+  @spec delete(t()) :: :ok
+  def delete(%__MODULE__{} = ring) do
+    :atomics.put(ring.state, @closed, 1)
+    _closed = close(ring)
+    true = :ets.delete(ring.table)
+    :ok
+  rescue
+    ArgumentError -> :ok
+  end
+
+  defp enqueue_locked(ring, item, enqueued_at, lock_token) do
     if atomic_get(ring, @closed) == 1 do
-      record_drop(ring, item, :gone_disconnected)
-      {:dropped, :closed}
+      {{:dropped, :closed}, {item, :gone_disconnected}, :coalesced}
     else
-      enqueue_open_locked(ring, item, lock_token)
+      enqueue_open_locked(ring, item, enqueued_at, lock_token)
     end
   end
 
-  defp enqueue_open_locked(ring, item, lock_token) do
-    wake = signal_writer(ring)
-    head = atomic_get(ring, @head)
-    size = atomic_get(ring, @size)
-    head_drops = atomic_get(ring, @head_drops)
-    full? = size == ring.capacity
-    index = if full?, do: head, else: rem(head + size, ring.capacity)
-    new_head = if full?, do: rem(head + 1, ring.capacity), else: head
-    new_size = if full?, do: size, else: size + 1
-    new_head_drops = if full?, do: head_drops + 1, else: head_drops
-    operation_token = unique_token()
-    enqueued_at = Clock.monotonic_time(:microsecond)
+  defp enqueue_open_locked(%{full_policy: :reject} = ring, item, enqueued_at, lock_token) do
+    if atomic_get(ring, @size) == ring.capacity do
+      # Go's handleFramePing drops the ping that arrived last when a pong is
+      # already waiting: the client is pinging faster than it is being answered,
+      # and the answer it is owed is the older one.
+      :atomics.add_get(ring.state, @tail_drops, 1)
+      {{:dropped, :queue_full}, nil, :coalesced}
+    else
+      publish_locked(ring, item, enqueued_at, lock_token)
+    end
+  end
 
-    journal(ring, lock_token, operation_token, index, new_head, new_size, new_head_drops)
+  defp enqueue_open_locked(ring, item, enqueued_at, lock_token) do
+    publish_locked(ring, item, enqueued_at, lock_token)
+  end
+
+  defp publish_locked(ring, item, enqueued_at, lock_token) do
+    {full?, index, head, size, head_drops} = slot_plan(ring)
+    operation_token = unique_token()
+
+    journal(ring, lock_token, operation_token, index, head, size, head_drops)
     run_hook(ring, :after_journal)
-    if full?, do: record_replaced_drop(ring, index)
+    replaced = if full?, do: replaced_item(ring, index)
     true = :ets.insert(ring.table, {index, operation_token, enqueued_at, item})
     run_hook(ring, :after_publish)
-    commit(ring, new_head, new_size, new_head_drops)
+    commit(ring, head, size, head_drops)
     run_hook(ring, :after_commit)
     :ets.delete(ring.table, :journal)
 
-    cond do
-      full? -> {:ok, :replaced}
-      wake == :wake -> {:ok, :wake}
-      true -> {:ok, :coalesced}
+    if full? do
+      {{:ok, :replaced}, replaced, :replace}
+    else
+      {{:ok, :published}, replaced, :publish}
+    end
+  end
+
+  # The slot to publish into, with the head, size and head-drop count that
+  # publishing it commits.
+  defp slot_plan(ring) do
+    head = atomic_get(ring, @head)
+    size = atomic_get(ring, @size)
+    head_drops = atomic_get(ring, @head_drops)
+
+    if size == ring.capacity do
+      {true, head, rem(head + 1, ring.capacity), size, head_drops + 1}
+    else
+      {false, rem(head + size, ring.capacity), head, size + 1, head_drops}
     end
   end
 
@@ -241,18 +350,33 @@ defmodule Derpex.Outbox.Ring do
     commit(ring, new_head, new_size, head_drops)
     run_hook(ring, :after_commit)
     :ets.delete(ring.table, :journal)
-    age_microseconds = max(Clock.monotonic_time(:microsecond) - enqueued_at, 0)
-    {:ok, item, age_microseconds}
+    {:ok, item, enqueued_at}
   end
 
-  defp signal_writer(ring) do
-    if atomic_get(ring, @wake_pending) == 0 do
+  defp signal_after_release(ring, {:ok, _published}, :publish) do
+    if claim_wake(ring) do
       send(ring.notifier, ring.wake_message)
-      :atomics.put(ring.state, @wake_pending, 1)
-      :wake
+      {:ok, :wake}
     else
-      :coalesced
+      {:ok, :coalesced}
     end
+  end
+
+  defp signal_after_release(ring, {:ok, :replaced} = result, :replace) do
+    if claim_wake(ring), do: send(ring.notifier, ring.wake_message)
+    result
+  end
+
+  defp signal_after_release(_ring, result, _wake), do: result
+
+  # Raising the flag is the claim, and it is one compare-and-exchange, so only
+  # the producer that observed it clear sends. Reading it, sending, and then
+  # writing it back is not the same thing: the consumer clears the flag on an
+  # empty take, and a clear that lands between the read and the write leaves a
+  # flag saying "already woken" with no wakeup on its way and no producer that
+  # will ever send another one.
+  defp claim_wake(ring) do
+    :atomics.compare_exchange(ring.state, @wake_pending, 0, 1) == :ok
   end
 
   defp journal(ring, lock_token, operation_token, index, head, size, head_drops) do
@@ -294,81 +418,6 @@ defmodule Derpex.Outbox.Ring do
     :atomics.put(ring.state, @head_drops, head_drops)
   end
 
-  defp acquire_producer(ring) do
-    case try_acquire(ring) do
-      {:ok, _token} = acquired ->
-        acquired
-
-      :busy ->
-        :atomics.add_get(ring.state, @producer_waiters, 1)
-
-        try do
-          acquire_producer_wait(ring, @producer_wait_attempts)
-        after
-          :atomics.sub_get(ring.state, @producer_waiters, 1)
-        end
-    end
-  end
-
-  defp acquire_consumer(ring) do
-    if atomic_get(ring, @producer_waiters) == 0, do: try_acquire(ring), else: :busy
-  end
-
-  defp acquire_producer_wait(ring, attempts_left) do
-    case try_acquire(ring) do
-      :busy when attempts_left > 0 ->
-        Process.sleep(1)
-        acquire_producer_wait(ring, attempts_left - 1)
-
-      result ->
-        result
-    end
-  end
-
-  defp acquire(ring), do: acquire(ring, @lock_retries)
-
-  defp acquire(ring, retries_left) do
-    case try_acquire(ring) do
-      :busy when retries_left > 0 ->
-        :erlang.yield()
-        acquire(ring, retries_left - 1)
-
-      result ->
-        result
-    end
-  end
-
-  defp try_acquire(ring) do
-    token = unique_token()
-
-    if :ets.insert_new(ring.table, {:lock, token, self()}) do
-      {:ok, token}
-    else
-      reclaim_stale_lock(ring, token)
-    end
-  end
-
-  defp reclaim_stale_lock(ring, token) do
-    case :ets.lookup(ring.table, :lock) do
-      [{:lock, old_token, owner}] ->
-        if Process.alive?(owner) do
-          :busy
-        else
-          :ets.delete_object(ring.table, {:lock, old_token, owner})
-          try_insert_lock(ring, token)
-        end
-
-      [] ->
-        try_insert_lock(ring, token)
-    end
-  end
-
-  defp try_insert_lock(ring, token) do
-    if :ets.insert_new(ring.table, {:lock, token, self()}), do: {:ok, token}, else: :busy
-  end
-
-  defp release(ring, token), do: :ets.delete_object(ring.table, {:lock, token, self()})
-
   defp clear_slots(ring) do
     operation_token = unique_token()
 
@@ -393,10 +442,11 @@ defmodule Derpex.Outbox.Ring do
     )
   end
 
-  defp record_replaced_drop(ring, index) do
+  # Only the lookup belongs under the lock; the drop is recorded after release.
+  defp replaced_item(ring, index) do
     case :ets.lookup(ring.table, index) do
-      [{^index, _slot_token, _enqueued_at, item}] -> record_drop(ring, item, :queue_head)
-      [] -> :ok
+      [{^index, _slot_token, replaced_at, item}] -> {item, :queue_head, replaced_at}
+      [] -> nil
     end
   end
 
@@ -420,8 +470,23 @@ defmodule Derpex.Outbox.Ring do
   defp record_drop(%{metric_kind: nil}, _item, _reason), do: :ok
 
   defp record_drop(ring, item, reason) do
-    Metrics.add_drop(ring.metrics, reason, ring.metric_kind, packet_size(item))
+    Metrics.add_drop(ring.metrics, reason, drop_kind(ring, item), packet_size(item))
   end
+
+  # A ring that carries one class of traffic labels its drops with that class.
+  # A forwarding ring carries both, so it labels each drop the way Go does,
+  # from the packet itself.
+  defp drop_kind(%{metric_kind: :by_packet}, item), do: packet_kind(item)
+  defp drop_kind(ring, _item), do: ring.metric_kind
+
+  defp packet_kind({:recv_packet, _source, packet}), do: packet_kind(packet)
+  defp packet_kind({:forward_packet, _source, _destination, packet}), do: packet_kind(packet)
+
+  defp packet_kind(packet) when is_binary(packet) do
+    if Disco.looks_like_wrapper?(packet), do: :disco, else: :other
+  end
+
+  defp packet_kind(_non_packet), do: :other
 
   defp packet_size({:recv_packet, _source, packet}) when is_binary(packet), do: byte_size(packet)
 

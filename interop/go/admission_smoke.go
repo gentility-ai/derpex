@@ -1,5 +1,5 @@
-// Copyright (c) 2026 DERPEX contributors.
-// SPDX-License-Identifier: BSD-3-Clause
+// Copyright (c) 2026 Gentility AI & DERPEX contributors.
+// SPDX-License-Identifier: MIT
 
 // Command admission_smoke checks disallowed app-name admission and trusted
 // mesh bypass with the official DERP HTTP client.

@@ -1,8 +1,13 @@
 defmodule Derpex.RouterTest do
   use ExUnit.Case, async: false
 
+  alias Derpex.Metrics
+  alias Derpex.Outbox
+  alias Derpex.Outbox.LifecycleQueue
+  alias Derpex.Outbox.Lock
   alias Derpex.Outbox.Ring
   alias Derpex.Router
+  alias Derpex.Router.ReversePaths
 
   test "successful routing looks up ETS and publishes directly to a bounded ring" do
     source = :crypto.strong_rand_bytes(32)
@@ -218,6 +223,223 @@ defmodule Derpex.RouterTest do
     Process.exit(destination_connection, :kill)
   end
 
+  test "forgetting a destination costs its own reverse paths, not the whole table" do
+    sources = for _index <- 1..100, do: :crypto.strong_rand_bytes(32)
+    connections = for _index <- 1..2_000, do: spawn(fn -> Process.sleep(:infinity) end)
+    shared_ring = Ring.new(1)
+
+    on_exit(fn ->
+      Enum.each(connections, &ReversePaths.forget_connection/1)
+      Enum.each(connections, &Process.exit(&1, :kill))
+    end)
+
+    for connection <- connections, source <- sources do
+      assert Router.note_send(source, connection, shared_ring) == :ok
+    end
+
+    [target | _others] = connections
+    target_key = :crypto.strong_rand_bytes(32)
+    assert Router.register(target_key, target, shared_ring) == :ok
+
+    {elapsed, :ok} = :timer.tc(fn -> Router.unregister(target_key, target) end)
+
+    assert elapsed < 2_000,
+           "unregister scanned the whole reverse table: #{elapsed} us"
+  end
+
+  test "clearing one destination's reverse paths leaves the others subscribed" do
+    source = :crypto.strong_rand_bytes(32)
+    first_key = :crypto.strong_rand_bytes(32)
+    second_key = :crypto.strong_rand_bytes(32)
+    source_connection = spawn(fn -> Process.sleep(:infinity) end)
+    first = spawn(fn -> Process.sleep(:infinity) end)
+    second = spawn(fn -> Process.sleep(:infinity) end)
+    first_ring = Ring.new(1)
+    second_ring = Ring.new(1)
+
+    assert Router.register(source, source_connection, Ring.new(1)) == :ok
+    assert Router.register(first_key, first, first_ring) == :ok
+    assert Router.register(second_key, second, second_ring) == :ok
+    assert Router.note_send(source, first, first_ring) == :ok
+    assert Router.note_send(source, second, second_ring) == :ok
+
+    assert Router.unregister(first_key, first) == :ok
+    assert Router.unregister(source, source_connection) == :ok
+
+    assert Ring.take(second_ring) == {:ok, {:peer_gone, source, 0x00}}
+    assert Ring.take(first_ring) == :empty
+
+    assert Router.unregister(second_key, second) == :ok
+    Enum.each([source_connection, first, second], &Process.exit(&1, :kill))
+  end
+
+  test "the last local route leaving while a forwarder remains keeps the peer present" do
+    source = :crypto.strong_rand_bytes(32)
+    destination_key = :crypto.strong_rand_bytes(32)
+    source_connection = spawn(fn -> Process.sleep(:infinity) end)
+    destination = spawn(fn -> Process.sleep(:infinity) end)
+    destination_ring = Ring.new(2)
+    forwarder_ring = Ring.new(2)
+
+    assert Router.register(source, source_connection, Ring.new(1)) == :ok
+    assert Router.register(destination_key, destination, destination_ring) == :ok
+    assert Router.add_forwarder(source, :peer_relay, forwarder_ring) == :ok
+    assert Router.note_send(source, destination, destination_ring) == :ok
+
+    assert Router.unregister(source, source_connection) == :ok
+    assert Ring.take(destination_ring) == :empty
+
+    assert Router.remove_forwarder(source, :peer_relay) == :ok
+    assert Ring.take(destination_ring) == {:ok, {:peer_gone, source, 0x00}}
+
+    assert Router.unregister(destination_key, destination) == :ok
+    Enum.each([source_connection, destination], &Process.exit(&1, :kill))
+  end
+
+  test "the last forwarder leaving with no local route announces the peer as gone" do
+    source = :crypto.strong_rand_bytes(32)
+    destination_key = :crypto.strong_rand_bytes(32)
+    destination = spawn(fn -> Process.sleep(:infinity) end)
+    destination_ring = Ring.new(2)
+    forwarder_ring = Ring.new(2)
+
+    assert Router.register(destination_key, destination, destination_ring) == :ok
+    assert Router.add_forwarder(source, :peer_relay, forwarder_ring) == :ok
+    assert Router.note_send(source, destination, destination_ring) == :ok
+
+    assert Router.remove_forwarder(source, :peer_relay) == :ok
+    assert Ring.take(destination_ring) == {:ok, {:peer_gone, source, 0x00}}
+
+    assert Router.unregister(destination_key, destination) == :ok
+    Process.exit(destination, :kill)
+  end
+
+  test "the last forwarder leaving while a local route remains keeps the peer present" do
+    source = :crypto.strong_rand_bytes(32)
+    destination_key = :crypto.strong_rand_bytes(32)
+    source_connection = spawn(fn -> Process.sleep(:infinity) end)
+    destination = spawn(fn -> Process.sleep(:infinity) end)
+    destination_ring = Ring.new(2)
+    forwarder_ring = Ring.new(2)
+
+    assert Router.register(source, source_connection, Ring.new(1)) == :ok
+    assert Router.register(destination_key, destination, destination_ring) == :ok
+    assert Router.add_forwarder(source, :peer_relay, forwarder_ring) == :ok
+    assert Router.note_send(source, destination, destination_ring) == :ok
+
+    assert Router.remove_forwarder(source, :peer_relay) == :ok
+    assert Ring.take(destination_ring) == :empty
+
+    assert Router.unregister(source, source_connection) == :ok
+    assert Ring.take(destination_ring) == {:ok, {:peer_gone, source, 0x00}}
+
+    assert Router.unregister(destination_key, destination) == :ok
+    Enum.each([source_connection, destination], &Process.exit(&1, :kill))
+  end
+
+  test "removing one of two forwarders keeps the peer present and still routed" do
+    source = :crypto.strong_rand_bytes(32)
+    sender = :crypto.strong_rand_bytes(32)
+    destination_key = :crypto.strong_rand_bytes(32)
+    destination = spawn(fn -> Process.sleep(:infinity) end)
+    destination_ring = Ring.new(2)
+    first = Ring.new(2)
+    second = Ring.new(2)
+
+    assert Router.register(destination_key, destination, destination_ring) == :ok
+    assert Router.add_forwarder(source, :first, first) == :ok
+    assert Router.add_forwarder(source, :second, second) == :ok
+    assert Router.note_send(source, destination, destination_ring) == :ok
+
+    before = Metrics.snapshot()[:remove_forwarder_other]
+    assert Router.remove_forwarder(source, :first) == :ok
+
+    assert Ring.take(destination_ring) == :empty
+    assert Router.forwarder_count(source) == 1
+    assert Metrics.snapshot()[:remove_forwarder_other] == before
+
+    assert_enqueued(Router.route(sender, source, "still routed"))
+    assert Ring.take(second) == {:ok, {:forward_packet, sender, source, "still routed"}}
+    assert Ring.take(first) == :empty
+
+    assert Router.remove_forwarder(source, :second) == :ok
+    assert Ring.take(destination_ring) == {:ok, {:peer_gone, source, 0x00}}
+
+    assert Router.unregister(destination_key, destination) == :ok
+    Process.exit(destination, :kill)
+  end
+
+  # Go's `handleFrameSendPacket` increments `packetsForwardedOut` before it calls
+  # `ForwardPacket`, so the counter measures forwarding attempts, not deliveries.
+  test "forwarding counts the attempt even when the forwarder ring refuses it" do
+    source = :crypto.strong_rand_bytes(32)
+    destination = :crypto.strong_rand_bytes(32)
+    forwarder_ring = Ring.new(1)
+
+    assert Router.add_forwarder(destination, :closed, forwarder_ring) == :ok
+    Ring.close(forwarder_ring)
+
+    before = Metrics.snapshot()[:packets_forwarded_out]
+
+    assert {:dropped, _reason} = Router.route(source, destination, "refused")
+    assert Metrics.snapshot()[:packets_forwarded_out] == before + 1
+
+    assert Router.remove_forwarder(destination, :closed) == :ok
+  end
+
+  test "removing an unregistered forwarder identity leaves the registered path alone" do
+    source = :crypto.strong_rand_bytes(32)
+    sender = :crypto.strong_rand_bytes(32)
+    destination_key = :crypto.strong_rand_bytes(32)
+    destination = spawn(fn -> Process.sleep(:infinity) end)
+    forwarder_process = spawn(fn -> Process.sleep(:infinity) end)
+    destination_ring = Ring.new(2)
+    forwarder_ring = Ring.new(2)
+
+    assert Router.register(destination_key, destination, destination_ring) == :ok
+    assert Router.add_forwarder(source, forwarder_process, forwarder_ring) == :ok
+    assert Router.note_send(source, destination, destination_ring) == :ok
+
+    before = Metrics.snapshot()[:remove_forwarder_other]
+    assert Router.remove_forwarder(source, :never_registered) == :ok
+    assert Router.remove_forwarder(:crypto.strong_rand_bytes(32), :never_registered) == :ok
+
+    assert Ring.take(destination_ring) == :empty
+    assert Router.forwarder_count(source) == 1
+    assert Metrics.snapshot()[:remove_forwarder_other] == before + 2
+
+    assert_enqueued(Router.route(sender, source, "still routed"))
+    assert Ring.take(forwarder_ring) == {:ok, {:forward_packet, sender, source, "still routed"}}
+
+    # The registered identity is still monitored, so its death still evicts it.
+    Process.exit(forwarder_process, :kill)
+    assert_eventually(fn -> Router.forwarder_count(source) == 0 end)
+    assert Ring.take(destination_ring) == {:ok, {:peer_gone, source, 0x00}}
+
+    assert Router.unregister(destination_key, destination) == :ok
+    Process.exit(destination, :kill)
+  end
+
+  test "a crashed last forwarder for a remote-only peer announces it as gone" do
+    source = :crypto.strong_rand_bytes(32)
+    destination_key = :crypto.strong_rand_bytes(32)
+    destination = spawn(fn -> Process.sleep(:infinity) end)
+    forwarder_process = spawn(fn -> Process.sleep(:infinity) end)
+    destination_ring = Ring.new(2)
+    forwarder_ring = Ring.new(2)
+
+    assert Router.register(destination_key, destination, destination_ring) == :ok
+    assert Router.add_forwarder(source, forwarder_process, forwarder_ring) == :ok
+    assert Router.note_send(source, destination, destination_ring) == :ok
+
+    Process.exit(forwarder_process, :kill)
+    assert_eventually(fn -> Router.forwarder_count(source) == 0 end)
+    assert Ring.take(destination_ring) == {:ok, {:peer_gone, source, 0x00}}
+
+    assert Router.unregister(destination_key, destination) == :ok
+    Process.exit(destination, :kill)
+  end
+
   test "the most recently active duplicate receives packets" do
     key = :crypto.strong_rand_bytes(32)
     source = :crypto.strong_rand_bytes(32)
@@ -241,6 +463,41 @@ defmodule Derpex.RouterTest do
     assert Router.unregister(key, second) == :ok
     Process.exit(first, :kill)
     Process.exit(second, :kill)
+  end
+
+  test "a sole connection's activity notes never reach a table" do
+    key = :crypto.strong_rand_bytes(32)
+    ring = Ring.new(1)
+    connection = activity_reporter(self(), key, ring)
+
+    assert_receive {:registered, ^connection}
+    on_exit(fn -> Process.exit(connection, :kill) end)
+
+    assert measure_lookups(connection) == 0
+    assert Router.unregister(key, connection) == :ok
+  end
+
+  test "a connection promoted to a duplicate resumes noting its activity" do
+    key = :crypto.strong_rand_bytes(32)
+    source = :crypto.strong_rand_bytes(32)
+    first_ring = Ring.new(2)
+    second_ring = Ring.new(2)
+    first = activity_reporter(self(), key, first_ring)
+    assert_receive {:registered, ^first}
+
+    second = spawn(fn -> Process.sleep(:infinity) end)
+    on_exit(fn -> Enum.each([first, second], &Process.exit(&1, :kill)) end)
+
+    assert Router.register(key, second, second_ring) == :ok
+    assert Router.route(source, key, "newest") == {:ok, :wake}
+    assert Ring.take(second_ring) == {:ok, {:recv_packet, source, "newest"}}
+
+    assert measure_lookups(first) > 0
+    assert Router.route(source, key, "promoted") == {:ok, :wake}
+    assert Ring.take(first_ring) == {:ok, {:recv_packet, source, "promoted"}}
+
+    assert Router.unregister(key, first) == :ok
+    assert Router.unregister(key, second) == :ok
   end
 
   test "closing a peer asks every duplicate connection to stop" do
@@ -296,7 +553,9 @@ defmodule Derpex.RouterTest do
 
     assert Router.watch(watcher, watcher_ring) == :ok
 
-    assert Ring.take(watcher_ring) ==
+    # The snapshot streams in chunks between everything else the router does,
+    # so it arrives shortly after the call returns rather than inside it.
+    assert take_when_ready(watcher_ring) ==
              {:ok,
               {:peer_present, first_key, first_presence.ip, first_presence.port,
                first_presence.flags, first_presence.app_name}}
@@ -324,6 +583,293 @@ defmodule Derpex.RouterTest do
     Process.exit(watcher, :kill)
   end
 
+  @tag :performance
+  @tag timeout: 120_000
+  test "a region-sized snapshot reaches a new watcher without stalling the router" do
+    parent = self()
+    connection = spawn(fn -> Process.sleep(:infinity) end)
+    ring = Ring.new(1)
+    total = 70_000
+    peers = for _index <- 1..total, do: :crypto.strong_rand_bytes(32)
+
+    on_exit(fn ->
+      Enum.each(peers, &Router.unregister(&1, connection))
+      Process.exit(connection, :kill)
+    end)
+
+    Enum.each(peers, &(:ok = Router.register(&1, connection, ring)))
+
+    # A real watcher drains as it reads, which is what lets the router stream a
+    # region larger than the queue's soft cap.
+    watcher = spawn_link(fn -> await_snapshot(parent, total) end)
+    lifecycle = LifecycleQueue.new(notifier: watcher, owner: watcher)
+    send(watcher, {:queue, lifecycle})
+    assert Router.watch(watcher, lifecycle) == :ok
+
+    # The router keeps answering while the snapshot streams: sending it from
+    # inside the watch call held the router for all seventy thousand frames.
+    source = :crypto.strong_rand_bytes(32)
+    destination = hd(peers)
+
+    latencies =
+      for _probe <- 1..200 do
+        {microseconds, _result} = :timer.tc(fn -> Router.route(source, destination, "probe") end)
+        Process.sleep(1)
+        microseconds
+      end
+
+    assert_receive {:snapshot_complete, ^total}, 60_000
+    assert Enum.max(latencies) < 5_000
+  end
+
+  defp await_snapshot(parent, total) do
+    receive do
+      {:queue, queue} -> collect_present(queue, MapSet.new(), parent, total)
+    end
+  end
+
+  defp collect_present(queue, seen, parent, total) do
+    case LifecycleQueue.take(queue) do
+      {:ok, {:peer_present, key, _ip, _port, _flags, _app}} ->
+        seen = MapSet.put(seen, key)
+
+        if MapSet.size(seen) == total do
+          send(parent, {:snapshot_complete, total})
+        else
+          collect_present(queue, seen, parent, total)
+        end
+
+      {:ok, _other} ->
+        collect_present(queue, seen, parent, total)
+
+      :busy ->
+        collect_present(queue, seen, parent, total)
+
+      _empty_or_closed ->
+        receive do
+          :derpex_outbox_ready -> collect_present(queue, seen, parent, total)
+        after
+          30_000 -> send(parent, {:snapshot_complete, MapSet.size(seen)})
+        end
+    end
+  end
+
+  # A watcher whose queue is smaller than the region cannot be given the whole
+  # snapshot at once, so the stream waits for room. What it must not do is take
+  # every last slot: the next presence change then overflows the queue and the
+  # watcher is closed for having connected to a region that is too big.
+  test "a stalled snapshot leaves room for the presence changes that follow it" do
+    parent = self()
+    connection = spawn(fn -> Process.sleep(:infinity) end)
+    ring = Ring.new(1)
+    soft_cap = 2_048
+    peers = for _index <- 1..3_000, do: :crypto.strong_rand_bytes(32)
+    late_peer = :crypto.strong_rand_bytes(32)
+
+    # The queue's table belongs to the watcher, as a connection's does, so it
+    # goes away with the watcher rather than with this test process.
+    watcher =
+      spawn(fn ->
+        send(parent, {:queue, LifecycleQueue.new(owner: parent, soft_cap: soft_cap)})
+        Process.sleep(:infinity)
+      end)
+
+    assert_receive {:queue, lifecycle}
+
+    on_exit(fn ->
+      Enum.each([late_peer | peers], &Router.unregister(&1, connection))
+      Process.exit(connection, :kill)
+      Process.exit(watcher, :kill)
+    end)
+
+    Enum.each(peers, &(:ok = Router.register(&1, connection, ring)))
+    assert Router.watch(watcher, lifecycle) == :ok
+
+    # The watcher never drains, so the snapshot stalls partway through.
+    assert_eventually(fn -> LifecycleQueue.size(lifecycle) > 0 end, 500)
+    Process.sleep(50)
+    stalled = LifecycleQueue.size(lifecycle)
+    assert stalled < soft_cap
+
+    # A peer arriving while the snapshot waits is a frame the watcher is owed,
+    # not a reason to close it.
+    assert Router.register(late_peer, connection, ring) == :ok
+    refute_receive {:derpex_lifecycle_overflow, _size}, 200
+    assert LifecycleQueue.size(lifecycle) <= soft_cap
+  end
+
+  test "a presence change that loses the queue lock is delivered, not dropped" do
+    watcher = spawn(fn -> Process.sleep(:infinity) end)
+    connection = spawn(fn -> Process.sleep(:infinity) end)
+    queue = LifecycleQueue.new(notifier: watcher, owner: watcher)
+    key = :crypto.strong_rand_bytes(32)
+
+    on_exit(fn ->
+      Router.unregister(key, connection)
+      Process.exit(connection, :kill)
+      Process.exit(watcher, :kill)
+    end)
+
+    assert Router.watch(watcher, queue) == :ok
+
+    # Hold the watcher's queue the way its own writer does mid-drain.
+    {:ok, token} = Lock.acquire_producer(queue.table, false, nil)
+    before = Metrics.snapshot()
+    assert Router.register(key, connection, Ring.new(1)) == :ok
+
+    assert_eventually(fn -> :ets.info(Derpex.Router.PendingLifecycle, :size) > 0 end, 200)
+    assert LifecycleQueue.size(queue) == 0
+
+    assert Metrics.snapshot()[:lifecycle_contention] > before[:lifecycle_contention]
+
+    # ADR 0003 promises a watcher's view is complete or absent: the frame waited
+    # for the lock rather than disappearing behind it.
+    Lock.release(queue.table, token)
+    assert_eventually(fn -> LifecycleQueue.size(queue) == 1 end, 200)
+
+    assert {:ok, {:peer_present, ^key, _ip, _port, _flags, _app}} = LifecycleQueue.take(queue)
+  end
+
+  # A reverse-path peer-gone is the one presence frame that cannot be retried:
+  # `take/1` has already deleted the row that names the destination. Losing the
+  # queue's lock therefore left the destination believing a peer it had been
+  # relaying to was still there, with nothing to correct it.
+  test "a reverse-path peer gone that loses the queue lock is parked, not dropped" do
+    source = :crypto.strong_rand_bytes(32)
+    destination = :crypto.strong_rand_bytes(32)
+    source_connection = spawn(fn -> Process.sleep(:infinity) end)
+    destination_connection = spawn(fn -> Process.sleep(:infinity) end)
+
+    lifecycle =
+      LifecycleQueue.new(notifier: destination_connection, owner: destination_connection)
+
+    on_exit(fn ->
+      Router.unregister(destination, destination_connection)
+      Process.exit(source_connection, :kill)
+      Process.exit(destination_connection, :kill)
+    end)
+
+    assert Router.register(source, source_connection, Ring.new(1)) == :ok
+
+    assert Router.register(
+             destination,
+             destination_connection,
+             Ring.new(1),
+             Ring.new(1),
+             lifecycle
+           ) ==
+             :ok
+
+    assert Router.note_send(source, destination_connection, lifecycle) == :ok
+
+    # Held the way the destination's own writer holds it mid-drain.
+    {:ok, token} = Lock.acquire_producer(lifecycle.table, false, nil)
+    assert Router.unregister(source, source_connection) == :ok
+
+    assert_eventually(fn -> :ets.info(Derpex.Router.PendingLifecycle, :size) > 0 end, 200)
+    Lock.release(lifecycle.table, token)
+
+    assert_eventually(fn -> LifecycleQueue.size(lifecycle) == 1 end, 500)
+    assert LifecycleQueue.take(lifecycle) == {:ok, {:peer_gone, source, 0x00}}
+  end
+
+  # The parked table is shared and ordered by connection, so stopping the flush
+  # at the first locked queue let one watcher hold up the presence frames of
+  # every watcher that sorts after it.
+  test "a parked frame is not held up by another watcher's locked queue" do
+    first = spawn(fn -> Process.sleep(:infinity) end)
+    second = spawn(fn -> Process.sleep(:infinity) end)
+    connection = spawn(fn -> Process.sleep(:infinity) end)
+    key = :crypto.strong_rand_bytes(32)
+
+    # The table is keyed by pid, and the held queue has to sort first for its
+    # lock to be able to hold anything up.
+    [held_watcher, free_watcher] = Enum.sort([first, second])
+    held = LifecycleQueue.new(notifier: held_watcher, owner: held_watcher)
+    free = LifecycleQueue.new(notifier: free_watcher, owner: free_watcher)
+
+    on_exit(fn ->
+      Router.unregister(key, connection)
+      Enum.each([first, second, connection], &Process.exit(&1, :kill))
+    end)
+
+    assert Router.watch(held_watcher, held) == :ok
+    assert Router.watch(free_watcher, free) == :ok
+
+    {:ok, held_token} = Lock.acquire_producer(held.table, false, nil)
+    {:ok, free_token} = Lock.acquire_producer(free.table, false, nil)
+    assert Router.register(key, connection, Ring.new(1)) == :ok
+    assert_eventually(fn -> :ets.info(Derpex.Router.PendingLifecycle, :size) == 2 end, 500)
+
+    # Only the free watcher's queue is released: its frame must not wait for the
+    # other watcher's writer.
+    Lock.release(free.table, free_token)
+    assert_eventually(fn -> LifecycleQueue.size(free) == 1 end, 500)
+    assert {:ok, {:peer_present, ^key, _ip, _port, _flags, _app}} = LifecycleQueue.take(free)
+
+    Lock.release(held.table, held_token)
+    assert_eventually(fn -> LifecycleQueue.size(held) == 1 end, 500)
+  end
+
+  test "a stalled watcher still learns about every peer that arrived" do
+    watcher = spawn(fn -> Process.sleep(:infinity) end)
+    lifecycle = LifecycleQueue.new(notifier: watcher, owner: watcher)
+    peers = for _index <- 1..100, do: :crypto.strong_rand_bytes(32)
+
+    on_exit(fn ->
+      Enum.each(peers, &Router.unregister(&1, watcher))
+      Process.exit(watcher, :kill)
+    end)
+
+    assert Router.watch(watcher, lifecycle) == :ok
+
+    # The watcher's writer never drains while the region fills up. A fixed ring
+    # would have kept the last thirty-two arrivals and quietly lost the rest.
+    Enum.each(peers, fn peer ->
+      assert Router.register(peer, watcher, Ring.new(1), Ring.new(1), lifecycle) == :ok
+    end)
+
+    assert_eventually(fn -> LifecycleQueue.size(lifecycle) == 100 end, 200)
+
+    present =
+      Stream.repeatedly(fn -> LifecycleQueue.take(lifecycle) end)
+      |> Enum.take_while(&match?({:ok, {:peer_present, _key, _ip, _port, _flags, _app}}, &1))
+      |> Enum.map(fn {:ok, {:peer_present, key, _ip, _port, _flags, _app}} -> key end)
+
+    assert length(present) == 100
+    assert Enum.sort(present) == Enum.sort(peers)
+  end
+
+  test "a packet for a torn-down destination counts as a disconnect drop" do
+    parent = self()
+    key = :crypto.strong_rand_bytes(32)
+    source = :crypto.strong_rand_bytes(32)
+
+    connection = spawn(fn -> Process.sleep(:infinity) end)
+
+    # A ring dies with the process that owns its table. The route survives until
+    # the router reaps it, so a packet can still find a destination that is gone.
+    owner = spawn(fn -> send(parent, {:ring, Ring.new(1)}) end)
+    monitor = Process.monitor(owner)
+    assert_receive {:ring, ring}
+    assert_receive {:DOWN, ^monitor, :process, ^owner, _reason}
+    assert Router.register(key, connection, ring) == :ok
+
+    on_exit(fn ->
+      Router.unregister(key, connection)
+      Process.exit(connection, :kill)
+    end)
+
+    before = Metrics.snapshot()
+    assert Router.route(source, key, "orphan") == {:dropped, :closed_destination}
+    after_snapshot = Metrics.snapshot()
+
+    assert delta(before, after_snapshot, {:packets_dropped, :gone_disconnected, :other}) == 1
+    assert delta(before, after_snapshot, {:bytes_dropped, :gone_disconnected, :other}) == 6
+  end
+
+  defp delta(before, current, key), do: Map.fetch!(current, key) - Map.fetch!(before, key)
+
   test "a vanished ring owner becomes a drop instead of crashing topology state" do
     parent = self()
 
@@ -348,6 +894,52 @@ defmodule Derpex.RouterTest do
     Process.exit(source_connection, :kill)
   end
 
+  # Registers from inside the spawned process, the way a listener handler does,
+  # then notes activity 10_000 times on demand so the caller can measure it.
+  defp activity_reporter(parent, key, ring) do
+    spawn(fn ->
+      :ok = Router.register(key, self(), ring)
+      send(parent, {:registered, self()})
+
+      receive do
+        :note_activity -> :ok
+      end
+
+      Enum.each(1..10_000, fn _index ->
+        :ok = Router.note_activity(key, self())
+      end)
+
+      send(parent, {:noted, self()})
+      Process.sleep(:infinity)
+    end)
+  end
+
+  defp measure_lookups(connection) do
+    counter = spawn_link(fn -> count_lookups(0) end)
+    :erlang.trace_pattern({:ets, :lookup, 2}, true, [])
+    :erlang.trace(connection, true, [:call, {:tracer, counter}])
+
+    try do
+      send(connection, :note_activity)
+      assert_receive {:noted, ^connection}, 10_000
+      reference = :erlang.trace_delivered(connection)
+      assert_receive {:trace_delivered, ^connection, ^reference}, 5_000
+      send(counter, {:count, self()})
+      assert_receive {:lookups, count}, 5_000
+      count
+    after
+      :erlang.trace(connection, false, [:call])
+      :erlang.trace_pattern({:ets, :lookup, 2}, false, [])
+    end
+  end
+
+  defp count_lookups(count) do
+    receive do
+      {:trace, _pid, :call, {:ets, :lookup, _arguments}} -> count_lookups(count + 1)
+      {:count, caller} -> send(caller, {:lookups, count})
+    end
+  end
+
   defp reporting_connection(parent) do
     spawn(fn ->
       receive do
@@ -356,6 +948,90 @@ defmodule Derpex.RouterTest do
           Process.sleep(:infinity)
       end
     end)
+  end
+
+  test "a watcher whose ring lock is held cannot delay the router" do
+    parent = self()
+    key = :crypto.strong_rand_bytes(32)
+    connection = spawn(fn -> Process.sleep(:infinity) end)
+    ring = Ring.new(2)
+
+    watchers =
+      Enum.map(1..100, fn _index ->
+        watcher_ring = Ring.new(2, test_hook: holding_hook(parent))
+        watcher = spawn(fn -> Process.sleep(:infinity) end)
+        assert Router.watch(watcher, watcher_ring) == :ok
+
+        holder =
+          spawn(fn ->
+            Process.put(:hold_ring_lock, true)
+            Ring.enqueue(watcher_ring, :held)
+          end)
+
+        assert_receive {:holding, ^holder}
+        {watcher, holder}
+      end)
+
+    on_exit(fn ->
+      Router.unregister(key, connection)
+      Process.exit(connection, :kill)
+
+      Enum.each(watchers, fn {watcher, holder} ->
+        Process.exit(holder, :kill)
+        Process.exit(watcher, :kill)
+      end)
+    end)
+
+    {elapsed_microseconds, :ok} =
+      :timer.tc(fn -> Router.register(key, connection, ring, ring, ring) end)
+
+    # Napping on each held lock would cost milliseconds per watcher.
+    assert elapsed_microseconds < 5_000
+
+    # Held locks make every later broadcast slow, so this test hands the router
+    # back clean rather than leaving the teardown to run beside the next test.
+    Enum.each(watchers, fn {watcher, holder} ->
+      send(holder, :release)
+      Process.exit(watcher, :kill)
+    end)
+
+    assert Router.unregister(key, connection) == :ok
+    assert_eventually(fn -> Router.stats().watchers == 0 end)
+  end
+
+  # Only the process that marked itself the holder parks inside the lock. The
+  # router runs this same hook whenever it publishes into one of these rings,
+  # and parking it there would wedge the singleton for every other test.
+  # A snapshot frame arrives from the router's own stream, so the first take
+  # after watch/2 waits for it.
+  defp take_when_ready(outbox, attempts \\ 200)
+  defp take_when_ready(outbox, 0), do: Outbox.take(outbox)
+
+  defp take_when_ready(outbox, attempts) do
+    case Outbox.take(outbox) do
+      :empty ->
+        Process.sleep(2)
+        take_when_ready(outbox, attempts - 1)
+
+      result ->
+        result
+    end
+  end
+
+  defp holding_hook(parent) do
+    fn
+      :after_journal ->
+        if Process.get(:hold_ring_lock) do
+          send(parent, {:holding, self()})
+
+          receive do
+            :release -> :ok
+          end
+        end
+
+      _phase ->
+        :ok
+    end
   end
 
   defp count_ring(ring, count \\ 0) do

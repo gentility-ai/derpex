@@ -1,17 +1,35 @@
+defmodule Derpex.ConnectionTest.StateHolder do
+  @moduledoc false
+
+  use GenServer
+
+  def start(state), do: GenServer.start(__MODULE__, state)
+
+  @impl true
+  def init(state), do: {:ok, state}
+
+  @impl true
+  def handle_cast(:crash, state), do: {:stop, :deliberate_crash, state}
+end
+
 defmodule Derpex.ConnectionTest do
   use ExUnit.Case, async: true
 
+  import ExUnit.CaptureLog
+
   alias Derpex.ClientInfo
   alias Derpex.Connection
+  alias Derpex.ConnectionTest.StateHolder
   alias Derpex.Crypto
   alias Derpex.Frame
   alias Derpex.Handshake
+  alias Derpex.Secret
 
   test "emits the greeting before a ten-second handshake deadline" do
     {_server_public, server_private} = Crypto.generate_keypair()
 
     assert {:ok, state, [{:send, greeting}, {:set_timeout, :handshake, 10_000}]} =
-             Connection.new(server_private)
+             Connection.new(Secret.wrap(server_private))
 
     assert {:ok, type, 40, body} = greeting |> IO.iodata_to_binary() |> Frame.decode_header()
     assert type == Frame.type(:server_key)
@@ -25,7 +43,7 @@ defmodule Derpex.ConnectionTest do
     client_info = %ClientInfo{version: 2, can_ack_pings: true, app_name: "chunked"}
     {:ok, frame} = Handshake.client_info_frame(client_private, server_public, client_info)
 
-    {:ok, state, _initial_actions} = Connection.new(server_private)
+    {:ok, state, _initial_actions} = Connection.new(Secret.wrap(server_private))
 
     {state, actions} =
       frame
@@ -38,7 +56,9 @@ defmodule Derpex.ConnectionTest do
 
     assert [
              {:authenticated, ^client_public, ^client_info, false},
+             {:register, ^client_public, ^client_info, false},
              {:send, server_info_frame},
+             :start_send_loop,
              {:cancel_timeout, :handshake},
              {:set_timeout, :keep_alive, keep_alive_interval}
            ] = actions
@@ -66,7 +86,7 @@ defmodule Derpex.ConnectionTest do
       Handshake.client_info_frame(client_private, server_public, client_info)
 
     packet_frame = Frame.encode(:send_packet, [destination, "packet"])
-    {:ok, state, _actions} = Connection.new(server_private)
+    {:ok, state, _actions} = Connection.new(Secret.wrap(server_private))
 
     assert {:ok, _state, actions} =
              Connection.receive_data(
@@ -76,12 +96,14 @@ defmodule Derpex.ConnectionTest do
 
     assert [
              {:authenticated, ^client_public, ^client_info, false},
+             {:register, ^client_public, ^client_info, false},
              {:send, _server_info},
+             :start_send_loop,
              {:cancel_timeout, :handshake},
              {:set_timeout, :keep_alive, _interval},
-             {:rate_limit, 38},
              :activity,
-             {:client_message, {:send_packet, ^destination, "packet"}}
+             {:client_message, {:send_packet, ^destination, "packet"}},
+             {:rate_limit, 38}
            ] = actions
   end
 
@@ -92,7 +114,7 @@ defmodule Derpex.ConnectionTest do
     {:ok, client_info_frame} =
       Handshake.client_info_frame(client_private, server_public, %ClientInfo{version: 2})
 
-    {:ok, state, _actions} = Connection.new(server_private, keep_alive_jitter: 4_999)
+    {:ok, state, _actions} = Connection.new(Secret.wrap(server_private), keep_alive_jitter: 4_999)
 
     assert {:ok, state, actions} =
              Connection.receive_data(state, IO.iodata_to_binary(client_info_frame))
@@ -118,17 +140,19 @@ defmodule Derpex.ConnectionTest do
 
     watch_frame = Frame.encode(:watch_connections, "")
 
-    {:ok, state, _actions} = Connection.new(server_private, mesh_key: mesh_key)
+    {:ok, state, _actions} =
+      Connection.new(Secret.wrap(server_private), mesh_key: Secret.wrap(mesh_key))
 
     assert {:ok, state, actions} =
              Connection.receive_data(state, IO.iodata_to_binary([client_info_frame, watch_frame]))
 
     assert [
              {:authenticated, ^client_public, ^client_info, true},
+             {:register, ^client_public, ^client_info, true},
              {:send, _server_info},
+             :start_send_loop,
              {:cancel_timeout, :handshake},
              {:set_timeout, :keep_alive, _interval},
-             {:rate_limit, 0},
              :activity,
              {:client_message, :watch_connections}
            ] = actions
@@ -136,7 +160,7 @@ defmodule Derpex.ConnectionTest do
     assert Connection.info(state).can_mesh
 
     {:ok, untrusted, _actions} =
-      Connection.new(server_private, mesh_key: :binary.copy(<<8>>, 32))
+      Connection.new(Secret.wrap(server_private), mesh_key: Secret.wrap(:binary.copy(<<8>>, 32)))
 
     assert {:close, _state, :insufficient_permissions, prior_actions} =
              Connection.receive_data(
@@ -149,7 +173,7 @@ defmodule Derpex.ConnectionTest do
 
   test "closes on the wrong first frame, malformed bodies, and handshake timeout" do
     {_server_public, server_private} = Crypto.generate_keypair()
-    {:ok, state, _actions} = Connection.new(server_private)
+    {:ok, state, _actions} = Connection.new(Secret.wrap(server_private))
 
     assert {:close, closed, {:unexpected_handshake_frame, type}, []} =
              Connection.receive_data(state, IO.iodata_to_binary(Frame.encode(:ping, "12345678")))
@@ -157,7 +181,7 @@ defmodule Derpex.ConnectionTest do
     assert type == Frame.type(:ping)
     assert Connection.info(closed).phase == :closed
 
-    {:ok, state, _actions} = Connection.new(server_private)
+    {:ok, state, _actions} = Connection.new(Secret.wrap(server_private))
     assert {:close, _state, :handshake_timeout, []} = Connection.timeout(state, :handshake)
   end
 
@@ -168,7 +192,7 @@ defmodule Derpex.ConnectionTest do
     {:ok, client_info_frame} =
       Handshake.client_info_frame(client_private, server_public, %ClientInfo{version: 2})
 
-    {:ok, state, _actions} = Connection.new(server_private)
+    {:ok, state, _actions} = Connection.new(Secret.wrap(server_private))
 
     {:ok, state, _actions} =
       Connection.receive_data(state, IO.iodata_to_binary(client_info_frame))
@@ -183,6 +207,65 @@ defmodule Derpex.ConnectionTest do
              )
   end
 
+  # Go charges once per frame header, and its limiter clamps each charge to the
+  # minimum burst. One charge for a whole chunk lets that clamp apply to the
+  # chunk instead: two hundred pipelined thousand-byte frames were charged as a
+  # single 203,000-byte frame and cost the bucket 65,568 tokens — a sixteenfold
+  # undercharge, reachable through one WebSocket message.
+  test "every frame header in a chunk is charged on its own" do
+    {server_public, server_private} = Crypto.generate_keypair()
+    {_client_public, client_private} = Crypto.generate_keypair()
+
+    {:ok, client_info_frame} =
+      Handshake.client_info_frame(client_private, server_public, %ClientInfo{version: 2})
+
+    {:ok, state, _actions} = Connection.new(Secret.wrap(server_private))
+
+    {:ok, state, _actions} =
+      Connection.receive_data(state, IO.iodata_to_binary(client_info_frame))
+
+    destination = :crypto.strong_rand_bytes(32)
+    payload = :binary.copy(<<0xA5>>, 1_000)
+    frame = IO.iodata_to_binary(Frame.encode(:send_packet, [destination, payload]))
+    pipelined = 20
+
+    assert {:ok, _state, actions} =
+             Connection.receive_data(state, :binary.copy(frame, pipelined))
+
+    charges = for {:rate_limit, length} <- actions, do: length
+    assert length(charges) == pipelined
+    assert Enum.all?(charges, &(&1 == 32 + byte_size(payload)))
+  end
+
+  # The phase is read before the frames are acted on, so the chunk carrying the
+  # ClientInfo frame is charged as unauthenticated — and what was pipelined
+  # behind it, the connection's first real traffic, went through for free.
+  test "a frame pipelined behind the client info is charged" do
+    {server_public, server_private} = Crypto.generate_keypair()
+    {_client_public, client_private} = Crypto.generate_keypair()
+
+    {:ok, client_info_frame} =
+      Handshake.client_info_frame(client_private, server_public, %ClientInfo{version: 2})
+
+    {:ok, state, _actions} = Connection.new(Secret.wrap(server_private))
+    destination = :crypto.strong_rand_bytes(32)
+    payload = :binary.copy(<<0xA5>>, 1_000)
+    frame = IO.iodata_to_binary(Frame.encode(:send_packet, [destination, payload]))
+
+    assert {:ok, state, actions} =
+             Connection.receive_data(state, IO.iodata_to_binary(client_info_frame) <> frame)
+
+    # The handshake frame itself stays free, as it does in Go: it is read before
+    # the rate-limited loop starts.
+    assert [{:rate_limit, 32 + 1_000}] == for({:rate_limit, _} = action <- actions, do: action)
+
+    # And the tally is not charged a second time on the next chunk.
+    assert {:ok, _state, next_actions} = Connection.receive_data(state, frame)
+
+    assert [{:rate_limit, 32 + 1_000}] ==
+             for({:rate_limit, _} = action <- next_actions, do: action)
+  end
+
   test "streams unknown authenticated frames to discard without retaining their bodies" do
     {server_public, server_private} = Crypto.generate_keypair()
     {_client_public, client_private} = Crypto.generate_keypair()
@@ -190,14 +273,104 @@ defmodule Derpex.ConnectionTest do
     {:ok, client_info_frame} =
       Handshake.client_info_frame(client_private, server_public, %ClientInfo{version: 2})
 
-    {:ok, state, _actions} = Connection.new(server_private)
+    {:ok, state, _actions} = Connection.new(Secret.wrap(server_private))
 
     {:ok, state, _actions} =
       Connection.receive_data(state, IO.iodata_to_binary(client_info_frame))
 
     header = Frame.encode_header(0xFE, 0xFFFFFFFF)
-    assert {:ok, state, []} = Connection.receive_data(state, header <> :binary.copy(<<1>>, 128))
+
+    # Go charges its receive limiter for the declared length as soon as it has
+    # the header, so a frame announcing four gigabytes is rate-limited before it
+    # streams rather than after.
+    assert {:ok, state, [{:rate_limit, 0xFFFFFFFF}]} =
+             Connection.receive_data(state, header <> :binary.copy(<<1>>, 128))
+
     assert state.decoder.remaining == 0xFFFFFFFF - 128
     assert state.decoder.fragments == []
+
+    # The rest of the body arrives uncharged: the frame was paid for at its
+    # header, and only a new header charges again.
+    assert {:ok, state, []} = Connection.receive_data(state, :binary.copy(<<1>>, 128))
+    assert state.decoder.remaining == 0xFFFFFFFF - 256
+  end
+
+  test "closes a wrong first frame on its header rather than after its body" do
+    {_server_public, server_private} = Crypto.generate_keypair()
+    {:ok, state, _actions} = Connection.new(Secret.wrap(server_private))
+
+    {microseconds, result} =
+      :timer.tc(fn -> Connection.receive_data(state, <<0xFF, 0xFFFFFFFF::32>>) end)
+
+    assert {:close, closed, {:unexpected_handshake_frame, 0xFF}, []} = result
+    assert Connection.info(closed).phase == :closed
+    assert microseconds < 100_000
+  end
+
+  test "closes on a client-info frame below Go's key-and-nonce minimum" do
+    {_server_public, server_private} = Crypto.generate_keypair()
+    {:ok, state, _actions} = Connection.new(Secret.wrap(server_private))
+
+    at_minimum = Frame.encode_header(Frame.type(:client_info), 56)
+    assert {:ok, _state, []} = Connection.receive_data(state, IO.iodata_to_binary(at_minimum))
+
+    below_minimum = Frame.encode_header(Frame.type(:client_info), 55)
+
+    assert {:close, closed, {:frame_too_small, 55, 56}, []} =
+             Connection.receive_data(state, IO.iodata_to_binary(below_minimum))
+
+    assert Connection.info(closed).phase == :closed
+  end
+
+  test "closes on a client-info frame above the pre-authentication cap" do
+    {_server_public, server_private} = Crypto.generate_keypair()
+    {:ok, state, _actions} = Connection.new(Secret.wrap(server_private))
+
+    at_cap = Frame.encode_header(Frame.type(:client_info), 16 * 1_024)
+    assert {:ok, _state, []} = Connection.receive_data(state, IO.iodata_to_binary(at_cap))
+
+    above_cap = Frame.encode_header(Frame.type(:client_info), 17 * 1_024)
+
+    assert {:close, closed, {:frame_too_large, 17_408, 16_384}, []} =
+             Connection.receive_data(state, IO.iodata_to_binary(above_cap))
+
+    assert Connection.info(closed).phase == :closed
+  end
+
+  test "keeps the server private key and mesh key out of inspected state" do
+    {_server_public, server_private} = Crypto.generate_keypair()
+    mesh_key = :crypto.strong_rand_bytes(32)
+
+    {:ok, state, _actions} =
+      Connection.new(Secret.wrap(server_private), mesh_key: Secret.wrap(mesh_key))
+
+    rendered = inspect(state, limit: :infinity, structs: false, binaries: :as_binaries)
+
+    refute rendered =~ Base.encode16(server_private)
+    refute rendered =~ inspect(server_private, limit: :infinity, binaries: :as_binaries)
+    refute rendered =~ Base.encode16(mesh_key)
+    refute rendered =~ inspect(mesh_key, limit: :infinity, binaries: :as_binaries)
+  end
+
+  test "keeps key material out of a crash report carrying connection state" do
+    {_server_public, server_private} = Crypto.generate_keypair()
+    mesh_key = :crypto.strong_rand_bytes(32)
+
+    {:ok, state, _actions} =
+      Connection.new(Secret.wrap(server_private), mesh_key: Secret.wrap(mesh_key))
+
+    log =
+      capture_log(fn ->
+        {:ok, holder} = StateHolder.start(state)
+        reference = Process.monitor(holder)
+        GenServer.cast(holder, :crash)
+        assert_receive {:DOWN, ^reference, :process, ^holder, :deliberate_crash}, 1_000
+      end)
+
+    assert log =~ "deliberate_crash"
+    refute log =~ Base.encode16(server_private)
+    refute log =~ inspect(server_private, limit: :infinity, binaries: :as_binaries)
+    refute log =~ Base.encode16(mesh_key)
+    refute log =~ inspect(mesh_key, limit: :infinity, binaries: :as_binaries)
   end
 end

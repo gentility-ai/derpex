@@ -1,6 +1,7 @@
 defmodule Derpex.Certificates.Manual do
   @moduledoc "Loads manual certificates and creates persistent self-signed IP certificates."
 
+  alias Derpex.AtomicFile
   alias Derpex.Clock
 
   @common_name_oid {2, 5, 4, 3}
@@ -9,6 +10,8 @@ defmodule Derpex.Certificates.Manual do
   @rsa_encryption_oid {1, 2, 840, 113_549, 1, 1, 1}
   @sha256_with_rsa_oid {1, 2, 840, 113_549, 1, 1, 11}
   @validity_seconds 365 * 24 * 60 * 60
+  @certificate_mode 0o644
+  @key_mode 0o600
 
   @type t :: %__MODULE__{
           hostname: binary(),
@@ -88,6 +91,43 @@ defmodule Derpex.Certificates.Manual do
     error -> {:error, {:certificate_generation, error}}
   end
 
+  @doc """
+  Generates a self-signed certificate for an IP address or a DNS name.
+
+  A relay that obtains its certificate from a certificate authority still has
+  to bind its listen socket before the first order can finish, so this supplies
+  something for it to bind that names the right identifier.
+  """
+  @spec generate_self_signed(binary()) :: {:ok, {binary(), tuple()}} | {:error, term()}
+  def generate_self_signed(hostname) when is_binary(hostname) do
+    case parse_ip(hostname) do
+      {:ok, _address} -> generate_ip(hostname)
+      :error -> generate_dns(hostname)
+    end
+  end
+
+  defp generate_dns(""), do: {:error, {:invalid_hostname, ""}}
+
+  defp generate_dns(hostname) do
+    private_key = :public_key.generate_key({:rsa, 2_048, 65_537})
+    public_key = {:RSAPublicKey, elem(private_key, 2), elem(private_key, 3)}
+    name = distinguished_name(hostname)
+
+    tbs_certificate =
+      {:OTPTBSCertificate, :v3, serial(), signature_algorithm(), name, validity(), name,
+       subject_public_key_info(public_key), :asn1_NOVALUE, :asn1_NOVALUE,
+       [
+         {:Extension, @basic_constraints_oid, false, {:BasicConstraints, false, :asn1_NOVALUE}},
+         {:Extension, @subject_alt_name_oid, false, [dNSName: String.to_charlist(hostname)]}
+       ]}
+
+    {:ok, {:public_key.pkix_sign(tbs_certificate, private_key), private_key}}
+  rescue
+    error -> {:error, {:certificate_generation, error}}
+  end
+
+  defp serial, do: :crypto.strong_rand_bytes(16) |> :binary.decode_unsigned()
+
   @doc "Verifies that a DER certificate is valid for a DNS name or IP SAN."
   @spec verify_certificate(binary(), binary()) :: :ok | {:error, term()}
   def verify_certificate(certificate_der, hostname),
@@ -114,11 +154,8 @@ defmodule Derpex.Certificates.Manual do
          certificate_pem =
            :public_key.pem_encode([{:Certificate, certificate_der, :not_encrypted}]),
          key_pem = encode_private_key(private_key),
-         :ok <- File.mkdir_p(Path.dirname(certificate_path)),
-         :ok <- File.write(certificate_path, certificate_pem),
-         :ok <- File.chmod(certificate_path, 0o644),
-         :ok <- File.write(key_path, key_pem) do
-      File.chmod(key_path, 0o600)
+         :ok <- AtomicFile.write(certificate_path, certificate_pem, mode: @certificate_mode) do
+      AtomicFile.write(key_path, key_pem, mode: @key_mode)
     end
   rescue
     error -> {:error, {:certificate_generation, error}}

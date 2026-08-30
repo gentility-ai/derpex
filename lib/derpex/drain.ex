@@ -11,7 +11,9 @@ defmodule Derpex.Drain do
   use GenServer
 
   alias Derpex.Clock
-  alias Derpex.Outbox.Ring
+  require Derpex.Outbox
+
+  alias Derpex.Outbox
 
   @default_reconnect_ms 1_000
   @default_try_for_ms 10_000
@@ -29,13 +31,14 @@ defmodule Derpex.Drain do
   end
 
   @doc "Registers an ordinary authenticated connection. Mesh peers are exempt."
-  @spec register(GenServer.server() | nil, pid(), Ring.t(), boolean()) :: :ok
+  @spec register(GenServer.server() | nil, pid(), Outbox.t(), boolean()) :: :ok
   def register(server \\ __MODULE__, connection, lifecycle, mesh_peer? \\ false)
 
   def register(nil, _connection, _lifecycle, _mesh_peer?), do: :ok
   def register(_server, _connection, _lifecycle, true), do: :ok
 
-  def register(server, connection, %Ring{} = lifecycle, false) when is_pid(connection) do
+  def register(server, connection, lifecycle, false)
+      when is_pid(connection) and Outbox.is_outbox(lifecycle) do
     GenServer.call(server, {:register, connection, lifecycle})
   end
 
@@ -245,7 +248,11 @@ defmodule Derpex.Drain do
       reconnect_ms =
         min(config.reconnect_ms + jitter(state.jitter, config.jitter_ms), @maximum_frame_value)
 
-      case Ring.enqueue(lifecycle, {:restarting, reconnect_ms, config.try_for_ms}) do
+      # The coordinator notifies every home connection in one call, so it never
+      # naps on one connection's ring lock while the rest wait.
+      notice = {:restarting, reconnect_ms, config.try_for_ms}
+
+      case Outbox.enqueue(lifecycle, notice, wait: false) do
         {:ok, _result} -> {enqueued + 1, dropped}
         {:dropped, _reason} -> {enqueued, dropped + 1}
       end

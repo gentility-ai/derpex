@@ -18,11 +18,15 @@ defmodule Derpex.Frame.Decoder do
             payload_length: 0,
             fragments: [],
             max_frame_length: @default_max_frame_length,
-            frame_policy: nil
+            frame_policy: nil,
+            charged: []
 
   @type frame :: {Frame.type_code(), binary() | {:discarded, non_neg_integer()}}
+  @type frame_mode :: :buffer | :discard
   @type frame_policy :: (Frame.type_code(), non_neg_integer() ->
-                           :buffer | :discard | {:error, term()})
+                           frame_mode()
+                           | {frame_mode(), frame_policy()}
+                           | {:error, term()})
   @opaque t :: %__MODULE__{
             header: binary(),
             type: nil | Frame.type_code(),
@@ -31,7 +35,8 @@ defmodule Derpex.Frame.Decoder do
             payload_length: non_neg_integer(),
             fragments: [binary()],
             max_frame_length: non_neg_integer(),
-            frame_policy: nil | frame_policy()
+            frame_policy: nil | frame_policy(),
+            charged: [non_neg_integer()]
           }
 
   @doc "Creates an empty decoder with a bounded accepted frame length."
@@ -46,6 +51,36 @@ defmodule Derpex.Frame.Decoder do
     }
   end
 
+  @doc """
+  Returns and clears the declared length of each header accepted so far.
+
+  Go charges its receive limiter once per frame, as soon as it has read that
+  frame's header and before it handles it: `rateLimit(int(fl))` immediately
+  after `readFrameHeader` in the authenticated read loop
+  (`../tailscale/derp/derpserver/derpserver.go`, `sclient.handleFrames`). It is
+  charged at the header rather than at the body because a frame that declares
+  four gigabytes must be rate-limited before it streams, not after.
+
+  The lengths are returned one per frame, not summed, because the limiter clamps
+  each charge to the minimum burst: summing a chunk's headers lets that clamp
+  apply to the chunk instead, so two hundred pipelined thousand-byte frames cost
+  what one maximum frame costs.
+  """
+  @spec take_charge(t()) :: {[non_neg_integer()], t()}
+  def take_charge(%__MODULE__{charged: charged} = decoder),
+    do: {Enum.reverse(charged), %{decoder | charged: []}}
+
+  @doc """
+  Removes one frame of `length` bytes from the tally, for a frame the caller
+  does not charge.
+
+  Go reads the ClientInfo frame before its rate-limited loop starts, so the
+  handshake frame is never charged to the client it authenticates.
+  """
+  @spec discharge(t(), non_neg_integer()) :: t()
+  def discharge(%__MODULE__{} = decoder, length),
+    do: %{decoder | charged: List.delete(decoder.charged, length)}
+
   @doc "Changes the limit applied to subsequent frame headers."
   @spec with_max_frame_length(t(), non_neg_integer()) :: t()
   def with_max_frame_length(%__MODULE__{} = decoder, max_frame_length) do
@@ -53,7 +88,12 @@ defmodule Derpex.Frame.Decoder do
     %{decoder | max_frame_length: max_frame_length}
   end
 
-  @doc "Changes the header policy used for buffering, bounded discard, or rejection."
+  @doc """
+  Changes the header policy used for buffering, bounded discard, or rejection.
+
+  A policy may also return `{mode, next_policy}` to govern only the frame it
+  just admitted and hand every later header in the same chunk to `next_policy`.
+  """
   @spec with_frame_policy(t(), frame_policy()) :: t()
   def with_frame_policy(%__MODULE__{} = decoder, frame_policy)
       when is_function(frame_policy, 2) do
@@ -97,9 +137,15 @@ defmodule Derpex.Frame.Decoder do
 
   defp start_payload(decoder, type, payload_length, chunk, frames) do
     case frame_policy(decoder, type, payload_length) do
-      :buffer -> start_frame(decoder, type, payload_length, :buffer, chunk, frames)
-      :discard -> start_frame(decoder, type, payload_length, :discard, chunk, frames)
-      {:error, reason} -> {:error, reason}
+      mode when mode in [:buffer, :discard] ->
+        start_frame(decoder, type, payload_length, mode, chunk, frames)
+
+      {mode, next_policy} when mode in [:buffer, :discard] and is_function(next_policy, 2) ->
+        decoder = %{decoder | frame_policy: next_policy}
+        start_frame(decoder, type, payload_length, mode, chunk, frames)
+
+      {:error, reason} ->
+        {:error, reason}
     end
   end
 
@@ -111,7 +157,8 @@ defmodule Derpex.Frame.Decoder do
   defp start_frame(decoder, type, payload_length, mode, chunk, frames) do
     decoder = %{
       decoder
-      | type: type,
+      | charged: [payload_length | decoder.charged],
+        type: type,
         mode: mode,
         remaining: payload_length,
         payload_length: payload_length,

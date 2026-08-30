@@ -1,0 +1,621 @@
+# This module implements the certificate issuance flow of cmd/derper's
+# ipcert.go obtainCert, over golang.org/x/crypto/acme as vendored at
+# ../tailscale/tempfork/acme.
+# Copyright (c) 2026 Tailscale Inc & contributors.
+# SPDX-License-Identifier: BSD-3-Clause
+
+defmodule Derpex.ACME.Client do
+  @moduledoc """
+  Orders certificates from an RFC 8555 certificate authority.
+
+  The process owns only the session — directory, account key, account URL and
+  the replay-nonce pool. An order itself runs in the caller, which is the
+  certificate manager's flight process, so a certificate authority that takes
+  minutes never occupies this one and two addresses can be ordered at once.
+
+  ## Challenges
+
+  `:challenge` names a `{module, server}` that exports `put_challenge/3` and
+  `delete_challenge/2`; `Derpex.Certificates.IPManager` does. The response is
+  published before the challenge is accepted and removed afterwards, whether
+  the order succeeded or not, so a token is never left answering.
+
+  ## Nonces
+
+  Every authenticated request spends a replay nonce and every response carries
+  the next one, so nonces are pooled here rather than fetched per request. A
+  `badNonce` problem document means the server rejected the one we sent, and
+  RFC 8555 section 6.5 requires the client to retry with a fresh one.
+  """
+
+  use GenServer
+
+  alias Derpex.ACME.Account
+  alias Derpex.ACME.Challenge
+  alias Derpex.ACME.CSR
+  alias Derpex.ACME.Directory
+  alias Derpex.ACME.HTTP
+  alias Derpex.ACME.JWS
+  alias Derpex.ACME.Order
+  alias Derpex.Certificates
+  alias Derpex.Clock
+  alias Derpex.Secret
+
+  @bad_nonce_suffix "badnonce"
+  @nonce_attempts 3
+  @nonce_backoff_ms 200
+  @default_retry_ms 1_000
+  @minimum_retry_ms 250
+  @order_deadline_ms 180_000
+  @minimum_request_ms 1_000
+
+  @type subject :: {:ip, binary()} | {:dns, binary()}
+  @type certificate :: %{certificate_der: binary(), chain: [binary()], private_key: tuple()}
+
+  def start_link(options) do
+    GenServer.start_link(__MODULE__, options, Keyword.take(options, [:name]))
+  end
+
+  @doc "Returns an issuer function for `Derpex.Certificates.IPManager`."
+  @spec issuer(GenServer.server()) ::
+          (binary(), binary() -> {:ok, certificate()} | {:error, term()})
+  def issuer(client) do
+    fn subject, profile -> issue(client, identify(subject), profile) end
+  end
+
+  @doc """
+  Classifies a certificate manager's subject as an ACME identifier.
+
+  RFC 8555 identifier types are `dns` and `ip`, and which one an order carries
+  decides how the authority validates it, so it is read from the subject rather
+  than configured.
+  """
+  @spec identify(binary()) :: subject()
+  def identify(subject) do
+    case :inet.parse_address(String.to_charlist(subject)) do
+      {:ok, _address} -> {:ip, subject}
+      {:error, _reason} -> {:dns, subject}
+    end
+  end
+
+  @doc "Orders one certificate, fulfilling every authorization it requires."
+  @spec issue(GenServer.server(), subject(), binary() | nil, keyword()) ::
+          {:ok, certificate()} | {:error, term()}
+  def issue(client, identifier, profile \\ nil, options \\ []) do
+    # Monotonic, not wall clock: an order must not be cut short or extended by
+    # the clock stepping while it runs, and NTP corrections are ordinary.
+    deadline =
+      Clock.monotonic_time(:millisecond) + Keyword.get(options, :deadline_ms, @order_deadline_ms)
+
+    with {:ok, session} <- GenServer.call(client, :session, :infinity),
+         :ok <- supported_profile(session, profile),
+         {:ok, order} <- create_order(client, session, identifier, profile, deadline),
+         :ok <- authorize(client, session, order, deadline),
+         {:ok, order} <- await_ready(client, session, order, deadline),
+         {:ok, {csr, private_key}} <- CSR.generate(identifier),
+         {:ok, order} <- finalize(client, session, order, csr, deadline),
+         {:ok, chain} <- download(client, session, order, deadline),
+         :ok <- verify_key(chain, private_key) do
+      {:ok, %{certificate_der: hd(chain), chain: chain, private_key: private_key}}
+    end
+  end
+
+  @impl true
+  def init(options) do
+    {:ok,
+     %{
+       directory_url: Keyword.fetch!(options, :directory_url),
+       certificate_directory: Keyword.fetch!(options, :directory),
+       email: Keyword.get(options, :email),
+       external_account: wrap_external_account(Keyword.get(options, :external_account)),
+       challenge: Keyword.fetch!(options, :challenge),
+       http_options: Keyword.get(options, :http_options, []),
+       session: nil,
+       nonces: []
+     }}
+  end
+
+  # This process holds the ACME account key and, for GCP, the external account
+  # HMAC key. Both are long-lived credentials for the relay's identity at a
+  # certificate authority, so neither reaches `:sys.get_state/1` or a crash
+  # report.
+  @impl true
+  def format_status(status) do
+    Map.update(status, :state, nil, &redact/1)
+  end
+
+  defp redact(%{session: session} = state) do
+    %{state | session: redact_session(session)}
+    |> Map.replace(:external_account, redact_external_account(state.external_account))
+    |> Map.replace(:nonces, length(state.nonces))
+  end
+
+  defp redact(state), do: state
+
+  defp redact_session(nil), do: nil
+  defp redact_session(session), do: Map.put(session, :account_key, :redacted)
+
+  defp redact_external_account(nil), do: nil
+  defp redact_external_account(external_account), do: Map.put(external_account, :key, :redacted)
+
+  defp wrap_account_key(key), do: Secret.wrap(:public_key.der_encode(:ECPrivateKey, key))
+
+  defp reveal_account_key(key) do
+    key |> Secret.reveal() |> then(&:public_key.der_decode(:ECPrivateKey, &1))
+  end
+
+  defp wrap_external_account(nil), do: nil
+
+  defp wrap_external_account(%{kid: kid, key: key}),
+    do: %{kid: kid, key: Secret.wrap(key)}
+
+  defp reveal_external_account(nil), do: nil
+
+  defp reveal_external_account(%{kid: kid, key: key}),
+    do: %{kid: kid, key: Secret.reveal(key)}
+
+  @impl true
+  def handle_call(:session, _from, state) do
+    case establish(state) do
+      {:ok, state} -> {:reply, {:ok, public_session(state)}, state}
+      {:error, reason, state} -> {:reply, {:error, reason}, state}
+    end
+  end
+
+  def handle_call(:clear_nonces, _from, state), do: {:reply, :ok, %{state | nonces: []}}
+
+  def handle_call(:take_nonce, _from, %{nonces: [nonce | rest]} = state) do
+    {:reply, {:ok, nonce}, %{state | nonces: rest}}
+  end
+
+  def handle_call(:take_nonce, _from, state) do
+    case establish(state) do
+      {:ok, state} -> fetch_nonce(state)
+      {:error, reason, state} -> {:reply, {:error, reason}, state}
+    end
+  end
+
+  @impl true
+  def handle_cast({:put_nonce, nonce}, state) do
+    {:noreply, %{state | nonces: Enum.take([nonce | state.nonces], 8)}}
+  end
+
+  # The account key lives wrapped in this long-lived process and is decoded per
+  # order, into the flight that signs with it. What `:sys.get_state/1`, the
+  # observer, and a crash report in this process can reach is the wrapper.
+  defp public_session(state) do
+    %{
+      directory: state.session.directory,
+      account_key: reveal_account_key(state.session.account_key),
+      kid: state.session.kid,
+      challenge: state.challenge,
+      http_options: state.http_options
+    }
+  end
+
+  # The directory fetch and the account registration happen once, inside this
+  # process, so concurrent orders cannot register the same key twice.
+  defp establish(%{session: session} = state) when not is_nil(session), do: {:ok, state}
+
+  defp establish(state) do
+    with {:ok, origin} <- HTTP.origin(state.directory_url),
+         state = %{state | http_options: Keyword.put(state.http_options, :origin, origin)},
+         {:ok, directory} <- Directory.fetch(state.directory_url, state.http_options),
+         {:ok, account_key} <- Account.load_or_create_key(state.certificate_directory),
+         state = %{
+           state
+           | session: %{
+               directory: directory,
+               account_key: wrap_account_key(account_key),
+               kid: nil
+             }
+         },
+         {:ok, kid, state} <- register(state) do
+      {:ok, put_in(state.session.kid, kid)}
+    else
+      {:error, reason} -> {:error, reason, %{state | session: nil}}
+      {:error, reason, state} -> {:error, reason, %{state | session: nil}}
+    end
+  end
+
+  defp register(state) do
+    url = state.session.directory.new_account
+
+    account_key = reveal_account_key(state.session.account_key)
+
+    payload =
+      Account.payload(
+        [email: state.email, external_account: reveal_external_account(state.external_account)],
+        account_key,
+        url
+      )
+
+    case request(state, url, payload, nil) do
+      {:ok, response, state} ->
+        case Account.identifier(response) do
+          {:ok, kid} -> {:ok, kid, state}
+          {:error, reason} -> {:error, reason, state}
+        end
+
+      {:error, reason, state} ->
+        {:error, reason, state}
+    end
+  end
+
+  # Registration runs before the client can serve `:take_nonce`, so it spends
+  # nonces from this process's own pool rather than calling back into itself.
+  defp request(state, url, payload, kid, attempt \\ 1) do
+    case local_nonce(state) do
+      {:ok, nonce, state} -> send_request(state, url, payload, kid, attempt, nonce)
+      {:error, reason, state} -> {:error, reason, state}
+    end
+  end
+
+  defp send_request(state, url, payload, kid, attempt, nonce) do
+    account_key = reveal_account_key(state.session.account_key)
+    body = JWS.encode(payload, account_key, kid: kid, nonce: nonce, url: url)
+
+    case HTTP.post(url, body, state.http_options) do
+      {:ok, response} ->
+        state = store_local_nonce(state, response)
+        requested(state, url, payload, kid, attempt, response)
+
+      {:error, reason} ->
+        {:error, reason, state}
+    end
+  end
+
+  defp requested(state, url, payload, kid, attempt, response) do
+    cond do
+      response.status < 400 ->
+        {:ok, response, state}
+
+      bad_nonce?(response) and attempt < @nonce_attempts ->
+        request(%{state | nonces: []}, url, payload, kid, attempt + 1)
+
+      true ->
+        {:error, error(response), state}
+    end
+  end
+
+  defp local_nonce(%{nonces: [nonce | rest]} = state), do: {:ok, nonce, %{state | nonces: rest}}
+
+  defp local_nonce(state) do
+    case HTTP.get(state.session.directory.new_nonce, state.http_options) do
+      {:ok, response} ->
+        case HTTP.header(response, "replay-nonce") do
+          nonce when is_binary(nonce) and nonce != "" -> {:ok, nonce, state}
+          _absent -> {:error, :no_replay_nonce, state}
+        end
+
+      {:error, reason} ->
+        {:error, reason, state}
+    end
+  end
+
+  defp store_local_nonce(state, response) do
+    case HTTP.header(response, "replay-nonce") do
+      nonce when is_binary(nonce) and nonce != "" ->
+        %{state | nonces: Enum.take([nonce | state.nonces], 8)}
+
+      _absent ->
+        state
+    end
+  end
+
+  defp fetch_nonce(state) do
+    case HTTP.get(state.session.directory.new_nonce, state.http_options) do
+      {:ok, response} ->
+        case HTTP.header(response, "replay-nonce") do
+          nonce when is_binary(nonce) and nonce != "" -> {:reply, {:ok, nonce}, state}
+          _absent -> {:reply, {:error, :no_replay_nonce}, state}
+        end
+
+      {:error, reason} ->
+        {:reply, {:error, reason}, state}
+    end
+  end
+
+  defp supported_profile(session, profile) do
+    if Directory.supports_profile?(session.directory, profile) do
+      :ok
+    else
+      {:error, {:unsupported_profile, profile}}
+    end
+  end
+
+  defp create_order(client, session, identifier, profile, deadline) do
+    with {:ok, response} <-
+           post(
+             client,
+             session,
+             session.directory.new_order,
+             Order.payload(identifier, profile),
+             deadline
+           ) do
+      Order.parse(response)
+    end
+  end
+
+  defp authorize(client, session, order, deadline) do
+    Enum.reduce_while(order.authorizations, :ok, fn url, :ok ->
+      case fulfill(client, session, url, deadline) do
+        :ok -> {:cont, :ok}
+        {:error, reason} -> {:halt, {:error, reason}}
+      end
+    end)
+  end
+
+  defp fulfill(client, session, url, deadline) do
+    with {:ok, response} <- post(client, session, url, :post_as_get, deadline),
+         {:ok, _status, challenge} <- Challenge.select(response) do
+      accept(client, session, url, challenge, deadline)
+    end
+  end
+
+  defp accept(_client, _session, _url, nil, _deadline), do: :ok
+
+  defp accept(client, session, authorization_url, challenge, deadline) do
+    path = Challenge.path(challenge.token)
+    response = Challenge.key_authorization(challenge.token, session.account_key)
+    {module, server} = session.challenge
+    :ok = module.put_challenge(server, path, response)
+
+    try do
+      with {:ok, _accepted} <- post(client, session, challenge.url, %{}, deadline) do
+        await_authorization(client, session, authorization_url, deadline)
+      end
+    after
+      _removed = module.delete_challenge(server, path)
+    end
+  end
+
+  defp await_authorization(client, session, url, deadline) do
+    poll(client, session, url, deadline, fn response ->
+      case Challenge.status(response) do
+        {:ok, "valid"} -> {:done, :ok}
+        {:ok, "invalid"} -> {:done, {:error, {:authorization_invalid, url}}}
+        {:ok, _pending} -> :again
+        {:error, reason} -> {:done, {:error, reason}}
+      end
+    end)
+  end
+
+  defp await_ready(_client, _session, %{url: nil} = order, _deadline), do: {:ok, order}
+
+  defp await_ready(client, session, order, deadline) do
+    poll(client, session, order.url, deadline, fn response ->
+      case Order.parse(response) do
+        {:ok, parsed} -> ready(parsed, order)
+        {:error, reason} -> {:done, {:error, reason}}
+      end
+    end)
+  end
+
+  defp ready(parsed, order) do
+    parsed = %{parsed | url: parsed.url || order.url}
+
+    case Order.settled(parsed) do
+      :pending -> :again
+      {:error, reason} -> {:done, {:error, reason}}
+      _ready_or_issued -> {:done, {:ok, parsed}}
+    end
+  end
+
+  defp finalize(client, session, order, csr, deadline) do
+    with {:ok, response} <-
+           post(client, session, order.finalize, Order.finalize_payload(csr), deadline),
+         {:ok, finalized} <- Order.parse(response) do
+      finalized = %{finalized | url: finalized.url || order.url}
+
+      case Order.settled(finalized) do
+        :issued -> {:ok, finalized}
+        {:error, reason} -> {:error, reason}
+        _not_yet -> await_issued(client, session, finalized, deadline)
+      end
+    end
+  end
+
+  defp await_issued(client, session, order, deadline) do
+    poll(client, session, order.url, deadline, fn response ->
+      case Order.parse(response) do
+        {:ok, parsed} -> issued(parsed, order)
+        {:error, reason} -> {:done, {:error, reason}}
+      end
+    end)
+  end
+
+  defp issued(parsed, order) do
+    parsed = %{parsed | url: parsed.url || order.url}
+
+    case Order.settled(parsed) do
+      :issued -> {:done, {:ok, parsed}}
+      {:error, reason} -> {:done, {:error, reason}}
+      _not_yet -> :again
+    end
+  end
+
+  defp download(client, session, %{certificate: url}, deadline) when is_binary(url) do
+    with {:ok, response} <- post(client, session, url, :post_as_get, deadline) do
+      case certificates(response.body) do
+        [] -> {:error, :empty_certificate_chain}
+        chain -> {:ok, chain}
+      end
+    end
+  end
+
+  defp download(_client, _session, _order, _deadline), do: {:error, :order_without_certificate}
+
+  # autocert's `validCert`: a chain whose leaf does not carry the public key of
+  # the key we generated is not ours to serve, however well formed it is.
+  defp verify_key([leaf | _intermediates], private_key) do
+    if Certificates.private_key_matches?(leaf, private_key) do
+      :ok
+    else
+      {:error, :issued_certificate_key_mismatch}
+    end
+  end
+
+  defp certificates(pem) do
+    pem
+    |> :public_key.pem_decode()
+    |> Enum.flat_map(fn
+      {:Certificate, der, :not_encrypted} -> [der]
+      _other -> []
+    end)
+  rescue
+    _error -> []
+  end
+
+  # An order is bounded by a deadline, not by a fixed number of attempts: a
+  # certificate authority that asks for a minute between polls is entitled to,
+  # and thirty quarter-second attempts would give up in under eight seconds.
+  # `Retry-After` decides the pause, clamped so neither a zero nor an hour is
+  # taken literally, and the deadline that bounds the whole order is read from
+  # `Derpex.Clock` and is therefore steerable. The pause itself is a delay
+  # inside one order's own process, not a protocol timer.
+  defp poll(client, session, url, deadline, decide) do
+    with {:ok, response} <- post(client, session, url, :post_as_get, deadline) do
+      case decide.(response) do
+        {:done, result} -> result
+        :again -> poll_again(client, session, url, deadline, decide, response)
+      end
+    end
+  end
+
+  defp poll_again(client, session, url, deadline, decide, response) do
+    case remaining(deadline) do
+      0 ->
+        {:error, {:order_deadline, url}}
+
+      remaining ->
+        Process.sleep(min(retry_after(response), remaining))
+        poll(client, session, url, deadline, decide)
+    end
+  end
+
+  defp remaining(deadline), do: max(deadline - Clock.monotonic_time(:millisecond), 0)
+
+  # RFC 7231 allows either delta-seconds or an HTTP-date, and upstream waits a
+  # second when the header is absent. An explicit value is honoured down to a
+  # quarter second, below which polling would spin. The only ceiling is the
+  # order's own deadline, applied by the caller: an authority asking for a
+  # minute is entitled to it, and polling sooner would just be refused.
+  defp retry_after(response) do
+    case HTTP.header(response, "retry-after") do
+      value when is_binary(value) -> parse_retry_after(String.trim(value))
+      nil -> @default_retry_ms
+    end
+  end
+
+  defp parse_retry_after(value) do
+    case Integer.parse(value) do
+      {seconds, ""} when seconds >= 0 -> max(seconds * 1_000, @minimum_retry_ms)
+      _not_delta_seconds -> retry_after_date(value)
+    end
+  end
+
+  # RFC 7231 IMF-fixdate: `Sun, 06 Nov 1994 08:49:37 GMT`. The obsolete formats
+  # are not accepted; an authority sending one gets the default wait.
+  defp retry_after_date(
+         <<_day::binary-size(3), ", ", date::binary-size(2), " ", month::binary-size(3), " ",
+           year::binary-size(4), " ", time::binary-size(8), " GMT">>
+       ) do
+    with {:ok, month} <- month_number(month),
+         {:ok, at, 0} <- DateTime.from_iso8601("#{year}-#{month}-#{date}T#{time}Z") do
+      at
+      |> DateTime.to_unix(:millisecond)
+      |> Kernel.-(Clock.system_time(:millisecond))
+      |> max(@minimum_retry_ms)
+    else
+      _unparsable -> @default_retry_ms
+    end
+  end
+
+  defp retry_after_date(_other), do: @default_retry_ms
+
+  defp month_number(month) do
+    case Enum.find_index(~w(Jan Feb Mar Apr May Jun Jul Aug Sep Oct Nov Dec), &(&1 == month)) do
+      nil -> :error
+      index -> {:ok, (index + 1) |> Integer.to_string() |> String.pad_leading(2, "0")}
+    end
+  end
+
+  # A nonce that cannot be fetched is an error, never a request sent without
+  # one: RFC 8555 rejects an unauthenticated replay, and a JWS with no nonce
+  # would be indistinguishable from one at the far end.
+  defp post(client, session, url, payload, deadline, attempt \\ 1) do
+    with {:ok, options} <- request_options(session, url, deadline),
+         {:ok, nonce} <- GenServer.call(client, :take_nonce, :infinity) do
+      body =
+        JWS.encode(payload, session.account_key, kid: session.kid, nonce: nonce, url: url)
+
+      case HTTP.post(url, body, options) do
+        {:ok, response} ->
+          store_nonce(client, response)
+          posted(client, session, url, payload, deadline, attempt, response)
+
+        {:error, reason} ->
+          {:error, reason}
+      end
+    end
+  end
+
+  # Every request is capped by what is left of the order, and one that could
+  # not finish inside the deadline is not started: a request begun with less
+  # than a second left can only end in a timeout the order has no time to
+  # recover from.
+  defp request_options(session, url, deadline) do
+    case remaining(deadline) do
+      left when left < @minimum_request_ms ->
+        {:error, {:order_deadline, url}}
+
+      left ->
+        {:ok, Keyword.put(session.http_options, :timeout_ms, left)}
+    end
+  end
+
+  # RFC 8555 section 6.5: a rejected nonce is retried with a fresh one. Every
+  # nonce held is suspect once the server rejects one, so the pool is emptied
+  # rather than spent one rejection at a time, and the retries back off.
+  defp posted(client, session, url, payload, deadline, attempt, response) do
+    cond do
+      response.status < 400 ->
+        {:ok, response}
+
+      bad_nonce?(response) and attempt < @nonce_attempts ->
+        GenServer.call(client, :clear_nonces, :infinity)
+        Process.sleep(min(@nonce_backoff_ms * attempt, remaining(deadline)))
+        post(client, session, url, payload, deadline, attempt + 1)
+
+      true ->
+        {:error, error(response)}
+    end
+  end
+
+  defp store_nonce(client, response) do
+    case HTTP.header(response, "replay-nonce") do
+      nonce when is_binary(nonce) and nonce != "" -> GenServer.cast(client, {:put_nonce, nonce})
+      _absent -> :ok
+    end
+  end
+
+  # Authorities differ on the case of the URN, so it is matched case
+  # insensitively on its suffix rather than compared byte for byte.
+  defp bad_nonce?(response) do
+    case HTTP.problem(response) do
+      %{type: type} -> type |> String.downcase(:ascii) |> String.ends_with?(@bad_nonce_suffix)
+      nil -> false
+    end
+  end
+
+  # A certificate authority that answers with something other than a problem
+  # document still has to be diagnosable, so a bounded slice of the body is
+  # carried with the status rather than discarded.
+  defp error(response) do
+    case HTTP.problem(response) do
+      nil -> {:acme_status, response.status, String.slice(response.body, 0, 256)}
+      problem -> {:acme_error, response.status, problem.type, problem.detail}
+    end
+  end
+end

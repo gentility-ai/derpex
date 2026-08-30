@@ -1,6 +1,8 @@
 # DERPEX implementation plan
 
-Status: approved integrated direction, implementation started 2026-08-28
+Status: implementation complete for the pinned baseline; final ship-gate
+review passed with zero blockers (fast-follows tracked as repository issues
+1-5), `mix release.check` 607/607 green, 2026-08-30
 
 DERPEX is an Elixir implementation of Tailscale's DERP server. The target is
 observable compatibility with the pinned Go implementation, including the
@@ -82,6 +84,45 @@ The separate Linux XDP package is not part of the current `cmd/derper` request
 path; its tests are recorded as implementation-specific unless later evidence
 shows an observable server requirement.
 
+ACME (RFC 8555) is **implemented**, not excepted. `DERPEX_CERT_MODE=letsencrypt`
+and `DERPEX_CERT_MODE=gcp` obtain certificates through `Derpex.ACME`: ES256 JWS,
+an optional external account binding for GCP, `newOrder` with one DNS or IP
+identifier and the RFC 8555 profiles extension, HTTP-01 answered on the
+plaintext port, a single-SAN certificate request, finalize and chain download.
+No published Hex ACME library carries IP identifiers or the profiles extension,
+and adopting one would have widened the release's twelve-application runtime
+closure, so the client is written against OTP alone; ADR 0004 records the
+survey and the decision.
+
+Two consequences are worth stating rather than discovering:
+
+- An ACME mode requires `DERPEX_HTTP_PORT`. A certificate authority validates
+  HTTP-01 by connecting to port 80 at the identifier being validated, so the
+  configuration is refused at boot without a plaintext listener rather than
+  failing on the first order.
+- A listen socket binds one certificate and cannot be told about a renewal, so
+  the certificate manager publishes each issuance into the same
+  `:persistent_term` snapshot a rotated file-backed certificate uses, and
+  `Derpex.Listener.Transports.SSL` reads it per connection. A renewed
+  certificate therefore reaches hellos with and without SNI alike.
+
+One inventory row is a structural seam rather than a behavior.
+`TestIPCertManagerNextProvider` covers upstream's delegation of a DNS hello
+from the IP certificate manager to a separate autocert manager. DERPEX has no
+second provider to delegate to — one manager orders both IP and hostname
+certificates — so `:next_provider` is a seam with no production caller. The row
+is `implementation-specific` on that argument, citing the delegation test in
+`test/derpex/certificates/ip_manager_test.exs`; it is not a claim that DERPEX
+ships the two-provider arrangement upstream tests.
+
+The plaintext listener `DERPEX_HTTP_PORT` opens is restricted to what Go's
+`tsweb.Port80Handler` serves: the challenge path and the unauthenticated
+probes, with everything else redirected to HTTPS and no DERP upgrade in
+cleartext unless `DERPEX_CLEAR_HTTP=1`.
+
+`DERPEX_IP_CERT_ISSUER=self` remains as a local alternative: persistent
+self-signed per-IP certificates that contact no certificate authority.
+
 The following are recorded as explicit, user-approved compatibility exceptions
 so they are not implemented by accident:
 
@@ -97,6 +138,85 @@ so they are not implemented by accident:
   clear error. No setec client is implemented.
 - `/debug/set-mutex-profile-fraction` is Go-runtime-specific and is
   `implementation-specific` in the inventory.
+- The pinned Go `recvClientKey` accepts an unauthenticated `ClientInfo` frame
+  of up to 256 KiB. DERPEX caps it at 16 KiB, because a real `ClientInfo`
+  payload is under 200 bytes and the frame is read before the peer is
+  authenticated. A conforming client is never affected; an oversize frame is
+  closed at its header instead of after its body.
+- Go keeps a client's pending presence changes in `sclient.peerStateChange`, a
+  slice with no cap, so a watcher that stops reading grows the relay's memory
+  without limit. DERPEX keeps the same unbounded queue but adds a soft cap of
+  65,536 frames, beyond which that watcher's connection is closed with a logged
+  reason and a counted `derp_lifecycle_queue_overflows`. A watcher that far
+  behind would be served a view of the past even if it caught up; a mesh peer
+  reconnects and takes a fresh snapshot. See ADR 0003.
+- Go's `sawSrc` set records, per connection, which sources it has relayed a
+  packet from, so a `peerGone` is owed only once. It never forgets a source,
+  which it can afford because the set dies with the connection. DERPEX forgets
+  a source when it writes that source's `peer_gone` frame, so a peer that
+  leaves and comes back is owed a second `peer_gone`. A conforming client is
+  never affected: it receives a frame Go would have withheld, describing a
+  disconnect that really happened.
+- Section 3.3 requires that every timeout, keepalive and limiter read time
+  through `Derpex.Clock`. Two places read the real clock directly: the outbox
+  lock's acquisition deadline (`Derpex.Outbox.Lock`) and the writer's
+  last-resort retry timer (`Derpex.Writer`). Both are internal contention
+  backoffs rather than protocol timing, and both must keep running under a
+  test that swaps in `Derpex.Clock.Manual` globally - a frozen clock would turn
+  the lock's bounded spin into an unbounded one and would leave a contended
+  writer waiting for a timer that never fires. The protocol deadlines those
+  tests exist to control - handshake, keepalive, drain, rate limiting - all
+  still go through `Derpex.Clock`.
+- Section 3.3 requires that a sender is never suspended by a destination's
+  queue. DERPEX suspends one for up to about four milliseconds when that
+  destination's outbox ring lock is held for that long, because Go's channel
+  send never loses a packet the queue has room for and DERPEX's ETS lock,
+  unlike a channel, can be held across a scheduler preemption. The budget is
+  wall-clock bounded, the naps inside it are counted as
+  `derp_ring_producer_naps`, exceeding it is a counted tail drop, and callers
+  that must not sleep for one destination — the router and the drain
+  coordinator — enqueue with `wait: false`. See ADR 0001. One measurable
+  consequence: upstream's DERP prober sends with an in-flight window of 30,
+  deliberately below the 32-packet queue depth, so against Go a lossless
+  100 MB transfer is guaranteed; against DERPEX a scheduler stall longer than
+  the lock budget can tail-drop below capacity (reproduced by fault injection
+  2026-08-30), so the interop prober smoke test verifies sequence-stamped
+  delivery with a bounded loss budget instead of losslessness
+  (`interop/go/prober_smoke.go`). Removing the below-capacity drop would need
+  a slot-reservation enqueue design; recorded as post-ship follow-up work.
+- Pinned `cmd/derper` sets `MinVersion: tls.VersionTLS12` on its TLS listener
+  (`derper.go:364`). DERPEX serves and dials TLS 1.3 only
+  (`config/runtime.exs`, `lib/derpex/mesh/client.ex`), which is a deliberate
+  hardening rather than parity: a conforming TLS-1.2-only client is refused
+  rather than served. `DERPEX_TLS_MIN_VERSION` accepts `1.2` or `1.3` and
+  defaults to `1.3`, so an operator who needs upstream's floor can restore it;
+  the setting applies to the listener and to the mesh client's outbound dial
+  alike, so a mesh connection cannot be weaker than the listener that
+  configured it.
+- Go's `tsweb.AllowDebugAccess` grants the debug endpoints to any address in
+  the Tailscale CGNAT range `100.64.0.0/10`, on the reasoning that reaching a
+  relay from a Tailscale address already means membership. DERPEX denies that
+  range by default and admits it only under
+  `DERPEX_DEBUG_ALLOW_TAILSCALE_CGNAT=1`, because a relay on a public `:443`
+  may sit behind carrier-grade NAT and see genuine CGNAT source addresses that
+  are not tailnet members. Loopback and the `fd7a:115c:a1e0::/48` ULA range
+  are trusted as Go trusts them.
+- Go's `handleBootstrapDNS` retains the raw `q` parameter of each query and
+  bounds only the entry count, clearing the map past 500 names, so 500
+  attacker-chosen names can retain megabytes. DERPEX keeps the same entry bound
+  and additionally truncates each retained name at 256 bytes, which bounds the
+  set at 500 × 256 bytes. A DNS name cannot exceed 253 bytes, so no real query
+  is truncated, and lookups still use the untruncated query.
+- Go accepts connections as fast as the listener yields them and rate-limits
+  nothing before the DERP handshake. DERPEX admits through
+  `Derpex.AcceptLimiter`: a global accept bucket, a per-source token bucket and
+  connection cap, and a fixed-size tracking set. The tracking set is a memory
+  bound rather than an admission bound — when every tracked source holds a live
+  connection there is nothing to evict, so a new source is admitted *untracked*
+  and pooled into one shared overflow bucket and connection cap rather than
+  refused. Untracked admissions are counted, so the loss of per-source
+  resolution is visible without the bound becoming either an outage or an
+  unmetered hole.
 
 ### 2.4 Compatibility precedence
 
@@ -278,6 +398,19 @@ fail-open or fail-closed:
 - cache size, durable state, clock skew, key rotation, and outage behavior are
   explicitly bounded and tested.
 
+The lease lifetime is the single number that bounds outage behavior. It is the
+worst-case window in which a revoked node can still connect when both push and
+reconciliation are unavailable, and it is how long the relay serves without
+Gentility. Leases backing live connections are re-authorized in the background
+at 80% of their lifetime, so an outage darkens the relay one lifetime after the
+last successful renewal rather than one lifetime after the outage begins; each
+connection closes a little before its own expiry, jittered, so a region does not
+reconnect in one burst. `nearest_lease_expiry_seconds` is exported for alerting
+because it is the only signal that precedes connection loss. Because every
+budget in a lease is enforced by the instance holding it, Gentility divides each
+intended organization and node limit by the number of instances that may serve
+it.
+
 Global organization limits must not introduce a synchronous control-plane call
 on the packet path. Gentility allocates versioned regional or instance budgets;
 DERPEX enforces those budgets locally and reports consumption in fixed windows.
@@ -400,7 +533,7 @@ the full official Rust client.
 
 ### 5.1 Upstream inventory
 
-The baseline contains 69 named relevant Go tests:
+The baseline contains 74 named relevant Go tests:
 
 | Area | Named tests |
 | --- | ---: |
@@ -409,6 +542,7 @@ The baseline contains 69 named relevant Go tests:
 | DERP HTTP | 11 |
 | `cmd/derper` | 14 |
 | DERP prober | 3 |
+| STUN | 5 |
 | XDP | 2 |
 
 `interop/COVERAGE.md` inventories every test by package, name, upstream line,
@@ -423,6 +557,10 @@ and one of these dispositions:
 - `pending`: temporarily incomplete and therefore release-blocking.
 
 No test may silently disappear, and a release may contain no `pending` rows.
+As of 2026-08-29 there are none: every row carries one of the other four
+dispositions, `test/derpex/upstream_coverage_test.exs` fails if one turns
+`pending` again or if the row count moves, and CI regenerates the file and
+fails on a diff.
 
 ### 5.2 Test layers
 
@@ -467,17 +605,49 @@ mix test                 # unit and property tests
 mix test.interop         # official Go and Rust clients against DERPEX
 mix test.diff            # Go-vs-DERPEX behavioral oracle
 mix test.system          # TLS, WebSocket, STUN, signals, external services
-mix test.gentility       # authorization, revocation, quotas, accounting
 mix test.all             # all release-blocking correctness gates
 mix bench                # non-blocking benchmark suite
-mix quality              # format, compile warnings, static analysis, mix test
+mix quality              # format, compile warnings, static analysis; no tests
 mix artifact.check       # boot and inspect compiler-free release artifacts
-mix release.check        # mix quality + test.all; the release gate
+mix release.check        # mix quality + test.all + artifact.check; the release gate
 ```
 
-Fast pull-request CI runs unit tests and a compact Go interop slice. Full
-differential, system, race-heavy, fuzz, and soak jobs run on main/nightly and
-before release. No nightly-only failure may be waived for a release.
+`mix quality` is the fast pre-commit gate: formatting, warnings-as-errors
+compilation, Credo, `rustfmt`, and Clippy. It deliberately runs no tests, so
+nothing that runs it may claim the suite passed. Tests under `test/system`
+carry `@moduletag :system`, which `test/test_helper.exs` excludes by default,
+so they run under `mix test.system` rather than a plain `mix test`. `mix
+test.all` opts every tagged gate back in (`--include system --include
+go_interop --include rust_interop`) and needs `DERPEX_TAILSCALE_DIR` and
+`DERPEX_TAILSCALE_RS_DIR` pointing at the pinned checkouts. There is no
+separate Gentility alias: the admission, revocation, quota and accounting
+suites live under `test/derpex/admission` and run in a plain `mix test`.
+
+`mix release.check` is the local form of the release gate, so it runs what CI
+runs: `quality`, `test.all`, the Rust crate's own `cargo test --locked`, the
+relay benchmark under the same three `--fail-on` thresholds CI uses, and
+`artifact.check` under `MIX_ENV=prod` in a child Mix invocation, because the
+surrounding gate runs in `MIX_ENV=test`. A threshold that only exists in the
+workflow is one a developer first meets on a pull request.
+
+Pull-request CI is not a subset. Every job — quality, unit and property tests,
+system tests, Rust tests, the benchmark smoke with its thresholds, Go interop
+including the differential oracle and the tsnet stack, and Rust interop — runs
+on every pull request and every non-tag push, because the whole suite fits in
+CI minutes and a gate that runs later is a gate that blocks later. Two
+schedules sit outside it: `.github/workflows/benchmark.yml` runs the long relay
+and slow-client soak weekly, and `.github/workflows/nightly.yml` runs each
+night what is too slow for a pull request — the property suite at
+`PROPERTY_RUNS=5000`, the benchmark at pull-request thresholds but a longer
+run, and `mix test.system`. No nightly or weekly failure may be waived for a
+release.
+
+The release workflow cannot publish around those gates. `release.yml` calls
+`ci.yml` as a reusable workflow in a job named `gate`, and every job that
+builds, packages, or publishes an artifact lists `gate` in its `needs:`, so a
+red quality, unit, Go interop, Rust interop, or runtime-boundary job blocks the
+tag's release outright. `ci.yml` ignores `v*` tag pushes on its own trigger so
+that gate is the tag's only run of the suite.
 
 Go conformance jobs run in an isolated CI job and exchange only semantic test
 results with the Elixir jobs. Go checkouts, caches, binaries, and toolchains are
@@ -535,6 +705,111 @@ consistency(check_output)                            # /debug/check
 The Go oracle helper emits the same schema. Event comparison permits only
 explicitly documented reorderings between independent connections.
 
+`interop/go/differential_trace.go` is the single driver for both servers:
+`oracle` mode starts the pinned Go server behind the same `/debug/varz` handler
+`cmd/derper` publishes, and DERPEX mode drives the DERPEX relay and scrapes its
+token-protected `/metrics`. The driver publishes only the per-server
+`derpserver.Server.ExpVar` set; the `derp_packets_dropped` and
+`derp_bytes_dropped` maps register themselves in the default expvar registry
+during `derpserver` package initialization and need no help from the driver.
+`test/interop/differential_test.exs` decodes both traces, compares them scenario
+by scenario and step by step so a divergence names the step that produced it,
+and then asserts whole-structure equality. Nothing in the trace is a literal
+written by the driver.
+
+The trace is a list of scenarios, each a list of steps. A step records the
+frames its clients observed and the delta of every tracked counter since the
+previous step. Three scenarios run in order:
+
+- `relay_and_drops` — relay of empty, short, and `MaxPacketSize` payloads; a
+  ping/pong exchange; a disco and a plain packet to never-connected keys; a
+  flood that overruns both send queues of a recipient which has stopped
+  reading, then that recipient catching up; and a disconnect observed by a peer.
+- `duplicate_keys` — two connections sharing one public key plus a sender,
+  covering newest-connection delivery, the older connection writing, and
+  last-writer delivery.
+- `watch_presence` — a trusted mesh watcher over the initial presence snapshot,
+  a forwarded packet of each kind for a key this server does not hold, a later
+  arrival, and a departure.
+
+The tracked counter subset, named as Go's varz exposes it, is
+`packets_sent`, `packets_received`, `packets_forwarded_in`, `packets_dropped`
+for all seven reasons crossed with both packet kinds,
+`peer_gone_disconnected_frames`, `peer_gone_not_here_frames`,
+`total_dup_client_conns`, `current_dup_client_keys`, `current_dup_client_conns`,
+`current_connections`, `unknown_frames`, `got_ping`, and `sent_pong`. A tracked
+counter that a server does not publish fails the run rather than reading as
+zero, so a missing counter cannot compare equal to a present one.
+
+Only these normalizations are applied, identically to both traces:
+
+1. Random node keys, addresses, and payload bytes become stable labels, a
+   loopback boolean, and a size plus SHA-256 digest.
+2. Metric names are canonicalized by trimming the `gauge_`/`counter_` type
+   prefixes that Go's varz strips and DERPEX's `/metrics` keeps, and by sorting
+   drop labels, which the two order differently.
+3. Saturation is per counter, not per step. A step names the counters it
+   compares by sign instead of by value, and every other counter in that step
+   is compared exactly. Only two steps name any: the flood signs `packets_sent`
+   and every `packets_dropped` cell, and the catch-up signs the
+   `packets_dropped` cells. How many packets reach the socket before it blocks
+   depends on kernel buffer sizes; the rest does not. In particular the flood
+   still compares `packets_received` exactly (192), and the catch-up compares
+   `packets_sent` exactly (65: a 32-deep ordinary queue, a 32-deep disco queue,
+   and the packet in flight), which pins the send-queue depth.
+4. The initial presence snapshot enumerates connected peers in unspecified
+   order, so that one step's events are sorted. No other reordering is allowed.
+
+Steps synchronize before snapshotting. Each waits for the server's
+`current_connections` gauge to reach the expected value, and each round-trips a
+ping on the connections whose accounting it depends on. A DERP server reads one
+connection's frames in order and drains its pong queue last, so a received pong
+proves both that the frames that client sent have been routed and that the
+frames queued for it have been written and counted. The stalled recipient is the
+one connection that cannot be pinged, which is why its send accounting is signed
+rather than exact.
+
+Each run also checks itself: across the flood and catch-up steps, the packets
+the server accepted must equal the packets it wrote plus the packets it dropped
+for a recorded reason, with nothing left over once the recipient has caught up
+and disconnected. The check uses the raw deltas, not the signed ones, and fails
+the run rather than the comparison, so a server that loses packets is caught
+even when both servers lose them.
+
+Five tracked cells stay zero-delta invariants because no unchanged official
+client can drive them, and the upstream checkout may not be modified to add one:
+
+- `unknown_frames` — the official client has no way to emit an unknown frame
+  type. The invariant still catches a server that miscounts ordinary frames as
+  unknown; driving a real unknown frame belongs to the raw-socket edge suite.
+- `packets_dropped{*,dup_client}` — reached only when a key has two or more
+  connections and none of them is currently the active one, a window the server
+  opens and closes on its own schedule.
+- `packets_dropped{*,gone_disconnected}` — requires a packet to be enqueued for
+  a recipient that is already tearing down, which no client can time.
+- `packets_dropped{*,queue_tail}` — Go tail-drops only after three failed
+  head-drop attempts under racing writers, which a deterministic scenario
+  cannot force.
+- `packets_dropped{*,write_error}` — requires the recipient's socket write to
+  fail, which means killing a connection mid-write and racing the two-second
+  write deadline.
+
+Every other cell is exercised: `unknown_dest` for both kinds by a disco and a
+plain packet to never-connected keys, `unknown_dest_on_fwd` for both kinds by
+the mesh watcher forwarding for a key this server does not hold, and
+`queue_head` for both kinds by the flood, which overruns the ordinary queue
+first and then the disco queue while the writer is stuck on the ordinary one.
+
+`bytes_sent`, `bytes_received`, and `bytes_dropped` are excluded as a
+byte-granularity restatement of the packet counters already compared.
+
+The mesh coverage here is deliberately watch-scoped. It exercises the surface a
+single server presents to a trusted peer — the presence snapshot, live presence
+and departure updates, and an inbound forwarded packet — but not a real mesh of
+two servers: no outbound forwarding, no `packets_forwarded_out`, no forwarder
+registration or replacement, and no `close_peer`. Those paths belong to the mesh
+interoperability suite, which runs DERPEX against a second live Go server.
+
 ## 6. Delivery milestones
 
 Every milestone has a hard exit gate. From Milestone 2 onward each milestone
@@ -552,7 +827,7 @@ Deliverables:
 - Add source-build, no-Rust consumer, and tag-triggered precompiled-NIF workflow
   skeletons using the target matrix in Section 3.7.
 - Commit `interop/upstream.lock` and checkout/bootstrap tooling.
-- Generate the 69-test inventory and initial compatibility dispositions.
+- Generate the 74-test inventory and initial compatibility dispositions.
 - Add a Go oracle/helper module without modifying the upstream checkout, and
   inventory the hooks exported by `derp/derpserver/fortest.go`.
 - Implement `Derpex.Clock` with a real and a controllable test implementation.
@@ -932,7 +1207,7 @@ Exit gate:
 - The release candidate installs and starts on every supported target without
   `go`, `cargo`, or `rustc`, using only the published checksum-verified NIF
   archive.
-- Every one of the 69 baseline tests is accounted for with no pending row.
+- Every one of the 74 baseline tests is accounted for with no pending row.
 - No known observable difference exists without a documented, user-approved
   compatibility exception.
 - Long-running tests show bounded mailboxes, queues, timers, and binary memory.
@@ -1024,7 +1299,7 @@ DERPEX is complete for the pinned baseline when:
 
 - all release-blocking Mix, Go interop, differential, Rust interop, and system
   gates pass;
-- all 69 relevant baseline Go tests have a reviewed disposition and none are
+- all 74 relevant baseline Go tests have a reviewed disposition and none are
   pending;
 - unchanged official Go clients can use native HTTP, TLS fast-start, and mesh
   paths;
@@ -1059,9 +1334,15 @@ These decisions are intentionally deferred until evidence is available:
 - capacity targets beyond the initial reference instances and launch SLOs;
 - additional deployment packaging beyond the multi-architecture OCI image and
   OTP release;
-- ACME provider dependency selection (Milestone 9);
 - whether metrics must be byte-for-byte Prometheus compatible or only preserve
-  all documented names, values, and labels.
+  all documented names, values, and labels;
+- ~~the project-wide license for original DERPEX code~~ — decided 2026-08-30:
+  MIT for original code (`LICENSE`), with adapted files retaining their
+  upstream BSD-3-Clause headers as recorded in `interop/PROVENANCE.md`.
+
+ACME provider dependency selection is no longer deferred: no published Hex
+library carried IP identifiers or the RFC 8555 profiles extension, so
+`Derpex.ACME` is written against OTP alone. ADR 0004 records the survey.
 
 The defaults are macOS/Linux development, Linux production, OTP release plus a
 container artifact, semantically identical Prometheus exposition, and no

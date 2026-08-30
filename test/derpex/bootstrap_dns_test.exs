@@ -22,7 +22,8 @@ defmodule Derpex.BootstrapDNSTest do
     request = %Request{
       method: "GET",
       target: "/bootstrap-dns?q=hidden.example",
-      version: "HTTP/1.1"
+      version: "HTTP/1.1",
+      headers: [{"host", "derp.example"}]
     }
 
     assert {:response, response} =
@@ -94,6 +95,35 @@ defmodule Derpex.BootstrapDNSTest do
     end)
 
     assert BootstrapDNS.metrics(server).queried_domains == 0
+  end
+
+  test "caps each retained query name so 500 entries cannot hold arbitrary bytes", %{
+    server: server
+  } do
+    long = String.duplicate("a", 300)
+
+    :ok =
+      BootstrapDNS.replace(
+        server,
+        %{},
+        %{(long <> ".one") => ["5.6.7.8"]},
+        %{(long <> ".one") => 1.0}
+      )
+
+    assert BootstrapDNS.lookup(server, long <> ".one", "10.0.0.1:1234") ==
+             %{(long <> ".one") => ["5.6.7.8"]}
+
+    assert BootstrapDNS.lookup(server, long <> ".two", "10.0.0.1:1234") == %{}
+
+    # Both names share their first 256 bytes, so only that prefix is retained.
+    assert BootstrapDNS.metrics(server).queried_domains == 1
+
+    # A name that already fits the cap is retained whole, so names differing
+    # inside the first 256 bytes stay distinct.
+    assert BootstrapDNS.lookup(server, String.duplicate("a", 255) <> "b", "10.0.0.1:1234") == %{}
+    assert BootstrapDNS.lookup(server, String.duplicate("a", 255) <> "c", "10.0.0.1:1234") == %{}
+
+    assert BootstrapDNS.metrics(server).queried_domains == 3
   end
 
   test "matches Go's deterministic PCG rollout selection" do

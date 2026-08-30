@@ -5,6 +5,35 @@ defmodule Derpex.Mesh.Client do
   The client watches one peer server, registers its advertised clients as
   regional routes, and forwards packets through a fixed-capacity ring. A
   broken connection withdraws every learned route before reconnecting.
+
+  Every outbound socket carries a five second send deadline, matching the
+  timer Go arms around `derp.Client.ForwardPacket`. Go closes the underlying
+  `net.Conn` when that timer fires; DERPEX asks the inet driver for the same
+  thing with `send_timeout` plus `send_timeout_close`, on the TCP socket and
+  on the transport under TLS alike, so a stalled peer surfaces as
+  `{:error, :timeout}` and disconnects instead of wedging the client process.
+  A timer owned by this process cannot do the job: nothing interrupts a
+  `:ssl.send/2` that is already blocked, and `:ssl.close/2` from a helper does
+  not rescue it either — that call queues behind the same blocked sender, takes
+  its full five second internal timeout, then exits the helper, and the send
+  is still blocked afterwards.
+
+  Dialling and handshaking share one absolute deadline of `connect_timeout`,
+  captured before the socket opens and re-derived for every read, rather than
+  a fresh timeout per read that a peer could renew forever by dribbling.
+
+  In the other direction a peer that stops speaking is caught by a two minute
+  receive deadline, rearmed on every byte the peer sends, matching the
+  `120 * time.Second` read deadline `derp.Client.Recv` sets before each frame.
+  A peer that misses it has its learned forwarders withdrawn and its
+  connection retried, so mesh routes never outlive the link that taught them.
+
+  One wakeup forwards at most 64 queued packets and then re-sends itself the
+  wake message rather than looping until the ring empties, so a deep backlog
+  cannot starve inbound frames, peer-gone updates, timers or calls. The budget
+  is what makes that bound hold: producers keep publishing while the drain
+  runs, so "until the ring reports empty" is not a bound at all when the fill
+  rate matches the drain rate.
   """
 
   use GenServer
@@ -16,15 +45,23 @@ defmodule Derpex.Mesh.Client do
   alias Derpex.Frame.Body
   alias Derpex.Frame.Decoder
   alias Derpex.Handshake
+  alias Derpex.HTTP1.Scan
   alias Derpex.Mesh.ClientAddressTable
+  alias Derpex.Metrics
   alias Derpex.Outbox.Ring
   alias Derpex.Router
+  alias Derpex.Secret
 
   @wake_message :derpex_mesh_outbox_ready
+  @busy_retry_ms 5
   @reconnect_message :derpex_mesh_reconnect
+  @recv_deadline_message :derpex_mesh_recv_deadline
   @default_reconnect_interval 5_000
   @default_connect_timeout 10_000
   @default_queue_capacity 32
+  @default_send_timeout 5_000
+  @default_recv_deadline 120_000
+  @max_drain_per_wake 64
   @max_http_head_bytes 1 * 1_024 * 1_024
   @max_server_frame_bytes Frame.max_info_length() + Frame.nonce_length()
 
@@ -56,11 +93,14 @@ defmodule Derpex.Mesh.Client do
 
   @impl true
   def init(options) do
+    private_key = Keyword.fetch!(options, :private_key)
+    mesh_key = Keyword.fetch!(options, :mesh_key)
+
     with {:ok, endpoint} <- parse_endpoint(Keyword.fetch!(options, :url)),
          {:ok, proxy} <- parse_proxy(Keyword.get(options, :proxy_url)),
-         <<private_key::binary-size(32)>> <- Keyword.fetch!(options, :private_key),
-         <<mesh_key::binary-size(32)>> <- Keyword.fetch!(options, :mesh_key),
-         {:ok, local_public_key} <- Crypto.public_key(private_key) do
+         <<_::binary-size(32)>> <- Secret.reveal(mesh_key),
+         <<revealed_private_key::binary-size(32)>> <- Secret.reveal(private_key),
+         {:ok, local_public_key} <- Crypto.public_key(revealed_private_key) do
       endpoint = %{endpoint | dial_host: Keyword.get(options, :dial_host, endpoint.host)}
 
       state = %{
@@ -75,6 +115,10 @@ defmodule Derpex.Mesh.Client do
           non_negative_option!(options, :reconnect_interval, @default_reconnect_interval),
         connect_timeout: positive_option!(options, :connect_timeout, @default_connect_timeout),
         queue_capacity: positive_option!(options, :queue_capacity, @default_queue_capacity),
+        metrics: Keyword.get_lazy(options, :metrics, &Metrics.default_handle/0),
+        send_timeout: positive_option!(options, :send_timeout, @default_send_timeout),
+        recv_deadline: positive_option!(options, :recv_deadline, @default_recv_deadline),
+        recv_timer: nil,
         tls_options: Keyword.get(options, :tls_options, []),
         socket: nil,
         decoder: Decoder.new(max_frame_length: @max_server_frame_bytes),
@@ -119,6 +163,12 @@ defmodule Derpex.Mesh.Client do
 
   def handle_info({@reconnect_message, _stale_token}, state), do: {:noreply, state}
 
+  def handle_info({@recv_deadline_message, token}, %{recv_timer: {token, _timer}} = state) do
+    {:noreply, disconnect_and_retry(%{state | recv_timer: nil}, :recv_timeout)}
+  end
+
+  def handle_info({@recv_deadline_message, _stale_token}, state), do: {:noreply, state}
+
   def handle_info(@wake_message, %{socket: nil} = state), do: {:noreply, state}
 
   def handle_info(@wake_message, state) do
@@ -154,7 +204,8 @@ defmodule Derpex.Mesh.Client do
     _state = withdraw_remote_peers(state)
     close_socket(state.socket)
     cancel_reconnect(state.reconnect_timer)
-    close_ring(state.ring)
+    _state = cancel_recv_deadline(state)
+    delete_ring(state.ring)
     :ok
   end
 
@@ -165,13 +216,9 @@ defmodule Derpex.Mesh.Client do
       {:ok, state, read_ahead} ->
         state = cancel_reconnect_timer(state)
 
-        with {:ok, state} <- process_server_data(state, read_ahead),
-             :ok <- active_once(state.socket),
-             :ok <- cache_local_address(state.socket) do
-          dispatch_event(state, {:connected, state.remote_server_key})
-          {:noreply, %{state | last_error: nil}}
-        else
-          {:error, reason} -> {:noreply, disconnect_and_retry(state, reason)}
+        case process_server_data(state, read_ahead) do
+          {:ok, state} -> finish_connect(state)
+          {:error, reason, state} -> {:noreply, disconnect_and_retry(state, reason)}
         end
 
       {:self_connect, state} ->
@@ -183,10 +230,23 @@ defmodule Derpex.Mesh.Client do
     end
   end
 
+  defp finish_connect(state) do
+    with :ok <- active_once(state.socket),
+         :ok <- cache_local_address(state.socket) do
+      state = arm_recv_deadline(state)
+      dispatch_event(state, {:connected, state.remote_server_key})
+      {:noreply, %{state | last_error: nil}}
+    else
+      {:error, reason} -> {:noreply, disconnect_and_retry(state, reason)}
+    end
+  end
+
   defp establish_connection(state) do
-    case open_socket(state) do
+    deadline = Clock.monotonic_time(:millisecond) + state.connect_timeout
+
+    case open_socket(state, deadline) do
       {:ok, socket} ->
-        case perform_handshake(%{state | socket: socket}) do
+        case perform_handshake(%{state | socket: socket}, deadline) do
           {:ok, connected_state, read_ahead} ->
             {:ok, connected_state, read_ahead}
 
@@ -204,11 +264,11 @@ defmodule Derpex.Mesh.Client do
     end
   end
 
-  defp perform_handshake(state) do
-    with :ok <- socket_send(state.socket, upgrade_request(state.endpoint)),
-         {:ok, read_ahead} <- receive_http_upgrade(state.socket, state.connect_timeout),
+  defp perform_handshake(state, deadline) do
+    with :ok <- socket_send(state, upgrade_request(state.endpoint)),
+         {:ok, read_ahead} <- receive_http_upgrade(state.socket, deadline),
          {:ok, type, server_key_body, read_ahead} <-
-           receive_frame(state.socket, read_ahead, state.connect_timeout),
+           receive_frame(state.socket, read_ahead, deadline),
          true <- type == Frame.type(:server_key),
          {:ok, remote_server_key} <- Handshake.decode_server_key(server_key_body) do
       state = %{state | remote_server_key: remote_server_key}
@@ -216,7 +276,7 @@ defmodule Derpex.Mesh.Client do
       if remote_server_key == state.local_public_key do
         {:self_connect, state}
       else
-        finish_handshake(state, read_ahead)
+        finish_handshake(state, read_ahead, deadline)
       end
     else
       false -> {:error, :expected_server_key, state}
@@ -224,29 +284,31 @@ defmodule Derpex.Mesh.Client do
     end
   end
 
-  defp finish_handshake(state, read_ahead) do
+  defp finish_handshake(state, read_ahead, deadline) do
+    private_key = Secret.reveal(state.private_key)
+
     info = %ClientInfo{
       version: Handshake.protocol_version(),
-      mesh_key: state.mesh_key,
+      mesh_key: Secret.reveal(state.mesh_key),
       can_ack_pings: true,
       app_name: "derpex"
     }
 
     with {:ok, client_info} <-
            Handshake.client_info_frame(
-             state.private_key,
+             private_key,
              state.remote_server_key,
              info
            ),
          {:ok, watch} <- Body.encode_client(:watch_connections),
-         :ok <- socket_send(state.socket, [client_info, watch]),
+         :ok <- socket_send(state, [client_info, watch]),
          {:ok, type, server_info_body, read_ahead} <-
-           receive_frame(state.socket, read_ahead, state.connect_timeout),
+           receive_frame(state.socket, read_ahead, deadline),
          true <- type == Frame.type(:server_info),
          {:ok, _server_info} <-
            Handshake.decode_server_info(
              server_info_body,
-             state.private_key,
+             private_key,
              state.remote_server_key
            ) do
       {:ok, %{state | decoder: Decoder.new(max_frame_length: @max_server_frame_bytes)},
@@ -258,6 +320,8 @@ defmodule Derpex.Mesh.Client do
   end
 
   defp receive_socket_data(state, data) do
+    state = arm_recv_deadline(state)
+
     case process_server_data(state, data) do
       {:ok, state} ->
         case active_once(state.socket) do
@@ -265,7 +329,7 @@ defmodule Derpex.Mesh.Client do
           {:error, reason} -> {:noreply, disconnect_and_retry(state, reason)}
         end
 
-      {:error, reason} ->
+      {:error, reason, state} ->
         {:noreply, disconnect_and_retry(state, reason)}
     end
   end
@@ -278,15 +342,19 @@ defmodule Derpex.Mesh.Client do
         process_server_frames(frames, %{state | decoder: decoder})
 
       {:error, reason} ->
-        {:error, {:frame, reason}}
+        {:error, {:frame, reason}, state}
     end
   end
 
+  # Failing halfway through a batch must still hand back the state the batch
+  # built so far. A `peer_present` earlier in the same segment has already
+  # registered a forwarder with the router, and only `state.remote_peers`
+  # records that it needs withdrawing before the ring behind it is deleted.
   defp process_server_frames(frames, state) do
     Enum.reduce_while(frames, {:ok, state}, fn frame, {:ok, state} ->
       case process_server_frame(state, frame) do
         {:ok, state} -> {:cont, {:ok, state}}
-        {:error, reason} -> {:halt, {:error, reason}}
+        {:error, reason} -> {:halt, {:error, reason, state}}
       end
     end)
   end
@@ -305,7 +373,7 @@ defmodule Derpex.Mesh.Client do
 
       {:ok, {:ping, payload}} ->
         with {:ok, pong} <- Body.encode_client({:pong, payload}),
-             :ok <- socket_send(state.socket, pong) do
+             :ok <- socket_send(state, pong) do
           {:ok, state}
         end
 
@@ -320,19 +388,30 @@ defmodule Derpex.Mesh.Client do
     end
   end
 
-  defp drain_forwarded_packets(state) do
+  defp drain_forwarded_packets(state),
+    do: drain_forwarded_packets(state, @max_drain_per_wake)
+
+  defp drain_forwarded_packets(_state, 0) do
+    send(self(), @wake_message)
+    :ok
+  end
+
+  defp drain_forwarded_packets(state, budget) do
     case Ring.take(state.ring) do
       {:ok, {:forward_packet, source, destination, packet}} ->
         with {:ok, frame} <- Body.encode_client({:forward_packet, source, destination, packet}),
-             :ok <- socket_send(state.socket, frame) do
-          drain_forwarded_packets(state)
+             :ok <- socket_send(state, frame) do
+          drain_forwarded_packets(state, budget - 1)
         end
 
       :empty ->
         :ok
 
       :busy ->
-        send(self(), @wake_message)
+        # A producer holds the ring. Re-waking immediately spins against it;
+        # the producer will signal after it publishes, and this timer is the
+        # safety net for the wakeup it may have coalesced into this one.
+        _timer = Process.send_after(self(), @wake_message, @busy_retry_ms)
         :ok
 
       :closed ->
@@ -344,8 +423,9 @@ defmodule Derpex.Mesh.Client do
     was_connected? = state.socket != nil
     ClientAddressTable.delete(self())
     close_socket(state.socket)
+    state = cancel_recv_deadline(state)
     state = withdraw_remote_peers(state)
-    close_ring(state.ring)
+    delete_ring(state.ring)
 
     state = %{
       state
@@ -401,63 +481,79 @@ defmodule Derpex.Mesh.Client do
     :ok
   end
 
+  defp arm_recv_deadline(state) do
+    state = cancel_recv_deadline(state)
+    token = make_ref()
+    timer = Clock.send_after(self(), {@recv_deadline_message, token}, state.recv_deadline)
+    %{state | recv_timer: {token, timer}}
+  end
+
+  defp cancel_recv_deadline(%{recv_timer: nil} = state), do: state
+
+  defp cancel_recv_deadline(%{recv_timer: {_token, timer}} = state) do
+    _remaining = Clock.cancel_timer(timer)
+    %{state | recv_timer: nil}
+  end
+
   defp new_ring(state) do
-    Ring.new(state.queue_capacity, notifier: self(), wake_message: @wake_message)
+    # Packets bound for another region are dropped under the same rules as any
+    # other queue. Each drop is labelled from the packet, the way Go labels a
+    # drop it makes on behalf of a forwarder.
+    Ring.new(state.queue_capacity,
+      notifier: self(),
+      wake_message: @wake_message,
+      metrics: state.metrics,
+      metric_kind: :by_packet
+    )
   end
 
-  defp close_ring(nil), do: :ok
+  defp delete_ring(nil), do: :ok
+  defp delete_ring(%Ring{} = ring), do: Ring.delete(ring)
 
-  defp close_ring(%Ring{} = ring) do
-    _result = Ring.close(ring)
-    :ok
-  rescue
-    ArgumentError -> :ok
-  end
-
-  defp open_socket(%{proxy: nil} = state) do
+  defp open_socket(%{proxy: nil} = state, deadline) do
     endpoint = state.endpoint
     host = String.to_charlist(endpoint.dial_host)
-    tcp_options = [:binary, packet: :raw, active: false, nodelay: true]
+    tcp_options = tcp_options(state)
 
     case endpoint.scheme do
       "http" ->
-        case :gen_tcp.connect(host, endpoint.port, tcp_options, state.connect_timeout) do
+        case :gen_tcp.connect(host, endpoint.port, tcp_options, time_left(deadline)) do
           {:ok, socket} -> {:ok, {:tcp, socket}}
           {:error, reason} -> {:error, reason}
         end
 
       "https" ->
-        case :ssl.connect(host, endpoint.port, tls_options(state), state.connect_timeout) do
+        case :ssl.connect(host, endpoint.port, tls_options(state), time_left(deadline)) do
           {:ok, socket} -> {:ok, {:ssl, socket}}
           {:error, reason} -> {:error, reason}
         end
     end
   end
 
-  defp open_socket(state) do
+  defp open_socket(state, deadline) do
     proxy = state.proxy
-    tcp_options = [:binary, packet: :raw, active: false, nodelay: true]
+    tcp_options = tcp_options(state)
 
     case :gen_tcp.connect(
            String.to_charlist(proxy.host),
            proxy.port,
            tcp_options,
-           state.connect_timeout
+           time_left(deadline)
          ) do
-      {:ok, socket} -> open_proxy_tunnel(state, socket)
+      {:ok, socket} -> open_proxy_tunnel(state, socket, deadline)
       {:error, reason} -> {:error, {:proxy_connect, reason}}
     end
   end
 
-  defp open_proxy_tunnel(state, socket) do
+  defp open_proxy_tunnel(state, socket, deadline) do
     target = host_and_port(state.endpoint.host, state.endpoint.port)
 
     result =
       with :ok <- :gen_tcp.send(socket, proxy_connect_request(target, state.proxy)),
-           :ok <- receive_proxy_response(socket, "", state.connect_timeout) do
+           :ok <- receive_proxy_response(socket, "", deadline) do
         case state.endpoint.scheme do
           "http" -> {:ok, {:tcp, socket}}
-          "https" -> wrap_proxy_tls(state, socket)
+          "https" -> wrap_proxy_tls(state, socket, deadline)
         end
       end
 
@@ -471,18 +567,29 @@ defmodule Derpex.Mesh.Client do
     end
   end
 
-  defp wrap_proxy_tls(state, socket) do
-    case :ssl.connect(socket, tls_options(state), state.connect_timeout) do
+  defp tcp_options(state) do
+    [
+      :binary,
+      packet: :raw,
+      active: false,
+      nodelay: true,
+      send_timeout: state.send_timeout,
+      send_timeout_close: true
+    ]
+  end
+
+  defp wrap_proxy_tls(state, socket, deadline) do
+    case :ssl.connect(socket, tls_options(state), time_left(deadline)) do
       {:ok, tls_socket} -> {:ok, {:ssl, tls_socket}}
       {:error, reason} -> {:error, {:proxy_tls, reason}}
     end
   end
 
-  defp receive_proxy_response(_socket, buffer, _timeout)
+  defp receive_proxy_response(_socket, buffer, _deadline)
        when byte_size(buffer) > @max_http_head_bytes,
        do: {:error, :proxy_response_too_large}
 
-  defp receive_proxy_response(socket, buffer, timeout) do
+  defp receive_proxy_response(socket, buffer, deadline) do
     case :binary.match(buffer, "\r\n\r\n") do
       {head_length, 4} ->
         <<head::binary-size(^head_length), "\r\n\r\n", _read_ahead::binary>> = buffer
@@ -492,8 +599,8 @@ defmodule Derpex.Mesh.Client do
         end
 
       :nomatch ->
-        case :gen_tcp.recv(socket, 0, timeout) do
-          {:ok, data} -> receive_proxy_response(socket, buffer <> data, timeout)
+        case :gen_tcp.recv(socket, 0, time_left(deadline)) do
+          {:ok, data} -> receive_proxy_response(socket, buffer <> data, deadline)
           {:error, reason} -> {:error, {:proxy_response, reason}}
         end
     end
@@ -540,17 +647,19 @@ defmodule Derpex.Mesh.Client do
     |> Keyword.put(:packet, :raw)
     |> Keyword.put(:active, false)
     |> Keyword.put(:nodelay, true)
+    |> Keyword.put(:send_timeout, state.send_timeout)
+    |> Keyword.put(:send_timeout_close, true)
   end
 
-  defp receive_http_upgrade(socket, timeout),
-    do: receive_http_upgrade(socket, "", timeout)
+  defp receive_http_upgrade(socket, deadline),
+    do: receive_http_upgrade(socket, "", 0, deadline)
 
-  defp receive_http_upgrade(_socket, buffer, _timeout)
+  defp receive_http_upgrade(_socket, buffer, _scanned, _deadline)
        when byte_size(buffer) > @max_http_head_bytes,
        do: {:error, :http_head_too_large}
 
-  defp receive_http_upgrade(socket, buffer, timeout) do
-    case :binary.match(buffer, "\r\n\r\n") do
+  defp receive_http_upgrade(socket, buffer, scanned, deadline) do
+    case Scan.match_from(buffer, scanned, "\r\n\r\n") do
       {head_length, 4} ->
         <<head::binary-size(^head_length), "\r\n\r\n", read_ahead::binary>> = buffer
 
@@ -560,9 +669,12 @@ defmodule Derpex.Mesh.Client do
         end
 
       :nomatch ->
-        case socket_recv(socket, timeout) do
-          {:ok, data} -> receive_http_upgrade(socket, buffer <> data, timeout)
-          {:error, reason} -> {:error, reason}
+        case socket_recv(socket, time_left(deadline)) do
+          {:ok, data} ->
+            receive_http_upgrade(socket, buffer <> data, byte_size(buffer), deadline)
+
+          {:error, reason} ->
+            {:error, reason}
         end
     end
   end
@@ -577,12 +689,12 @@ defmodule Derpex.Mesh.Client do
     end
   end
 
-  defp receive_frame(socket, buffer, timeout) do
-    with {:ok, buffer} <- ensure_bytes(socket, buffer, Frame.header_length(), timeout),
+  defp receive_frame(socket, buffer, deadline) do
+    with {:ok, buffer} <- ensure_bytes(socket, buffer, Frame.header_length(), deadline),
          {:ok, type, length, _rest} <- Frame.decode_header(buffer),
          true <- length <= @max_server_frame_bytes,
          {:ok, buffer} <-
-           ensure_bytes(socket, buffer, Frame.header_length() + length, timeout) do
+           ensure_bytes(socket, buffer, Frame.header_length() + length, deadline) do
       <<_header::binary-size(5), payload::binary-size(^length), rest::binary>> = buffer
       {:ok, type, payload, rest}
     else
@@ -591,15 +703,20 @@ defmodule Derpex.Mesh.Client do
     end
   end
 
-  defp ensure_bytes(_socket, buffer, wanted, _timeout) when byte_size(buffer) >= wanted,
+  defp ensure_bytes(_socket, buffer, wanted, _deadline) when byte_size(buffer) >= wanted,
     do: {:ok, buffer}
 
-  defp ensure_bytes(socket, buffer, wanted, timeout) do
-    case socket_recv(socket, timeout) do
-      {:ok, data} -> ensure_bytes(socket, buffer <> data, wanted, timeout)
+  defp ensure_bytes(socket, buffer, wanted, deadline) do
+    case socket_recv(socket, time_left(deadline)) do
+      {:ok, data} -> ensure_bytes(socket, buffer <> data, wanted, deadline)
       {:error, reason} -> {:error, reason}
     end
   end
+
+  # Every dial and read in one connect attempt shares a single deadline, so a
+  # peer that keeps a per-read timer alive by dribbling a byte at a time still
+  # runs out of connect_timeout rather than stalling the client indefinitely.
+  defp time_left(deadline), do: max(deadline - Clock.monotonic_time(:millisecond), 0)
 
   defp upgrade_request(endpoint) do
     [
@@ -659,8 +776,8 @@ defmodule Derpex.Mesh.Client do
     if String.contains?(host, ":"), do: "[#{host}]:#{port}", else: "#{host}:#{port}"
   end
 
-  defp socket_send({:tcp, socket}, data), do: :gen_tcp.send(socket, data)
-  defp socket_send({:ssl, socket}, data), do: :ssl.send(socket, data)
+  defp socket_send(%{socket: {:tcp, socket}}, data), do: :gen_tcp.send(socket, data)
+  defp socket_send(%{socket: {:ssl, socket}}, data), do: :ssl.send(socket, data)
 
   defp socket_recv({:tcp, socket}, timeout), do: :gen_tcp.recv(socket, 0, timeout)
   defp socket_recv({:ssl, socket}, timeout), do: :ssl.recv(socket, 0, timeout)

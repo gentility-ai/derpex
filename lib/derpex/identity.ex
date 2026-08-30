@@ -1,6 +1,7 @@
 defmodule Derpex.Identity do
   @moduledoc "Persistent, atomically created DERP server identity."
 
+  alias Derpex.AtomicFile
   alias Derpex.Crypto
 
   @key_length 32
@@ -44,7 +45,7 @@ defmodule Derpex.Identity do
   defp create_with_lock(_path, 0), do: {:error, :identity_lock_timeout}
 
   defp create_with_lock(path, attempts) do
-    :ok = File.mkdir_p(Path.dirname(path))
+    :ok = AtomicFile.ensure_directory(Path.dirname(path))
     lock_path = path <> ".lock"
 
     case open_exclusive(lock_path) do
@@ -88,33 +89,10 @@ defmodule Derpex.Identity do
 
   defp write_new_identity(path) do
     private_key = :crypto.strong_rand_bytes(@key_length)
-    temporary_path = path <> ".tmp.#{:erlang.unique_integer([:positive, :monotonic])}"
 
-    case open_exclusive(temporary_path) do
-      {:ok, file} -> write_and_rename(file, temporary_path, path, private_key)
-      {:error, reason} -> {:error, {:identity_temporary_file, reason}}
-    end
-  end
-
-  defp write_and_rename(file, temporary_path, path, private_key) do
-    result =
-      with :ok <- File.chmod(temporary_path, @file_mode),
-           :ok <- :file.write(file, private_key),
-           :ok <- :file.sync(file),
-           :ok <- :file.close(file),
-           :ok <- File.rename(temporary_path, path),
-           :ok <- File.chmod(path, @file_mode) do
-        {:ok, private_key}
-      end
-
-    case result do
-      {:ok, _private_key} = ok ->
-        ok
-
-      {:error, reason} ->
-        _close_result = :file.close(file)
-        _remove_result = File.rm(temporary_path)
-        {:error, {:identity_write, reason}}
+    case AtomicFile.write(path, private_key, mode: @file_mode) do
+      :ok -> {:ok, private_key}
+      {:error, reason} -> {:error, {:identity_write, reason}}
     end
   end
 

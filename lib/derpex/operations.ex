@@ -10,6 +10,7 @@ defmodule Derpex.Operations do
   alias Derpex.Admission.Gentility
   alias Derpex.Admission.Gentility.Events
   alias Derpex.BootstrapDNS
+  alias Derpex.Certificates.IPManager
   alias Derpex.Drain
   alias Derpex.HTTP1.Request
   alias Derpex.Metrics
@@ -62,11 +63,18 @@ defmodule Derpex.Operations do
   def health(:ready) do
     with :ok <- health(:live),
          {:ok, %{accepting_home?: true}} <- safe(&Drain.stats/0),
+         :ok <- certificates_ready(),
          :ok <- gentility_ready() do
       :ok
     else
       _unready -> {:error, :not_ready}
     end
+  end
+
+  # A listener serving a self-signed placeholder answers TLS but no client will
+  # trust it, so the relay is live and not ready until its certificate arrives.
+  defp certificates_ready do
+    if IPManager.bootstrap_certificate_active?(), do: {:error, :bootstrap_certificate}, else: :ok
   end
 
   @doc "Runs internal topology checks without returning client identities."
@@ -87,6 +95,7 @@ defmodule Derpex.Operations do
       |> merge_core_metrics()
       |> merge_router_metrics()
       |> merge_accept_metrics()
+      |> merge_certificate_metrics()
       |> merge_drain_metrics()
       |> merge_bootstrap_metrics()
       |> merge_gentility_metrics()
@@ -233,13 +242,19 @@ defmodule Derpex.Operations do
       accept_rate_limited: "derpex_accept_global_rate_limited_total",
       ip_rate_limited: "derpex_accept_ip_rate_limited_total",
       ip_connection_limited: "derpex_accept_ip_connection_limited_total",
-      ip_tracking_limited: "derpex_accept_ip_tracking_limited_total",
+      ip_untracked: "derpex_accept_limiter_untracked_total",
+      overflow_limited: "derpex_accept_overflow_limited_total",
       tracked_ips: "derpex_accept_tracked_ips",
       active_connections: "derpex_accept_active_connections",
       max_tracked_ips: "derpex_accept_max_tracked_ips"
     }
 
     merge_named_snapshot(metrics, safe(&AcceptLimiter.stats/0), names)
+  end
+
+  defp merge_certificate_metrics(metrics) do
+    active = if IPManager.bootstrap_certificate_active?(), do: 1, else: 0
+    Map.put(metrics, "derpex_tls_bootstrap_certificate_active", active)
   end
 
   defp merge_drain_metrics(metrics) do
@@ -285,8 +300,22 @@ defmodule Derpex.Operations do
   defp merge_live_gentility(metrics) do
     case safe(fn -> Gentility.stats(Gentility) end) do
       {:ok, values} -> merge_gentility_snapshot(metrics, values)
-      _unavailable -> metrics
+      _unavailable -> merge_stalled_gentility(metrics)
     end
+  end
+
+  # A controller stuck in a long call still has to report why: these counters
+  # live outside the process precisely so an incident does not also go dark.
+  defp merge_stalled_gentility(metrics) do
+    names = %{
+      usage_shed_total: "derpex_gentility_usage_shed_total",
+      byte_pacing_capped_total: "derpex_gentility_byte_pacing_capped_total",
+      close_peer_failures: "derpex_gentility_close_peer_failed_total"
+    }
+
+    metrics
+    |> Map.put("derpex_gentility_stalled", 1)
+    |> merge_values(Gentility.counters(), names)
   end
 
   defp merge_usage_metrics(metrics, usage) do
@@ -297,13 +326,18 @@ defmodule Derpex.Operations do
       aggregate_entries: "derpex_gentility_usage_aggregate_entries",
       aggregate_windows: "derpex_gentility_usage_aggregate_windows",
       blocked?: "derpex_gentility_usage_blocked",
-      exporting?: "derpex_gentility_usage_exporting"
+      shed_total: "derpex_gentility_usage_shed_total",
+      exporting?: "derpex_gentility_usage_exporting",
+      dropped_rows: "derpex_gentility_usage_dropped_rows",
+      spool_load_error: "derpex_gentility_usage_spool_load_error"
     }
 
     merge_values(metrics, usage, names)
   end
 
   defp merge_gentility_snapshot(metrics, %{usage: usage} = values) do
+    usage = Map.put(usage, :shed_total, Map.get(values, :usage_shed_total, 0))
+
     names = %{
       cache_entries: "derpex_gentility_cache_entries",
       revocations: "derpex_gentility_revocations",
@@ -312,12 +346,38 @@ defmodule Derpex.Operations do
       active_organizations: "derpex_gentility_active_organizations",
       active_requests: "derpex_gentility_active_requests",
       max_cache_entries: "derpex_gentility_max_cache_entries",
-      max_revocations: "derpex_gentility_max_revocations"
+      max_revocations: "derpex_gentility_max_revocations",
+      cache_full: "derpex_gentility_cache_full",
+      close_peer_failures: "derpex_gentility_close_peer_failed_total",
+      byte_pacing_capped_total: "derpex_gentility_byte_pacing_capped_total",
+      renewals_in_flight: "derpex_gentility_renewals_in_flight",
+      nearest_lease_expiry_seconds: "derpex_gentility_nearest_lease_expiry_seconds",
+      cache_load_error: "derpex_gentility_cache_load_error",
+      cache_persist_error: "derpex_gentility_cache_persist_error"
     }
 
     metrics
     |> merge_values(values, names)
+    |> merge_authorize_metrics(Map.get(values, :authorize_counts, %{}))
+    |> merge_close_peer_metrics(Map.get(values, :close_peer_counts, %{}))
     |> merge_usage_metrics(usage)
+  end
+
+  # Both label sets are enumerated by the admission controller, so the series
+  # count is fixed and no node, organization, or source identity can reach a
+  # label.
+  defp merge_authorize_metrics(metrics, counts) do
+    Enum.reduce(Gentility.authorize_labels(), metrics, fn {outcome, reason} = label, metrics ->
+      name = ~s(derpex_gentility_authorize_total{outcome="#{outcome}",reason="#{reason}"})
+      Map.put(metrics, name, Map.get(counts, label, 0))
+    end)
+  end
+
+  defp merge_close_peer_metrics(metrics, counts) do
+    Enum.reduce(Gentility.close_peer_causes(), metrics, fn cause, metrics ->
+      name = ~s(derpex_gentility_close_peer_total{cause="#{cause}"})
+      Map.put(metrics, name, Map.get(counts, cause, 0))
+    end)
   end
 
   defp merge_event_metrics(metrics) do

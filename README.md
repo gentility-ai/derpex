@@ -15,12 +15,38 @@ The native crate is built from source for prerelease versions:
 ```sh
 mix deps.get
 mix quality
+mix test
 mix artifact.check
 ```
+
+`mix quality` is the fast pre-commit gate: formatting, warnings-as-errors
+compilation, Credo, `rustfmt`, and Clippy. It runs no tests, so `mix test` is a
+separate step.
 
 `mix artifact.check` assembles the production OTP release, removes Rustler's
 build-time project templates, rejects Go/Rust source or toolchain files, and
 boots the packaged crypto NIF through the release executable.
+
+The release-blocking aliases are:
+
+```text
+mix test          # unit and property tests
+mix test.system   # test/system: TLS, signals, external services
+mix test.diff     # the Go-versus-DERPEX differential oracle
+mix test.interop  # official Go and Rust clients against DERPEX
+mix test.all      # every tagged gate: system, Go interop, Rust interop
+mix release.check # quality, test.all, cargo test, the benchmark thresholds,
+                  # and artifact.check: the release gate, run locally
+```
+
+Every test under `test/system` must carry `@moduletag :system`. That tag is
+excluded by default in `test/test_helper.exs`, so the system suite runs only
+under `mix test.system` (or `mix test.all`) and never rides along with a plain
+`mix test`.
+
+`mix test.all` and `mix test.interop` need `DERPEX_TAILSCALE_DIR` and
+`DERPEX_TAILSCALE_RS_DIR` pointing at the pinned sibling checkouts; both
+accept relative paths.
 
 Go, Rust, and the pinned upstream repositories are conformance-test inputs
 only. Separate CI jobs exercise the unchanged Go clients, two real `tsnet`
@@ -29,9 +55,9 @@ Go-server-versus-DERPEX differential trace, and the official `tailscale-rs`
 client. None of those toolchains or checkouts is copied into an OTP release or
 runtime image.
 
-The Go job also runs the six pinned upstream packages represented by
+The Go job also runs the seven pinned upstream packages represented by
 `interop/COVERAGE.md`. That step proves the normative oracle remains healthy;
-the reviewed 69-test mapping, official clients, and differential trace are the
+the reviewed 74-test mapping, official clients, and differential trace are the
 corresponding DERPEX behavior gates.
 
 The local official-client gates use sibling pinned checkouts:
@@ -46,6 +72,37 @@ DERPEX_TAILSCALE_RS_DIR=../tailscale-rs DERPEX_RUST_INTEROP=1 \
 
 With `DERPEX_TAILSCALE_DIR` set, `mix test.diff` runs just the normalized
 semantic comparison against the pinned Go server.
+
+`mix release.check` runs what CI runs, including the two gates that used to
+live only in the workflow: the Rust crate's own `cargo test --locked` and the
+relay benchmark under CI's three `--fail-on` thresholds. A threshold a
+developer first meets on a pull request is a threshold that was not a local
+gate.
+
+Every CI job runs on every pull request; there is no reduced pull-request
+subset. Two schedules sit outside that: `.github/workflows/benchmark.yml` runs
+the long relay and slow-client soak weekly, and `.github/workflows/nightly.yml`
+runs nightly what is too slow for a pull request — the property suite at
+`PROPERTY_RUNS=5000`, a ten-times-longer benchmark against the same
+thresholds, and `mix test.system`.
+
+Releases cannot skip any of that. `.github/workflows/release.yml` calls the
+whole CI workflow as a reusable workflow in a job named `gate`, and every job
+that builds, packages, or publishes an artifact declares `needs: [gate, ...]`.
+A red quality, unit, Go interop, Rust interop, or runtime-boundary job blocks
+the tag from producing a NIF archive, a GitHub release, or a runtime image.
+CI ignores `v*` tag pushes on its own trigger, so a release tag runs the suite
+once, through that gate.
+
+`checksum-Elixir.Derpex.Crypto.Native.exs` is the manifest `rustler_precompiled`
+verifies a downloaded NIF archive against. It is committed rather than generated
+at publish time, and it is empty (`%{}`) today, so consumers build the crate from
+source. Prerelease tags — any version carrying a SemVer prerelease suffix, such
+as `v0.2.0-rc.1` — are expected to ship that way and are exempt from the check.
+A stable tag is not: the `version` job fails a tag whose manifest is still empty,
+because a stable release must not silently require a Rust toolchain on every
+machine that installs it. So the order is: tag a prerelease, take the manifest
+that run publishes, commit it, then tag the stable version.
 
 The `tsnet` smoke advertises DERPEX from Tailscale's own in-memory test control
 server, pins DERPEX's raw-IP TLS certificate, forces the two nodes off direct
@@ -72,6 +129,92 @@ files leave the last good certificate active. Set
 `DERPEX_TLS_RELOAD_INTERVAL_MS` to change the interval or `0` to disable
 polling. Raw-IP clients do not send SNI and continue to use the startup manual
 certificate, which is the intended stable pinned-certificate path.
+
+### Certificate modes
+
+`DERPEX_CERT_MODE` selects the certificate provider and defaults to `manual`,
+the file-backed listener above.
+
+`letsencrypt` obtains certificates over ACME (RFC 8555). It needs
+`DERPEX_CERT_DIR`, `DERPEX_CERT_HOSTNAME`, and `DERPEX_HTTP_PORT` — a
+certificate authority validates HTTP-01 by connecting to port 80 at the name or
+address being validated, so a configuration without a plaintext listener is
+refused at boot rather than failing on the first order:
+
+```sh
+DERPEX_LISTEN_PORT=443 \
+DERPEX_HTTP_PORT=80 \
+DERPEX_IDENTITY_PATH=/var/lib/derpex/derpex.key \
+DERPEX_CERT_MODE=letsencrypt \
+DERPEX_CERT_DIR=/var/lib/derpex/certs \
+DERPEX_CERT_HOSTNAME=derp.example.com \
+DERPEX_ACME_EMAIL=security@example.com \
+bin/derpex start
+```
+
+Set `DERPEX_IP_CERT_ISSUER=acme` with an IP address as
+`DERPEX_CERT_HOSTNAME` to order short-lived certificates for the address a
+connection arrives on, which is upstream's `--acme-ip-certs`. `gcp` is the same
+flow against Google's endpoint and additionally requires
+`DERPEX_ACME_EAB_KID`, `DERPEX_ACME_EAB_KEY`, and `DERPEX_ACME_EMAIL`.
+`DERPEX_ACME_DIRECTORY_URL` overrides the directory, which is how the tests
+point the client at a fake authority. It must be HTTPS unless its host is
+loopback, and every URL the authority hands out afterwards has to share that
+directory's scheme, host, and port — a certificate authority cannot redirect
+this relay onto another host.
+
+The account key is created once at `DERPEX_CERT_DIR/acme-account.key` with mode
+`0600` and reused for every order.
+
+`DERPEX_HTTP_MAX_CONNECTIONS` caps the plaintext listener on its own and
+defaults to 256. `DERPEX_MAX_CONNECTIONS` is what an operator sized for the
+DERP listener, so it applies to that listener alone rather than to each of them
+in turn.
+
+The plaintext listener exists to answer challenges, not to serve the relay: it
+answers `/.well-known/acme-challenge/*` and the unauthenticated probes, sends
+any other `GET` or `HEAD` to the same target over HTTPS, and answers anything
+else with `400 Use HTTPS`. A cleartext DERP upgrade is offered only when
+`DERPEX_CLEAR_HTTP=1` is set, so a client cannot be talked down onto port 80.
+
+`DERPEX_IP_CERT_ISSUER=self` needs no certificate authority at all: with
+`DERPEX_CERT_DIR=/var/lib/derpex/certs` and `DERPEX_CERT_HOSTNAME` set to a bare
+IP address, the relay issues and caches a persistent self-signed certificate for
+that address (key `0600`, certificate `0644`) and serves it to SNI and no-SNI
+hellos alike. It contacts no certificate authority. Any other value of
+`DERPEX_IP_CERT_ISSUER` is rejected at boot, as is combining it with
+`DERPEX_TLS_CERTFILE` or `DERPEX_TLS_KEYFILE`: two certificate sources for one
+listener is an operator mistake with a silent outcome, so it is refused rather
+than resolved by precedence.
+
+A certificate is served while it is inside its validity window and is renewed in
+the background once less than a third of its lifetime remains, so no handshake
+ever waits on an issuance unless there is nothing valid to serve. Issuance runs
+in its own process, so an authority that takes minutes cannot stall a handshake
+for another address, and concurrent requests for one address share a single
+order. A failed issuance backs off from one minute to thirty, and the
+certificate already in hand keeps answering throughout. An SNI naming a
+different IP address, or an unconfigured DNS name, is refused with a TLS
+`unrecognized_name` alert rather than answered with the listener's own
+certificate.
+
+A listen socket binds one certificate and cannot be told about a renewal, so the
+relay binds whatever it has at boot — a cached certificate, or a self-signed one
+if the authority is unreachable — and publishes each issuance into the snapshot
+the TLS transport reads per connection. A renewed certificate therefore reaches
+clients that send SNI and clients that do not.
+
+The certificate plan is resolved before anything else starts, whether or not
+`DERPEX_LISTEN_PORT` is set, so a configuration mistake stops the boot rather
+than surfacing later.
+
+DERPEX serves and dials TLS 1.3 only. Pinned `cmd/derper` sets a TLS 1.2
+minimum, so this is a deliberate hardening and not parity: a conforming
+TLS-1.2-only client is refused. `DERPEX_TLS_MIN_VERSION=1.2` restores the
+upstream floor, and `1.3` (the default) keeps it raised; nothing else is
+accepted. The setting reaches both directions — the TLS listener and every
+mesh peer the relay dials — so a mesh connection cannot end up weaker than the
+listener it came from.
 
 The server identity is created atomically with mode `0600` and is stable across
 restarts. The UDP STUN service listens on port `3478` by default whenever the
@@ -148,6 +291,12 @@ buckets are evicted least-recently-used at that hard bound, while active claims
 are process-monitored and never evicted. Limiter metrics aggregate outcomes and
 never use source IPs as labels.
 
+Per-source limits key on the allocation, not the address: IPv6 sources are
+aggregated to `DERPEX_ACCEPT_IPV6_PREFIX` (default `64`, the routed prefix a
+single host is normally handed) so one /64 cannot fill the tracking table or
+buy itself thousands of buckets. IPv4 keys on the full address, and
+IPv4-mapped IPv6 addresses are unmapped before aggregation.
+
 ## Gentility profile
 
 The baseline profile remains the default. A production Gentility deployment
@@ -180,6 +329,17 @@ Cached leases and usage batches are atomically persisted with mode `0600`.
 Unknown and expired nodes fail closed during outage. A full usage spool stops
 packet admission instead of dropping accounting data or growing memory.
 
+The lease TTL (`DERPEX_GENTILITY_MAX_LEASE_MS`, 15 minutes by default) is the
+worst-case window in which a revoked node can still connect if both revocation
+push and reconciliation are unavailable, and it is also how long the relay
+keeps serving without Gentility. Leases backing live connections are renewed at
+80% of their lifetime, so an outage darkens the relay one TTL after the last
+successful renewal, node by node as each lease expires. Alert on
+`derpex_gentility_nearest_lease_expiry_seconds`: it is the only warning that
+arrives before connections start dropping. Lease budgets are enforced per
+instance, so Gentility must divide each intended limit by the number of
+instances that may serve a node. `docs/deployment/gentility.md` is the runbook.
+
 Graceful regional withdrawal is controlled through `Derpex.Drain.begin_drain/2`
 and `Derpex.Drain.cancel/1`. A drain rejects new home transitions, leaves mesh
 peers and probes available, sends bounded-jitter `FrameRestarting` notices only
@@ -199,11 +359,19 @@ random `DERPEX_OPERATIONS_TOKEN` of at least 16 bytes to enable `GET /metrics`
 and `GET /debug/check`, then send it as `Authorization: Bearer <token>`.
 Metrics use a fixed schema with only protocol-defined finite labels; relay
 identity, organization, peer, and source-IP values are never metric labels.
+Alert on a sustained non-zero rate of `derpex_accept_limiter_untracked_total`:
+it means the per-IP admission table is full, so new sources are sharing one
+overflow bucket instead of getting their own, and per-IP limits are no longer
+enforced individually. Raise `DERPEX_ACCEPT_MAX_TRACKED_IPS` when it fires.
 
 The baseline-compatible `/debug/`, `/debug/vars`, `/debug/varz`,
 `/debug/check`, and live Linux `/debug/traffic` routes permit direct loopback
-and Tailscale-address clients. They reject requests carrying
-`X-Forwarded-For`. The upstream
+and Tailscale IPv6 ULA (`fd7a:115c:a1e0::/48`) clients. Unlike upstream, the
+Tailscale IPv4 CGNAT range (`100.64.0.0/10`) is **not** granted by default: a
+relay on a public port can see a carrier-NAT source address belonging to no
+tailnet. Set `DERPEX_DEBUG_ALLOW_TAILSCALE_CGNAT=1` to restore the upstream
+rule on a relay whose only CGNAT peers are tailnet nodes. These routes reject
+requests carrying `X-Forwarded-For`. The upstream
 `TS_ALLOW_DEBUG_IP`, `TS_DEBUG_TRUSTED_CIDRS`, and GET-only
 `TS_DEBUG_KEY_PATH`/`?debugkey=` mechanisms are supported; the Gentility
 operations bearer token is also accepted. Public health and probes do not

@@ -4,6 +4,7 @@ defmodule Derpex.HTTP1.Response do
   @status_reasons %{
     200 => "OK",
     204 => "No Content",
+    302 => "Found",
     400 => "Bad Request",
     401 => "Unauthorized",
     403 => "Forbidden",
