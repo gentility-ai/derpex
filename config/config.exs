@@ -15,5 +15,5 @@ config :derpex,
   native_base_url:
     System.get_env(
       "DERPEX_NATIVE_BASE_URL",
-      "https://github.com/jtippett/derpex/releases/download"
+      "https://github.com/gentility-ai/derpex/releases/download"
     )

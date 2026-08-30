@@ -200,6 +200,13 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
 
+      # The repository is private, so the image build cannot fetch the release
+      # assets anonymously; hand them to the build context instead.
+      - name: Fetch the tagged native archives for the image build
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release download "v${{ needs.version.outputs.value }}" --pattern '*.tar.gz' --dir native-artifacts
+
       - name: Build with precompiled native archive
         run: docker build --load --target runtime --tag derpex:release .
 
@@ -232,6 +239,13 @@ jobs:
       packages: write
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+
+      # Both Linux archives land in the build context so each platform of the
+      # multi-architecture build finds its own in the local cache.
+      - name: Fetch the tagged native archives for the image build
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release download "v${{ needs.version.outputs.value }}" --pattern '*.tar.gz' --dir native-artifacts
 
       - uses: docker/setup-qemu-action@c7c53464625b32c7a7e944ae62b3e17d2b600130 # v3
 

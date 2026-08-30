@@ -27,6 +27,13 @@ COPY rel ./rel
 COPY checksum-Elixir.Derpex.Crypto.Native.exs ./
 
 FROM builder_base AS builder_precompiled
+# A private repository's release assets cannot be fetched anonymously, so a
+# tagged image build downloads them with the workflow's token into
+# native-artifacts/ and the compile takes them from the rustler_precompiled
+# cache instead of the network. With the directory empty, the compile falls
+# back to downloading from the configured base URL.
+COPY native-artifacts /build/native-artifacts
+ENV RUSTLER_PRECOMPILED_GLOBAL_CACHE_PATH=/build/native-artifacts
 RUN mix compile --warnings-as-errors && mix release derpex
 
 FROM builder_base AS builder_source

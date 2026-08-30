@@ -11,3 +11,4 @@
 *.ez
 derpex-*.tar.gz
 /.claude/worktrees/
+native-artifacts/*.tar.gz

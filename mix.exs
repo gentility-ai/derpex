@@ -2,7 +2,7 @@ defmodule Derpex.MixProject do
   use Mix.Project
 
   @version "0.1.0"
-  @source_url "https://github.com/jtippett/derpex"
+  @source_url "https://github.com/gentility-ai/derpex"
 
   # Kept byte-identical to the "Smoke relay benchmark harness" step in
   # .github/workflows/ci.yml; test/release_gate_test.exs compares the two.
