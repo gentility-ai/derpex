@@ -2,8 +2,12 @@ name: CI
 
 on:
   push:
-    # Release tags reach this workflow through release.yml's gate job, so
-    # ignoring them here keeps a tag from running the whole suite twice.
+    # All branch pushes run CI. Release tags reach this workflow through
+    # release.yml's gate job, so ignoring them here keeps a tag from running
+    # the whole suite twice. (With only tags-ignore defined, GitHub never
+    # matched branch pushes at all, so merges to main ran no CI.)
+    branches:
+      - "**"
     tags-ignore:
       - "v*"
   pull_request:
