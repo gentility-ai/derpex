@@ -211,9 +211,9 @@ A relay older than v0.2.0 has no `lane`; Gentility counts its series as
 
 The exporter's lines are fixed by the test "exports fixed-cardinality
 admission metrics through operations" in
-`test/derpex/admission/gentility_test.exs`. Gentility's cron test copies its
-`authorize_total` lines, so a change there shows up as a broken test on both
-sides.
+`test/derpex/admission/gentility_test.exs`. Gentility's cron test is to take
+its `authorize_total` lines from that test verbatim, so that a change there
+breaks a test on both sides.
 
 **Clock skew.** A lease whose `issued_ms` is more than
 `DERPEX_GENTILITY_MAX_FUTURE_SKEW_MS` (30 s) ahead of the relay's clock fails
