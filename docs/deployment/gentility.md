@@ -15,10 +15,11 @@ proxy or load balancer.
 - Go DERP is not a production dependency or fallback.
 - The runtime artifact contains an OTP release and precompiled NIF only. It
   contains no Go/Rust toolchain, upstream checkout, or conformance helper.
-- The release includes a module implementing
-  `Derpex.Admission.Gentility.ControlPlane`; its authenticated transport is a
-  Gentility-owned integration, while leases, revocations, reconciliation, and
-  usage batches use DERPEX contract v1.
+- The release reaches Gentility through a
+  `Derpex.Admission.Gentility.ControlPlane`. `DERPEX_GENTILITY_ADAPTER=http`
+  selects the one DERPEX ships, `Derpex.Admission.Gentility.HTTP`; any other
+  value names a module. Leases, revocations, reconciliation, and usage batches
+  use DERPEX contract v1 either way.
 - Admission cache and usage spool live on persistent encrypted storage with
   mode `0600`. Both are refused at startup if the path is not a regular file or
   is larger than its configured bounds could ever produce, so a replaced or
@@ -81,12 +82,52 @@ than silently reverting to its default.
 | --- | --- | --- |
 | `DERPEX_GENTILITY_MAX_CACHE_ENTRIES` | `100000` | Hard bound on cached authorization leases. |
 | `DERPEX_GENTILITY_MAX_REVOCATIONS` | `10000` | Hard bound on retained revocation records. |
-| `DERPEX_GENTILITY_MAX_CONCURRENT_REQUESTS` | `64` | Live authorizations in flight; excess is shed as `admission_overloaded`. |
+| `DERPEX_GENTILITY_MAX_CONCURRENT_REQUESTS` | `64` | Live authorizations in flight; excess is refused `admission_overloaded` and counted as reason `overloaded`. |
 | `DERPEX_GENTILITY_AUTHORITY_TIMEOUT_MS` | `2000` | Deadline for one live authorization call. |
 | `DERPEX_GENTILITY_MAX_LEASE_MS` | `900000` | Longest lease lifetime accepted, and so the worst-case missed-revocation window. |
 | `DERPEX_GENTILITY_MAX_FUTURE_SKEW_MS` | `30000` | Clock skew allowed on a lease issue time. It never extends expiry. |
 | `DERPEX_GENTILITY_MAX_BYTE_DELAY_MS` | `30000` | Per-node pacing delay above which a connection is closed instead of paced; also the cap on any single pacing wait. |
 | `DERPEX_GENTILITY_CACHE_PERSIST_MS` | `5000` | Longest a newly cached lease may go unwritten to disk. |
+| `DERPEX_GENTILITY_ENFORCE` | `1` | `1` refuses and closes. `0` observes: it counts `would_deny` and `would_close` and refuses nothing. |
+| `DERPEX_GENTILITY_CONFINED_SOURCES` | unset | `<prefix>=<kind>\|<kind>;...`: from a listed prefix, admit only those owner kinds. |
+| `DERPEX_GENTILITY_MAX_UNKNOWN_REQUESTS` | `16` | Authorizations in flight for keys with no cached lease. |
+| `DERPEX_GENTILITY_UNKNOWN_RATE` | `20/40` | Rate a second and burst for those authorizations, across all sources. |
+| `DERPEX_GENTILITY_UNKNOWN_PER_SOURCE_RATE` | `2/10` | The same, per source, keyed as the accept limiter keys it. |
+
+### The HTTP adapter
+
+With `DERPEX_GENTILITY_ADAPTER=http` the relay needs two more settings, both
+required:
+
+| Variable | Meaning |
+| --- | --- |
+| `DERPEX_GENTILITY_URL` | The Gentility app's base URL. It must be `https://`. |
+| `DERPEX_GENTILITY_TOKEN` | The relay's bearer token, at least 32 bytes. |
+
+Every call carries `x-derp-instance: $DERPEX_GENTILITY_INSTANCE_ID` and the
+bearer. No call carries a source address, and none is logged. The routes,
+the long poll, and the reconcile page are described in ADR 0002's v0.2.0
+addendum. A 404 from authorize is an error, as any non-200 is, so a key with
+no cached lease is refused `no_cached_lease`.
+
+### Rollout: observe, then enforce
+
+Start a relay with `DERPEX_GENTILITY_ENFORCE=0`. Every decision is still made
+and counted, but nothing is refused or closed. Read
+`authorize_total{outcome="would_deny"}` by reason and
+`close_peer_total{outcome="would_close"}` by cause. When they show only what
+enforcement should refuse, set `1`. Observe never refuses, not even a call the
+unknown lane cannot take.
+
+### Lanes
+
+A key that holds a cached lease takes the known lane, the
+`DERPEX_GENTILITY_MAX_CONCURRENT_REQUESTS` gate. Any other key takes the
+unknown lane, bounded by the three `UNKNOWN` settings. A flood of made-up keys
+fills only the unknown lane, so known nodes and renewals are never shed behind
+it. A cold relay, with no lease cached, admits its fleet through the unknown
+lane: 40 at once, then 20 a second; 10 behind one address, then 2 a second.
+ADR 0002 works the numbers.
 
 Size `DERPEX_GENTILITY_MAX_CACHE_ENTRIES` above the number of distinct nodes an
 instance expects to serve within one lease lifetime, not above its concurrent
@@ -243,14 +284,24 @@ lease lifetime.
 Every admission decision the controller answers is counted under a fixed label
 set — no node, organization, or source identity ever reaches a label:
 
-- `derpex_gentility_authorize_total{outcome,reason}` — `outcome` is `live`,
-  `cached`, or `denied`; denials carry one of a fixed reason set
-  (`no_cached_lease`, `lease_revoked`, `cache_full`, `stale_lease`,
-  `wrong_region`, `invalid_record`, `overloaded`, `unavailable`, `other`).
-  A rising `cached` share means Gentility is unreachable and the relay is
-  running on cached leases.
-- `derpex_gentility_close_peer_total{cause}` — `expiry`, `revocation`,
-  `eviction`, or `key_rotation`.
+- `derpex_gentility_authorize_total{outcome,reason,lane}` — `outcome` is
+  `live`, `cached`, `denied`, or `would_deny` (a denial under observe);
+  denials carry one of a fixed reason set (`no_cached_lease`, `lease_revoked`,
+  `cache_full`, `stale_lease`, `wrong_region`, `invalid_record`,
+  `overloaded`, `unavailable`, `confined_source`,
+  `connection_limit`, `other`). `lane` is `known` or `unknown`. A rising
+  `cached` share means Gentility is unreachable and the relay is running on
+  cached leases. A lease issued more than `DERPEX_GENTILITY_MAX_FUTURE_SKEW_MS`
+  ahead of the relay's clock counts as `invalid_record`. `no_cached_lease`
+  means Gentility gave no usable record and nothing is cached, whatever the
+  cause. In the unknown lane, `overloaded` with more `live` answers than
+  `no_cached_lease` ones is a cold start; otherwise it is a flood, or a cold
+  relay whose Gentility is not answering.
+- `derpex_gentility_close_peer_total{cause,outcome}` — `cause` is `expiry`,
+  `revocation`, `eviction`, or `key_rotation`; `outcome` is `closed`, or
+  `would_close` under observe.
+- `derpex_gentility_enforce` — 1 when enforcing, 0 when observing.
+- `derpex_gentility_active_unknown_requests` — unknown-lane calls in flight.
 - `derpex_gentility_nearest_lease_expiry_seconds` — how long until the next
   cached lease is closed. **Alert on this.** It falling toward zero across the
   fleet while `authorize_total{outcome="cached"}` climbs is the signature of a
@@ -308,6 +359,11 @@ configured bounds — is moved aside as `<path>.corrupt-<timestamp>`, logged, an
 flagged by `derpex_gentility_usage_spool_load_error`; accounting then restarts
 empty. The ledger for that window is lost and the kept file is what to recover
 from, but a relay never refuses to boot over one unreadable file.
+
+The HTTP adapter has no usage route yet. It acknowledges each batch and
+discards it, and `derpex_gentility_usage_discarded_total` counts the batches.
+The spool still drains, so packets are never shed for it. Nothing is billed
+while it is so.
 
 `derpex_gentility_usage_dropped_rows` counts since the usage worker started, so
 a restart resets it to zero. Alert on an increase rather than an absolute

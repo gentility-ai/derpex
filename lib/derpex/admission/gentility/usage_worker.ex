@@ -219,7 +219,8 @@ defmodule Derpex.Admission.Gentility.UsageWorker do
          export: nil,
          last_error: nil,
          load_error: load_error,
-         dropped_rows: 0
+         dropped_rows: 0,
+         discarded_batches: 0
        }}
     end
   end
@@ -397,7 +398,7 @@ defmodule Derpex.Admission.Gentility.UsageWorker do
       case UsageSpool.ack(state.spool, export.id) do
         {:ok, spool} ->
           :atomics.put(state.blocked, 1, 0)
-          %{state | spool: spool, last_error: nil}
+          %{state | spool: spool, last_error: nil} |> count_discarded(result)
 
         {:error, reason} ->
           :atomics.put(state.blocked, 1, 1)
@@ -407,6 +408,13 @@ defmodule Derpex.Admission.Gentility.UsageWorker do
       %{state | last_error: :export_failed}
     end
   end
+
+  # An exporter with nowhere to send usage acknowledges a batch as discarded.
+  # It leaves the spool like any other, and the count says it went nowhere.
+  defp count_discarded(state, {:ok, :discarded}),
+    do: %{state | discarded_batches: state.discarded_batches + 1}
+
+  defp count_discarded(state, _exported), do: state
 
   defp successful_export?(:ok), do: true
   defp successful_export?({:ok, _result}), do: true
@@ -456,6 +464,7 @@ defmodule Derpex.Admission.Gentility.UsageWorker do
       spool_bytes: spool.bytes,
       exporting?: not is_nil(state.export),
       dropped_rows: state.dropped_rows,
+      discarded_batches: state.discarded_batches,
       spool_load_error: state.load_error != nil,
       last_error: state.last_error
     }
@@ -471,6 +480,7 @@ defmodule Derpex.Admission.Gentility.UsageWorker do
       spool_bytes: 0,
       exporting?: false,
       dropped_rows: 0,
+      discarded_batches: 0,
       spool_load_error: false,
       last_error: :usage_unavailable
     }

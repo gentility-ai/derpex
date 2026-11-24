@@ -318,21 +318,25 @@ if config_env() == :prod do
           nil
 
         adapter_text ->
-          module_name =
-            if String.starts_with?(adapter_text, "Elixir."),
-              do: adapter_text,
-              else: "Elixir." <> adapter_text
+          adapter_module =
+            if adapter_text == "http" do
+              Derpex.Admission.Gentility.HTTP
+            else
+              module_name =
+                if String.starts_with?(adapter_text, "Elixir."),
+                  do: adapter_text,
+                  else: "Elixir." <> adapter_text
 
-          adapter =
-            try do
-              String.to_existing_atom(module_name)
-            rescue
-              ArgumentError ->
-                raise "DERPEX_GENTILITY_ADAPTER must name a module included in the release"
+              try do
+                String.to_existing_atom(module_name)
+              rescue
+                ArgumentError ->
+                  raise "DERPEX_GENTILITY_ADAPTER must be http or name a module included in the release"
+              end
             end
 
-          unless Code.ensure_loaded?(adapter) do
-            raise "DERPEX_GENTILITY_ADAPTER must name a module included in the release"
+          unless Code.ensure_loaded?(adapter_module) do
+            raise "DERPEX_GENTILITY_ADAPTER must be http or name a module included in the release"
           end
 
           verification_keys_text =
@@ -388,6 +392,83 @@ if config_env() == :prod do
               _invalid -> raise "DERPEX_GENTILITY_REGION_ID must be an unsigned 32-bit integer"
             end
 
+          # The HTTP adapter speaks to the Gentility app over HTTPS, naming
+          # this relay by its instance id and presenting its bearer.
+          adapter =
+            if adapter_module == Derpex.Admission.Gentility.HTTP do
+              url =
+                System.get_env("DERPEX_GENTILITY_URL") ||
+                  raise "DERPEX_GENTILITY_URL is required with DERPEX_GENTILITY_ADAPTER=http"
+
+              unless String.starts_with?(url, "https://") do
+                raise "DERPEX_GENTILITY_URL must be an https URL"
+              end
+
+              token =
+                System.get_env("DERPEX_GENTILITY_TOKEN") ||
+                  raise "DERPEX_GENTILITY_TOKEN is required with DERPEX_GENTILITY_ADAPTER=http"
+
+              case Derpex.Admission.Gentility.HTTP.config(
+                     url: url,
+                     token: token,
+                     instance_id: instance_id,
+                     region_id: region_id,
+                     tls_options: [versions: tls_versions]
+                   ) do
+                {:ok, options} ->
+                  {adapter_module, options}
+
+                {:error, :invalid_url} ->
+                  raise "DERPEX_GENTILITY_URL must be an https URL with no query"
+
+                {:error, :invalid_token} ->
+                  raise "DERPEX_GENTILITY_TOKEN must be at least 32 bytes of visible ASCII"
+
+                {:error, :invalid_instance_id} ->
+                  raise "DERPEX_GENTILITY_INSTANCE_ID must be 1 to 512 bytes of visible ASCII"
+              end
+            else
+              adapter_module
+            end
+
+          # Observe (0) makes and counts every decision and refuses nothing.
+          # Enforcement is the default, as it was before observe existed: an
+          # operator rolling out says ENFORCE=0 out loud.
+          enforce =
+            case System.get_env("DERPEX_GENTILITY_ENFORCE", "1") do
+              "1" -> true
+              "0" -> false
+              _invalid -> raise "DERPEX_GENTILITY_ENFORCE must be 0 or 1"
+            end
+
+          confinement =
+            case Derpex.Admission.Gentility.Confinement.parse(
+                   System.get_env("DERPEX_GENTILITY_CONFINED_SOURCES")
+                 ) do
+              {:ok, rules} ->
+                rules
+
+              {:error, {entry, reason}} ->
+                raise "DERPEX_GENTILITY_CONFINED_SOURCES has an invalid entry " <>
+                        "#{inspect(entry)}: #{reason}"
+            end
+
+          parse_lane_rate = fn name, default ->
+            case Derpex.Admission.Gentility.UnknownLane.parse_rate(System.get_env(name, default)) do
+              {:ok, rate} -> rate
+              {:error, :invalid_rate} -> raise "#{name} must be rate/burst, such as #{default}"
+            end
+          end
+
+          unknown_lane = [
+            max_concurrent_requests:
+              parse_bounded_integer.("DERPEX_GENTILITY_MAX_UNKNOWN_REQUESTS", 16, 1, 65_535),
+            rate: parse_lane_rate.("DERPEX_GENTILITY_UNKNOWN_RATE", "20/40"),
+            per_source_rate: parse_lane_rate.("DERPEX_GENTILITY_UNKNOWN_PER_SOURCE_RATE", "2/10"),
+            max_sources: max_tracked_ips,
+            ipv6_prefix: accept_ipv6_prefix
+          ]
+
           events =
             case System.get_env("DERPEX_GENTILITY_EVENTS", "1") do
               "1" -> [adapter: adapter]
@@ -437,6 +518,9 @@ if config_env() == :prod do
             max_future_skew_ms: max_future_skew_ms,
             max_byte_delay_ms: max_byte_delay_ms,
             cache_persist_ms: cache_persist_ms,
+            enforce: enforce,
+            confinement: confinement,
+            unknown_lane: unknown_lane,
             usage: [
               instance_id: instance_id,
               region_id: region_id,
