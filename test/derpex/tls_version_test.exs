@@ -49,7 +49,8 @@ defmodule Derpex.TLSVersionTest do
     assert length(String.split(runtime, "versions: tls_versions,")) - 1 == 2,
            "both TLS listener branches must take the configured floor"
 
-    assert length(String.split(runtime, "tls_options: [versions: tls_versions]")) - 1 == 3,
-           "every mesh peer shape must dial with the configured floor"
+    # Three mesh peer shapes, and the Gentility HTTP adapter.
+    assert length(String.split(runtime, "tls_options: [versions: tls_versions]")) - 1 == 4,
+           "every mesh peer shape and the Gentility adapter must dial with the configured floor"
   end
 end

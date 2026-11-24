@@ -5,6 +5,7 @@ defmodule Derpex.Admission.GentilityTest do
   alias Derpex.Admission.Gentility.Cache
   alias Derpex.Admission.Gentility.Closer
   alias Derpex.Admission.Gentility.Contract
+  alias Derpex.Admission.Gentility.HTTP
   alias Derpex.Admission.Gentility.Lease
   alias Derpex.Admission.Gentility.Revocation
   alias Derpex.Admission.Gentility.Signer
@@ -185,9 +186,9 @@ defmodule Derpex.Admission.GentilityTest do
     assert length(String.split(log, "authority unavailable")) == 2
 
     counts = Gentility.stats(controller).authorize_counts
-    assert counts[{:live, :ok}] == 1
-    assert counts[{:cached, :ok}] == 3
-    assert counts[{:denied, :no_cached_lease}] == 1
+    assert counts[{:live, :ok, :unknown}] == 1
+    assert counts[{:cached, :ok, :known}] == 3
+    assert counts[{:denied, :no_cached_lease, :unknown}] == 1
   end
 
   test "counts closed peers by cause and reports the nearest lease expiry" do
@@ -241,7 +242,34 @@ defmodule Derpex.Admission.GentilityTest do
     assert {:ok, _context} = Task.await(first)
 
     counts = Gentility.stats(controller).authorize_counts
-    assert counts[{:denied, :overloaded}] == 1
+    assert counts[{:denied, :overloaded, :unknown}] == 1
+  end
+
+  test "counts a lease issued beyond the clock-skew allowance as invalid_record" do
+    # The clock reads 1_000. A lease may be issued up to 30 s ahead of it.
+    ahead = fn by_ms ->
+      fn request ->
+        {:ok,
+         signed_lease(request.node_key,
+           issued_at_ms: 1_000 + by_ms,
+           expires_at_ms: 1_000 + by_ms + 1_000
+         )}
+      end
+    end
+
+    controller = start_controller(authority: ahead.(30_001), max_future_skew_ms: 30_000)
+    policy = Gentility.policy(controller)
+
+    assert {:error, _not_yet_valid} = Gentility.authorize(request(node_key(50)), policy)
+
+    counts = Gentility.stats(controller).authorize_counts
+    assert counts[{:denied, :invalid_record, :unknown}] == 1
+
+    stop_supervised!(Gentility)
+    controller = start_controller(authority: ahead.(30_000), max_future_skew_ms: 30_000)
+
+    assert {:ok, _context} =
+             Gentility.authorize(request(node_key(51)), Gentility.policy(controller))
   end
 
   test "exports fixed-cardinality admission metrics through operations" do
@@ -264,10 +292,21 @@ defmodule Derpex.Admission.GentilityTest do
 
     text = Derpex.Operations.prometheus()
 
-    assert text =~ ~s(derpex_gentility_authorize_total{outcome="live",reason="ok"} 1)
-    assert text =~ ~s(derpex_gentility_authorize_total{outcome="cached",reason="ok"} 0)
-    assert text =~ ~s(derpex_gentility_authorize_total{outcome="denied",reason="cache_full"} 0)
-    assert text =~ ~s(derpex_gentility_close_peer_total{cause="expiry"} 0)
+    assert text =~
+             ~s(derpex_gentility_authorize_total{outcome="live",reason="ok",lane="unknown"} 1)
+
+    assert text =~
+             ~s(derpex_gentility_authorize_total{outcome="cached",reason="ok",lane="known"} 0)
+
+    assert text =~
+             ~s(derpex_gentility_authorize_total{outcome="denied",reason="cache_full",lane="known"} 0)
+
+    assert text =~
+             ~s(derpex_gentility_authorize_total{outcome="would_deny",reason="confined_source",lane="unknown"} 0)
+
+    assert text =~ ~s(derpex_gentility_close_peer_total{cause="expiry",outcome="closed"} 0)
+    assert text =~ ~s(derpex_gentility_close_peer_total{cause="expiry",outcome="would_close"} 0)
+    assert text =~ "derpex_gentility_enforce 1"
     assert text =~ "derpex_gentility_nearest_lease_expiry_seconds 1"
     assert text =~ "derpex_gentility_cache_load_error 0"
     assert text =~ "derpex_gentility_cache_persist_error 0"
@@ -703,7 +742,7 @@ defmodule Derpex.Admission.GentilityTest do
     assert Gentility.stats(controller).cache_entries == 1
 
     counts = Gentility.stats(controller).authorize_counts
-    assert counts[{:denied, :wrong_region}] == 1
+    assert counts[{:denied, :wrong_region, :unknown}] == 1
   end
 
   @tag :tmp_dir
@@ -1943,6 +1982,36 @@ defmodule Derpex.Admission.GentilityTest do
 
     eventually(fn -> Gentility.stats(controller).usage.spool_batches == 0 end)
     assert Gentility.stats(controller).usage.aggregate_entries == 0
+  end
+
+  # A4: Gentility has no usage route, so the HTTP adapter acknowledges every
+  # batch as discarded. It leaves the spool, and the count says it went nowhere.
+  @tag :tmp_dir
+  test "a batch the exporter discards leaves the spool and is counted", %{tmp_dir: tmp_dir} do
+    node_key = node_key(22)
+
+    {:ok, http} =
+      HTTP.config(
+        url: "https://gentility.invalid",
+        token: String.duplicate("t", 32),
+        instance_id: "derpex-sin-1",
+        region_id: 17
+      )
+
+    start_controller(
+      name: Gentility,
+      authority: fn _request -> {:ok, signed_lease(node_key)} end,
+      usage: usage_options(tmp_dir, {HTTP, http})
+    )
+
+    policy = Gentility.policy(Gentility)
+    {:ok, context} = Gentility.authorize(request(node_key), policy)
+    assert Gentility.record_usage(context, 100, :accepted, policy) == :ok
+
+    Manual.advance(100)
+    eventually(fn -> Gentility.stats(Gentility).usage.discarded_batches == 1 end)
+    assert Gentility.stats(Gentility).usage.spool_batches == 0
+    assert Derpex.Operations.prometheus() =~ "derpex_gentility_usage_discarded_total 1"
   end
 
   @tag :tmp_dir

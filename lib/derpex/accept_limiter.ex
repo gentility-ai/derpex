@@ -130,7 +130,7 @@ defmodule Derpex.AcceptLimiter do
         {:reply, {:error, :ip_connection_limited}, count(state, :ip_connection_limited)}
 
       true ->
-        {reply, state} = claim_connection(state, tracking_key(source_ip, state.ipv6_prefix), pid)
+        {reply, state} = claim_connection(state, source_key(source_ip, state.ipv6_prefix), pid)
         {:reply, reply, state}
     end
   end
@@ -466,14 +466,20 @@ defmodule Derpex.AcceptLimiter do
 
   defp count(state, key), do: update_in(state.counters[key], &(&1 + 1))
 
-  defp tracking_key({_a, _b, _c, _d} = address, _prefix), do: address
+  @doc """
+  The allocation a source address belongs to, as every per-source limit keys
+  it: an IPv4 address itself, an IPv4-mapped IPv6 address as its IPv4
+  address, and any other IPv6 address as its `prefix`-bit network.
+  """
+  @spec source_key(:inet.ip_address(), 1..128) :: :inet.ip_address()
+  def source_key({_a, _b, _c, _d} = address, _prefix), do: address
 
-  defp tracking_key({0, 0, 0, 0, 0, 0xFFFF, high, low}, _prefix) do
+  def source_key({0, 0, 0, 0, 0, 0xFFFF, high, low}, _prefix) do
     <<a, b, c, d>> = <<high::16, low::16>>
     {a, b, c, d}
   end
 
-  defp tracking_key({a, b, c, d, e, f, g, h}, prefix) do
+  def source_key({a, b, c, d, e, f, g, h}, prefix) do
     <<network::bits-size(^prefix), _host::bits>> =
       <<a::16, b::16, c::16, d::16, e::16, f::16, g::16, h::16>>
 

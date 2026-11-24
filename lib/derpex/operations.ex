@@ -329,6 +329,7 @@ defmodule Derpex.Operations do
       shed_total: "derpex_gentility_usage_shed_total",
       exporting?: "derpex_gentility_usage_exporting",
       dropped_rows: "derpex_gentility_usage_dropped_rows",
+      discarded_batches: "derpex_gentility_usage_discarded_total",
       spool_load_error: "derpex_gentility_usage_spool_load_error"
     }
 
@@ -345,6 +346,8 @@ defmodule Derpex.Operations do
       active_nodes: "derpex_gentility_active_nodes",
       active_organizations: "derpex_gentility_active_organizations",
       active_requests: "derpex_gentility_active_requests",
+      active_unknown_requests: "derpex_gentility_active_unknown_requests",
+      enforce: "derpex_gentility_enforce",
       max_cache_entries: "derpex_gentility_max_cache_entries",
       max_revocations: "derpex_gentility_max_revocations",
       cache_full: "derpex_gentility_cache_full",
@@ -359,7 +362,10 @@ defmodule Derpex.Operations do
     metrics
     |> merge_values(values, names)
     |> merge_authorize_metrics(Map.get(values, :authorize_counts, %{}))
-    |> merge_close_peer_metrics(Map.get(values, :close_peer_counts, %{}))
+    |> merge_close_peer_metrics(
+      Map.get(values, :close_peer_counts, %{}),
+      Map.get(values, :would_close_counts, %{})
+    )
     |> merge_usage_metrics(usage)
   end
 
@@ -367,17 +373,23 @@ defmodule Derpex.Operations do
   # count is fixed and no node, organization, or source identity can reach a
   # label.
   defp merge_authorize_metrics(metrics, counts) do
-    Enum.reduce(Gentility.authorize_labels(), metrics, fn {outcome, reason} = label, metrics ->
-      name = ~s(derpex_gentility_authorize_total{outcome="#{outcome}",reason="#{reason}"})
+    Gentility.authorize_labels()
+    |> Enum.reduce(metrics, fn {outcome, reason, lane} = label, metrics ->
+      name =
+        ~s(derpex_gentility_authorize_total{outcome="#{outcome}",reason="#{reason}",lane="#{lane}"})
+
       Map.put(metrics, name, Map.get(counts, label, 0))
     end)
   end
 
-  defp merge_close_peer_metrics(metrics, counts) do
-    Enum.reduce(Gentility.close_peer_causes(), metrics, fn cause, metrics ->
-      name = ~s(derpex_gentility_close_peer_total{cause="#{cause}"})
-      Map.put(metrics, name, Map.get(counts, cause, 0))
-    end)
+  defp merge_close_peer_metrics(metrics, closed, would_close) do
+    for cause <- Gentility.close_peer_causes(),
+        {outcome, counts} <- [closed: closed, would_close: would_close],
+        reduce: metrics do
+      metrics ->
+        name = ~s(derpex_gentility_close_peer_total{cause="#{cause}",outcome="#{outcome}"})
+        Map.put(metrics, name, Map.get(counts, cause, 0))
+    end
   end
 
   defp merge_event_metrics(metrics) do

@@ -16,6 +16,38 @@ defmodule Derpex.Admission.Gentility do
   error tuple of any shape, a timeout, an exit, or an unrecognized term — is a
   failure of the control plane, never a denial, so admission falls back to the
   cached lease. A node with no unexpired cached lease is still rejected.
+
+  ## Lanes
+
+  A key holding a lease in this relay's cache takes the known lane, bounded by
+  `max_concurrent_requests`. With `unknown_lane` configured, any other key
+  takes the unknown lane: its own bound on calls in flight, a global token
+  bucket, and a bucket per source (`UnknownLane`). A flood of made-up keys
+  therefore fills only the unknown lane; a known node's connection and every
+  renewal never wait behind it. A call its lane cannot take is refused
+  `admission_overloaded`, counted under reason `overloaded`. Without `unknown_lane`, both kinds share the known
+  lane, as before v0.2.0, and are still counted by lane.
+
+  ## Confinement
+
+  `confinement` (see `Confinement`) refuses a new connection from a listed
+  source prefix whose lease is not of one of that prefix's owner kinds, with
+  `confined_source`, whether the lease came live or from the cache.
+
+  ## Observe
+
+  With `enforce: false` every decision is made and counted exactly as under
+  enforcement, but nothing is refused and nothing is closed. A refusal is
+  counted as outcome `would_deny`, under its reason and lane, and the
+  connection is admitted with an `observed` context that claims no budget and
+  records no usage. That includes `overloaded`: observe never
+  refuses, so a call its lane cannot take is admitted without asking
+  Gentility. A close — revocation, expiry, eviction, key rotation — is counted
+  in `close_peer_total` as outcome `would_close` and the connection is kept;
+  a connection over a revised connection limit is kept; and a node over its
+  byte budget is paced at the cap rather than closed. Leases and revocations
+  are still installed and dropped as under enforcement, so the counts are the
+  ones enforcement would produce.
   """
 
   use GenServer
@@ -29,9 +61,11 @@ defmodule Derpex.Admission.Gentility do
   alias Derpex.Admission.Gentility.Cache
   alias Derpex.Admission.Gentility.CacheWriter
   alias Derpex.Admission.Gentility.Closer
+  alias Derpex.Admission.Gentility.Confinement
   alias Derpex.Admission.Gentility.Contract
   alias Derpex.Admission.Gentility.Lease
   alias Derpex.Admission.Gentility.Revocation
+  alias Derpex.Admission.Gentility.UnknownLane
   alias Derpex.Admission.Gentility.Usage
   alias Derpex.Admission.Gentility.UsageWorker
   alias Derpex.Admission.Request
@@ -60,11 +94,15 @@ defmodule Derpex.Admission.Gentility do
     :stale_lease,
     :wrong_region,
     :invalid_record,
+    :confined_source,
+    :connection_limit,
     :overloaded,
     :unavailable,
     :other
   ]
+  @lanes [:known, :unknown]
   @close_peer_causes [:expiry, :revocation, :eviction, :key_rotation]
+  @close_peer_outcomes [:closed, :would_close]
   @cache_write_timeout_ms 1_500
   @budget_prune_chunk 1_000
   @reverify_chunk 1_000
@@ -81,7 +119,10 @@ defmodule Derpex.Admission.Gentility do
       :byte_budgets,
       :clock,
       :max_byte_delay_ms,
-      :usage
+      :usage,
+      :enforce,
+      :cache_table,
+      :unknown_lane
     ]
     defstruct @enforce_keys
 
@@ -95,14 +136,20 @@ defmodule Derpex.Admission.Gentility do
             byte_budgets: :ets.tid(),
             clock: module(),
             max_byte_delay_ms: pos_integer(),
-            usage: nil | map()
+            usage: nil | map(),
+            enforce: boolean(),
+            cache_table: :ets.tid(),
+            unknown_lane: nil | %{gate: :atomics.atomics_ref(), max: pos_integer(), server: pid()}
           }
   end
 
-  @overloaded_counter 1
-  @unavailable_counter 2
+  # Caller-side counts, by lane: a shed or an unreachable controller is counted
+  # by the connection process itself, with no message to anyone.
+  @overloaded_counter %{known: 1, unknown: 5}
+  @unavailable_counter %{known: 2, unknown: 6}
   @usage_shed_counter 3
   @pacing_capped_counter 4
+  @counter_slots 6
 
   @type authority ::
           module() | {module(), term()} | (Request.t() -> {:ok, binary()} | {:error, term()})
@@ -121,17 +168,19 @@ defmodule Derpex.Admission.Gentility do
 
   @impl Derpex.Admission
   def authorize(%Request{} = request, %Policy{} = policy) do
-    case reserve(policy.gate, policy.max_concurrent_requests) do
-      :ok ->
+    lane = lane(policy, request.node_key)
+
+    case enter_lane(policy, lane, request.source_ip) do
+      {:ok, gate} ->
         try do
-          authorize_reserved(request, policy)
+          authorize_reserved(request, lane, policy)
         after
-          :atomics.sub(policy.gate, 1, 1)
+          :atomics.sub(gate, 1, 1)
         end
 
       {:error, :admission_overloaded} = shed ->
-        :atomics.add(policy.counters, @overloaded_counter, 1)
-        shed
+        :atomics.add(policy.counters, Map.fetch!(@overloaded_counter, lane), 1)
+        observe(shed, policy)
     end
   end
 
@@ -142,9 +191,15 @@ defmodule Derpex.Admission.Gentility do
   end
 
   @impl Derpex.Admission
+  def claim(%Request{}, %{observed: _reason} = context, connection, %Policy{})
+      when is_pid(connection),
+      do: {:ok, context}
+
   def claim(%Request{} = request, context, connection, %Policy{} = policy)
       when is_map(context) and is_pid(connection) do
-    controller_call(policy.server, {:claim, request.node_key, context, connection})
+    policy.server
+    |> controller_call({:claim, request.node_key, context, connection})
+    |> observe(policy)
   end
 
   def claim(%Request{} = request, context, connection, server) do
@@ -165,6 +220,9 @@ defmodule Derpex.Admission.Gentility do
   end
 
   @impl Derpex.Admission
+  def reserve_bytes(%{observed: _reason}, bytes, %Policy{}) when is_integer(bytes) and bytes >= 0,
+    do: {:ok, 0}
+
   def reserve_bytes(%{gentility: gentility}, bytes, %Policy{} = policy)
       when is_integer(bytes) and bytes >= 0 do
     now = policy.clock.monotonic_time(:microsecond)
@@ -187,7 +245,8 @@ defmodule Derpex.Admission.Gentility do
       # quiet ones it shares an organization with. Pacing is capped so a paced
       # connection stays responsive; the untaken debt keeps pacing the next
       # reservation.
-      if node_delay <= maximum_delay do
+      # Observe closes nothing: a node past its own debt is paced at the cap.
+      if node_delay <= maximum_delay or not policy.enforce do
         {:ok, paced_delay(policy, max(node_delay, organization_delay), maximum_delay)}
       else
         {:error, :byte_budget_exhausted}
@@ -205,6 +264,7 @@ defmodule Derpex.Admission.Gentility do
 
   @impl Derpex.Admission
   def record_usage(_context, _bytes, _outcome, %Policy{usage: nil}), do: :ok
+  def record_usage(%{observed: _reason}, _bytes, _outcome, %Policy{}), do: :ok
 
   def record_usage(%{gentility: gentility}, bytes, outcome, %Policy{} = policy)
       when is_integer(bytes) and bytes >= 0 and outcome in [:accepted, :dropped] do
@@ -276,8 +336,8 @@ defmodule Derpex.Admission.Gentility do
 
       refs ->
         %{
-          authorize_overloaded_total: :atomics.get(refs.counters, @overloaded_counter),
-          authorize_unavailable_total: :atomics.get(refs.counters, @unavailable_counter),
+          authorize_overloaded_total: lane_total(refs.counters, @overloaded_counter),
+          authorize_unavailable_total: lane_total(refs.counters, @unavailable_counter),
           usage_shed_total: :atomics.get(refs.counters, @usage_shed_counter),
           byte_pacing_capped_total: :atomics.get(refs.counters, @pacing_capped_counter),
           close_peer_failures: :atomics.get(refs.close_failures, 1)
@@ -328,6 +388,8 @@ defmodule Derpex.Admission.Gentility do
       active_nodes: map_size(state.node_claims),
       active_organizations: map_size(state.organization_claims),
       active_requests: :atomics.get(state.policy.gate, 1),
+      active_unknown_requests: unknown_requests(state.policy),
+      enforce: state.policy.enforce,
       max_cache_entries: state.max_cache_entries,
       max_revocations: state.max_revocations,
       cache_full: state.cache_full,
@@ -336,6 +398,7 @@ defmodule Derpex.Admission.Gentility do
       renewals_in_flight: map_size(state.renewals),
       authorize_counts: caller_counts(state, state.authorize_counts),
       close_peer_counts: state.close_peer_counts,
+      would_close_counts: state.would_close_counts,
       nearest_lease_expiry_seconds: nearest_lease_expiry_seconds(state),
       usage_shed_total: :atomics.get(state.policy.counters, @usage_shed_counter),
       close_peer_failures: :atomics.get(state.close_failures, 1),
@@ -353,23 +416,29 @@ defmodule Derpex.Admission.Gentility do
     {:reply, {reply, state.usage}, state}
   end
 
-  def handle_call({:accept_live, node_key, wire}, _from, state) do
+  def handle_call({:accept_live, node_key, wire, call}, _from, state) do
     state = purge_expired(state)
 
     case Contract.record_type(wire) do
-      {:ok, :lease} -> counted(accept_live_lease(state, node_key, wire))
-      {:ok, :revocation} -> counted(accept_live_denial(state, node_key, wire))
-      {:error, _reason} = error -> counted({:reply, error, state})
+      {:ok, :lease} -> decided(accept_live_lease(state, node_key, wire), call)
+      {:ok, :revocation} -> decided(accept_live_denial(state, node_key, wire), call)
+      {:error, _reason} = error -> decided({:reply, error, state}, call)
     end
   end
 
-  def handle_call({:cached, node_key}, _from, state) do
-    state |> purge_expired() |> cached_decision(node_key) |> counted()
+  def handle_call({:cached, node_key, call}, _from, state) do
+    state |> purge_expired() |> cached_decision(node_key) |> decided(call)
   end
 
+  # A claim follows an admission, so the key holds a cached lease by now: a
+  # refused claim is counted in the known lane.
   def handle_call({:claim, node_key, context, connection}, _from, state) do
     state = purge_expired(state)
-    claim_connection(state, node_key, context, connection)
+
+    case claim_connection(state, node_key, context, connection) do
+      {:reply, {:ok, _context}, _state} = claimed -> claimed
+      refused -> counted(refused, :known)
+    end
   end
 
   def handle_call({:release, connection}, _from, state) do
@@ -498,6 +567,7 @@ defmodule Derpex.Admission.Gentility do
   def handle_info({:EXIT, pid, reason}, state) do
     cond do
       state.usage && state.usage.server == pid -> {:stop, reason, state}
+      unknown_lane_server?(state.policy, pid) -> {:stop, reason, state}
       state.cache_writer == pid -> restart_cache_writer(state, reason)
       state.closer == pid -> restart_closer(state, reason)
       true -> unexpected_exit(state, pid, reason)
@@ -513,6 +583,7 @@ defmodule Derpex.Admission.Gentility do
     UsageWorker.stop(state.usage)
     CacheWriter.stop(state.cache_writer)
     Closer.stop(state.closer)
+    stop_unknown_lane(state.policy.unknown_lane)
     :ok
   end
 
@@ -520,7 +591,10 @@ defmodule Derpex.Admission.Gentility do
     authority = Keyword.fetch!(options, :authority)
     server = Keyword.get(options, :server) || self()
     gate = :atomics.new(1, signed: false)
-    counters = :atomics.new(4, signed: false)
+    counters = :atomics.new(@counter_slots, signed: false)
+    enforce = Keyword.get(options, :enforce, true)
+
+    unless is_boolean(enforce), do: raise(ArgumentError, "enforce must be a boolean")
 
     max_concurrent_requests =
       positive_option!(options, :max_concurrent_requests, @default_max_concurrent_requests)
@@ -548,6 +622,9 @@ defmodule Derpex.Admission.Gentility do
     verification_keys = Keyword.fetch!(options, :verification_keys)
     region_id = region_option!(options)
     clock = Keyword.get(options, :clock, Clock)
+    confinement = Keyword.get(options, :confinement, [])
+
+    unless is_list(confinement), do: raise(ArgumentError, "confinement must be a list of rules")
 
     cache_path = Keyword.get(options, :cache_path)
 
@@ -559,7 +636,8 @@ defmodule Derpex.Admission.Gentility do
     with :ok <- validate_verification_keys(verification_keys),
          {:ok, cache_writer} <- initial_cache_writer(cache_path, cache_table),
          {:ok, closer} <- Closer.start_link(close_peer: close_peer, failures: close_failures),
-         {:ok, usage} <- initial_usage(Keyword.get(options, :usage), clock) do
+         {:ok, usage} <- initial_usage(Keyword.get(options, :usage), clock),
+         {:ok, unknown_lane} <- initial_unknown_lane(Keyword.get(options, :unknown_lane), clock) do
       budgets = Budgets.new()
 
       policy = %Policy{
@@ -572,7 +650,10 @@ defmodule Derpex.Admission.Gentility do
         byte_budgets: Budgets.table(budgets),
         clock: clock,
         max_byte_delay_ms: max_byte_delay_ms,
-        usage: usage_policy(usage)
+        usage: usage_policy(usage),
+        enforce: enforce,
+        cache_table: cache_table,
+        unknown_lane: unknown_lane
       }
 
       {:ok,
@@ -585,6 +666,7 @@ defmodule Derpex.Admission.Gentility do
          max_lease_ms: max_lease_ms,
          max_future_skew_ms: max_future_skew_ms,
          region_id: region_id,
+         confinement: confinement,
          clock: clock,
          close_peer: close_peer,
          closer: closer,
@@ -623,6 +705,7 @@ defmodule Derpex.Admission.Gentility do
          expiry_jitter: expiry_jitter,
          authorize_counts: %{},
          close_peer_counts: %{},
+         would_close_counts: %{},
          log_interval_ms: log_interval_ms,
          log_at: %{},
          closing_connections: MapSet.new(),
@@ -639,25 +722,73 @@ defmodule Derpex.Admission.Gentility do
     end
   end
 
-  defp authorize_reserved(request, policy) do
+  # The source travels to the controller for confinement and goes no further:
+  # it is never handed to the authority, and never logged or labelled.
+  defp authorize_reserved(request, lane, policy) do
+    call = %{source: request.source_ip, lane: lane}
+
     case invoke_with_timeout(policy.authority, request, policy.authority_timeout) do
       {:ok, {:ok, wire}} when is_binary(wire) ->
-        controller_call(policy.server, {:accept_live, request.node_key, wire}, policy)
+        controller_call(policy.server, {:accept_live, request.node_key, wire, call}, policy, lane)
 
       _authority_failed ->
-        controller_call(policy.server, {:cached, request.node_key}, policy)
+        controller_call(policy.server, {:cached, request.node_key, call}, policy, lane)
     end
   end
 
+  # A key is known while this relay's cache holds a lease for it. Expired leases
+  # leave the cache as they expire, so membership is the lane's whole test, and
+  # it is a lock-free read.
+  defp lane(policy, node_key) do
+    if :ets.member(policy.cache_table, {:lease, node_key}), do: :known, else: :unknown
+  end
+
+  defp enter_lane(%Policy{unknown_lane: %{} = unknown}, :unknown, source) do
+    with :ok <- reserve(unknown.gate, unknown.max) do
+      case UnknownLane.take(unknown.server, source) do
+        :ok ->
+          {:ok, unknown.gate}
+
+        {:error, :admission_overloaded} = shed ->
+          :atomics.sub(unknown.gate, 1, 1)
+          shed
+      end
+    end
+  end
+
+  defp enter_lane(policy, _lane, _source) do
+    with :ok <- reserve(policy.gate, policy.max_concurrent_requests), do: {:ok, policy.gate}
+  end
+
+  # Observe never refuses: whatever would have been refused is admitted with a
+  # context that names why, by its metric reason, and claims nothing.
+  defp observe({:error, reason}, %Policy{enforce: false}),
+    do: {:ok, %{observed: denial_reason(reason)}}
+
+  defp observe(result, _policy), do: result
+
   @doc false
-  @spec authorize_labels() :: [{atom(), atom()}]
+  @spec authorize_labels() :: [{atom(), atom(), atom()}]
   def authorize_labels do
-    [{:live, :ok}, {:cached, :ok}] ++ Enum.map(@denial_reasons, &{:denied, &1})
+    for lane <- @lanes,
+        label <-
+          [{:live, :ok}, {:cached, :ok}] ++
+            for(
+              outcome <- [:denied, :would_deny],
+              reason <- @denial_reasons,
+              do: {outcome, reason}
+            ) do
+      {elem(label, 0), elem(label, 1), lane}
+    end
   end
 
   @doc false
   @spec close_peer_causes() :: [atom()]
   def close_peer_causes, do: @close_peer_causes
+
+  @doc false
+  @spec close_peer_outcomes() :: [atom()]
+  def close_peer_outcomes, do: @close_peer_outcomes
 
   defp invoke_with_timeout(authority, request, timeout) do
     parent = self()
@@ -695,11 +826,11 @@ defmodule Derpex.Admission.Gentility do
     :exit, _reason -> {:error, :admission_unavailable}
   end
 
-  defp controller_call(server, message, %Policy{} = policy) do
+  defp controller_call(server, message, %Policy{} = policy, lane) do
     case controller_call(server, message) do
       {:error, :admission_unavailable} = unavailable ->
-        :atomics.add(policy.counters, @unavailable_counter, 1)
-        unavailable
+        :atomics.add(policy.counters, Map.fetch!(@unavailable_counter, lane), 1)
+        observe(unavailable, policy)
 
       result ->
         result
@@ -754,11 +885,34 @@ defmodule Derpex.Admission.Gentility do
     end
   end
 
+  # A lease admits only after confinement has had its say, live or cached.
+  defp decided({:reply, reply, state}, call) do
+    {:reply, confine(reply, call.source, state.confinement), state}
+    |> counted(call.lane)
+  end
+
+  defp confine({:ok, %{gentility: %{owner_kind: owner_kind}}} = admitted, source, rules) do
+    case Confinement.check(rules, source, owner_kind) do
+      :ok -> admitted
+      {:error, :confined_source} = refused -> refused
+    end
+  end
+
+  defp confine(reply, _source, _rules), do: reply
+
   # Every authorization the controller answers is counted under a fixed label
-  # set, so the outcome mix is visible without a per-node series.
-  defp counted({:reply, reply, state}) do
+  # set, so the outcome mix is visible without a per-node series. Under observe
+  # a refusal is counted as `would_deny` and answered with an observed context.
+  defp counted({:reply, reply, state}, lane) do
     {outcome, reason} = authorize_label(reply)
-    {:reply, reply, count_authorize(state, outcome, reason)}
+
+    {outcome, reply} =
+      case {outcome, state.policy.enforce} do
+        {:denied, false} -> {:would_deny, observe(reply, state.policy)}
+        _admitted_or_enforced -> {outcome, reply}
+      end
+
+    {:reply, reply, count_authorize(state, outcome, reason, lane)}
   end
 
   defp authorize_label({:ok, %{gentility: %{source: :live}}}), do: {:live, :ok}
@@ -766,9 +920,11 @@ defmodule Derpex.Admission.Gentility do
   defp authorize_label({:error, reason}), do: {:denied, denial_reason(reason)}
 
   defp denial_reason(reason) when reason in @denial_reasons, do: reason
+  defp denial_reason(:admission_overloaded), do: :overloaded
   defp denial_reason(:admission_unavailable), do: :unavailable
   defp denial_reason(:lease_not_cached), do: :no_cached_lease
-  defp denial_reason(:admission_overloaded), do: :overloaded
+  defp denial_reason(:node_connection_limit), do: :connection_limit
+  defp denial_reason(:organization_connection_limit), do: :connection_limit
   defp denial_reason(reason) when is_atom(reason), do: record_reason(reason)
   defp denial_reason({:unknown_signing_key, _key_id}), do: :invalid_record
   defp denial_reason({:invalid_signing_key, _key_id}), do: :invalid_record
@@ -782,8 +938,8 @@ defmodule Derpex.Admission.Gentility do
       else: :other
   end
 
-  defp count_authorize(state, outcome, reason) do
-    counts = Map.update(state.authorize_counts, {outcome, reason}, 1, &(&1 + 1))
+  defp count_authorize(state, outcome, reason, lane) do
+    counts = Map.update(state.authorize_counts, {outcome, reason, lane}, 1, &(&1 + 1))
     %{state | authorize_counts: counts}
   end
 
@@ -1396,6 +1552,9 @@ defmodule Derpex.Admission.Gentility do
 
   # Only the two identities a revised lease names can have gone over their
   # allocation, so enforcement never walks the whole cache.
+  defp enforce_revised_budgets(%{policy: %{enforce: false}} = state, _node_key, _organization),
+    do: state
+
   defp enforce_revised_budgets(state, node_key, organization_id) do
     state
     |> over_limit_connections(node_key, organization_id)
@@ -2092,6 +2251,12 @@ defmodule Derpex.Admission.Gentility do
   # behind thousands of router calls.
   defp close_peers(state, [], _cause), do: state
 
+  # Observe closes nothing: the close is counted, and the connection kept.
+  defp close_peers(%{policy: %{enforce: false}} = state, keys, cause) do
+    counts = Map.update(state.would_close_counts, cause, length(keys), &(&1 + length(keys)))
+    %{state | would_close_counts: counts}
+  end
+
   defp close_peers(state, [key], cause) do
     state
     |> close_peer(key, cause)
@@ -2216,9 +2381,56 @@ defmodule Derpex.Admission.Gentility do
   # The two shedding outcomes are counted lock-free by the connection process
   # itself, so an overloaded relay does not pay a message to say so.
   defp caller_counts(state, counts) do
-    counts
-    |> put_caller_count({:denied, :overloaded}, state.policy.counters, @overloaded_counter)
-    |> put_caller_count({:denied, :unavailable}, state.policy.counters, @unavailable_counter)
+    outcome = if state.policy.enforce, do: :denied, else: :would_deny
+
+    Enum.reduce(@lanes, counts, fn lane, counts ->
+      counts
+      |> put_caller_count(
+        {outcome, :overloaded, lane},
+        state.policy.counters,
+        Map.fetch!(@overloaded_counter, lane)
+      )
+      |> put_caller_count(
+        {outcome, :unavailable, lane},
+        state.policy.counters,
+        Map.fetch!(@unavailable_counter, lane)
+      )
+    end)
+  end
+
+  defp lane_total(counters, indexes) do
+    indexes |> Map.values() |> Enum.map(&:atomics.get(counters, &1)) |> Enum.sum()
+  end
+
+  defp unknown_requests(%Policy{unknown_lane: nil}), do: 0
+  defp unknown_requests(%Policy{unknown_lane: unknown}), do: :atomics.get(unknown.gate, 1)
+
+  defp unknown_lane_server?(%Policy{unknown_lane: %{server: server}}, pid), do: server == pid
+  defp unknown_lane_server?(_policy, _pid), do: false
+
+  defp initial_unknown_lane(nil, _clock), do: {:ok, nil}
+
+  defp initial_unknown_lane(options, clock) when is_list(options) do
+    max = positive_option!(options, :max_concurrent_requests, 16)
+
+    lane_options =
+      options
+      |> Keyword.take([:rate, :per_source_rate, :max_sources, :ipv6_prefix])
+      |> Keyword.put(:clock, clock)
+
+    with {:ok, server} <- UnknownLane.start_link(lane_options) do
+      {:ok, %{gate: :atomics.new(1, signed: false), max: max, server: server}}
+    end
+  end
+
+  defp initial_unknown_lane(_options, _clock), do: {:error, :invalid_unknown_lane}
+
+  defp stop_unknown_lane(nil), do: :ok
+
+  defp stop_unknown_lane(%{server: server}) do
+    GenServer.stop(server, :shutdown, 1_500)
+  catch
+    :exit, _reason -> :ok
   end
 
   defp put_caller_count(counts, key, counters, index) do
