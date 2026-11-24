@@ -10,8 +10,8 @@ defmodule Derpex.Admission.Gentility.Confinement do
 
   A connection whose source lies in a listed prefix is admitted only if its
   lease's owner kind equals one of that prefix's kinds. The compare is of the
-  whole string: `computer@ryzen` matches neither `computer@ryz` nor
-  `computer@ryzen2`, and a kind is never split. A source in several listed
+  whole string: `computer@host1` matches neither `computer@host` nor
+  `computer@host12`, and a kind is never split. A source in several listed
   prefixes must match the kinds of each. Any other source is unaffected.
   A refusal is `confined_source`.
 

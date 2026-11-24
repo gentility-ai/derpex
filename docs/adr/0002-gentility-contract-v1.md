@@ -259,18 +259,9 @@ known lane. Renewals were never in the unknown lane.
 reconnecting at once, or above 10 computers behind one address. Below both,
 every node is admitted on its first try. Computers on one host share its
 address, so the second binds on a host running more than 10 computers; its
-computers are then all in within (C − 10) / 2 seconds. Those computers also
-share one bucket, so one guest that floods the relay with made-up keys can
-hold it empty, and another computer's first connect on that host waits behind
-it. A computer that holds a cached lease takes the known lane and never waits
-behind the flood.
-
-Gentility's computer hosts are designed to limit this in front of the relay
-(D3, gentility-core #1325); this relay does not depend on it. In that design
-jobs cannot reach the relay, and a guest with root is held to 3 new
-connections at once, then one every 10 s, keyed by its own address. With up to
-10 guests a host that is 1 a second in total, under the bucket's 2. If this
-lane's per-source rate or burst changes, that limit is re-sized with it.
+computers are then all in within (C − 10) / 2 seconds. Computers on one host
+share a bucket. A computer that holds a cached lease takes the known lane and
+does not wait in it.
 
 **Telling a cold start from a flood.** Both show the unknown lane shedding
 `authorize_total{lane="unknown",reason="overloaded"}`. The answers the lane

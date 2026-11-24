@@ -1,6 +1,5 @@
 defmodule Derpex.Admission.GentilityPlaneTest do
-  # D1, D2, D3 and D6 of the DERP admission design (T-642 closure 1):
-  # confinement, the observe switch, and the two lanes, through the controller.
+  # Confinement, the observe switch, and the two lanes, through the controller.
   use ExUnit.Case, async: false
 
   alias Derpex.Admission.Gentility
@@ -26,7 +25,7 @@ defmodule Derpex.Admission.GentilityPlaneTest do
     :ok
   end
 
-  describe "D1: a confined source refuses any other kind, live and cached" do
+  describe "a confined source refuses any other kind, live and cached" do
     test "a machine lease, including a platform organization's, is refused from the host" do
       {:ok, answer} = Agent.start_link(fn -> :lease end)
 
@@ -38,7 +37,7 @@ defmodule Derpex.Admission.GentilityPlaneTest do
               :down -> {:error, :unavailable}
             end
           end,
-          confinement: confined("computer@ryzen|platform")
+          confinement: confined("computer@host1|platform")
         )
 
       policy = Gentility.policy(controller)
@@ -65,7 +64,7 @@ defmodule Derpex.Admission.GentilityPlaneTest do
     end
   end
 
-  describe "D2: confinement admits the listed kinds and nothing else changes" do
+  describe "confinement admits the listed kinds and nothing else changes" do
     test "listed kinds pass from the host; near-miss kinds do not; other sources see no rule" do
       {:ok, kinds} = Agent.start_link(fn -> %{} end)
 
@@ -74,16 +73,16 @@ defmodule Derpex.Admission.GentilityPlaneTest do
           authority: fn request ->
             {:ok, lease(request.node_key, Agent.get(kinds, &Map.fetch!(&1, request.node_key)))}
           end,
-          confinement: confined("computer@ryzen|platform")
+          confinement: confined("computer@host1|platform")
         )
 
       policy = Gentility.policy(controller)
 
       for {byte, kind, from_host} <- [
-            {10, "computer@ryzen", :admitted},
+            {10, "computer@host1", :admitted},
             {11, "platform", :admitted},
-            {12, "computer@ryz", :refused},
-            {13, "computer@ryzen2", :refused},
+            {12, "computer@host", :refused},
+            {13, "computer@host12", :refused},
             {14, "machine", :refused},
             {15, "user", :refused}
           ] do
@@ -114,7 +113,7 @@ defmodule Derpex.Admission.GentilityPlaneTest do
     end
   end
 
-  describe "D3: observe counts and keeps; enforce refuses and closes" do
+  describe "observe counts and keeps; enforce refuses and closes" do
     test "a denial: enforce refuses it, observe admits it observed and counts would_deny" do
       for enforce <- [true, false] do
         controller =
@@ -318,7 +317,7 @@ defmodule Derpex.Admission.GentilityPlaneTest do
       end
     end
 
-    # The AM's item 1: observe must never refuse, overload included.
+    # Observe must never refuse, overload included.
     test "an overloaded lane: enforce refuses, observe admits without asking and counts it" do
       for enforce <- [true, false] do
         parent = self()
@@ -360,7 +359,7 @@ defmodule Derpex.Admission.GentilityPlaneTest do
     end
   end
 
-  describe "D6: made-up keys fill only the unknown lane" do
+  describe "made-up keys fill only the unknown lane" do
     test "a flood from many sources is shed and counted by lane; a known node still connects" do
       known = node_key(30)
 
@@ -506,8 +505,7 @@ defmodule Derpex.Admission.GentilityPlaneTest do
                {:error, :admission_overloaded}
     end
 
-    # The AM's item 2: a relay back with an empty cache sees every node as
-    # unknown, and admits them at the unknown lane's rate.
+    # A relay back with an empty cache sees every node as unknown, and admits them at the unknown lane's rate.
     test "a cold relay admits the fleet at the lane's rate, then every node is known" do
       {:ok, answered} = Agent.start_link(fn -> 0 end)
 
@@ -560,7 +558,7 @@ defmodule Derpex.Admission.GentilityPlaneTest do
     test "a cold relay admits ten computers behind one address at once, the rest at 2/s" do
       controller =
         start_controller(
-          authority: fn request -> {:ok, lease(request.node_key, "computer@ryzen")} end,
+          authority: fn request -> {:ok, lease(request.node_key, "computer@host1")} end,
           unknown_lane: lane(rate: {20, 40}, per_source_rate: {2, 10})
         )
 

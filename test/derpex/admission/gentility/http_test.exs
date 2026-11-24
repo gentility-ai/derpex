@@ -1,6 +1,6 @@
 defmodule Derpex.Admission.Gentility.HTTPTest do
-  # D4 and D5 of the DERP admission design (T-642 closure 1): the HTTP adapter
-  # against a fake Gentility app, and records Gentility signed verifying here.
+  # The HTTP adapter against a fake Gentility app, and records Gentility signed
+  # verifying here.
   use ExUnit.Case, async: false
 
   alias Derpex.Admission.Gentility
@@ -44,7 +44,7 @@ defmodule Derpex.Admission.Gentility.HTTPTest do
     {:ok, listener: listener, port: port, options: options}
   end
 
-  describe "D4: authorize" do
+  describe "authorize" do
     test "a 200 lease is the record; the call names the relay and sends no source", context do
       lease = signed_lease(node_key(1))
       server = serve(context.listener, [{200, [], lease}])
@@ -119,14 +119,14 @@ defmodule Derpex.Admission.Gentility.HTTPTest do
 
       assert Gentility.authorize(request(node_key(5)), policy) == {:error, :no_cached_lease}
 
-      assert {:ok, %{gentility: %{source: :live, owner_kind: "computer@ryzen"}}} =
+      assert {:ok, %{gentility: %{source: :live, owner_kind: "computer@host1"}}} =
                Gentility.authorize(request(node_key(5)), policy)
 
       Task.await(server)
     end
   end
 
-  describe "D4: the revocation stream" do
+  describe "the revocation stream" do
     test "a 200 revocation and a 204 each carry the next cursor", context do
       revocation = signed_revocation(node_key(6), 10)
 
@@ -176,7 +176,7 @@ defmodule Derpex.Admission.Gentility.HTTPTest do
     end
   end
 
-  describe "D4: reconcile" do
+  describe "reconcile" do
     test "pages until the empty page with no cursor", context do
       first = signed_revocation(node_key(8), 10)
       second = signed_revocation(node_key(9), 11)
@@ -220,7 +220,7 @@ defmodule Derpex.Admission.Gentility.HTTPTest do
     end
   end
 
-  describe "D4: usage and settings" do
+  describe "usage and settings" do
     test "usage is acknowledged as discarded, and sends nothing", context do
       assert HTTP.export_usage(:binary.copy(<<0>>, 32), "batch", context.options) ==
                {:ok, :discarded}
@@ -253,13 +253,13 @@ defmodule Derpex.Admission.Gentility.HTTPTest do
     end
   end
 
-  describe "D5: records Gentility signed" do
+  describe "records Gentility signed" do
     # These are the bytes `Gentility.Overlay.DerpContract` produces for the
     # fields below, under key id "gentility-test" and the seed 0x10 x 32 that
     # `ContractTest` uses. They were generated with this repository's
     # independent test encoder (`Signer`); Gentility's own test checks it
     # produces the same hex, so the two sides cannot drift apart unnoticed.
-    @phoenix_lease "4458414c0001000e67656e74696c6974792d746573740101010101010101010101010101010101010101010101010101010101010101002430313961303030302d303030302d373030302d383030302d303030303030303030303031002430313961303030302d303030302d373030302d383030302d303030303030303030303032000e636f6d70757465724072797a656e000773746167696e6700000384000644594164224000000000000000010000019ab697e87b0000019ab6a1103b0000000800000400000000000000000000000000000000000000000000000000000000000000000022811db62b42b9a9e9f425b4211d36fe10f1bae81f61881d6f01590e67bc032ac16cc8226210a42c78441794b68b3c7d550cb81a71c05f6610760ca637db740e"
+    @phoenix_lease "4458414c0001000e67656e74696c6974792d746573740101010101010101010101010101010101010101010101010101010101010101002430313961303030302d303030302d373030302d383030302d303030303030303030303031002430313961303030302d303030302d373030302d383030302d303030303030303030303032000e636f6d707574657240686f737431000773746167696e6700000384000644594164224000000000000000010000019ab697e87b0000019ab6a1103b0000000800000400000000000000000000000000000000000000000000000000000000000000000083e3ac0582460c67b8e49146f4654ec59b06f3665d81b665a24083acb665972ea9de92a609b5e8f5f3f7ed4fd4b7e09591922c3fff79521cb6425a51016f1a0e"
     @phoenix_revocation "445852560001000e67656e74696c6974792d74657374020202020202020202020202020202020202020202020202020202020202020200064459416c3bf10000019ab69c7e6e000b6b65795f726f74617465642a47896dc41dce98ddeac35fce4f307d977167e46c59f91da4239c6024a59fbb5cf426770f9452a31374e667efaa49649bce216f9e7037b7e7ddc3ca46acdd01"
 
     test "a lease Gentility signed verifies field for field" do
@@ -273,7 +273,7 @@ defmodule Derpex.Admission.Gentility.HTTPTest do
                node_key: :binary.copy(<<0x01>>, 32),
                node_id: "019a0000-0000-7000-8000-000000000001",
                organization_id: "019a0000-0000-7000-8000-000000000002",
-               owner_kind: "computer@ryzen",
+               owner_kind: "computer@host1",
                deployment_id: "staging",
                region_id: 900,
                policy_revision: 1_764_000_000_123_456,
@@ -395,7 +395,7 @@ defmodule Derpex.Admission.Gentility.HTTPTest do
       node_key: node_key,
       node_id: "node_01",
       organization_id: "org_01",
-      owner_kind: "computer@ryzen",
+      owner_kind: "computer@host1",
       deployment_id: "staging",
       region_id: 900,
       policy_revision: 9,

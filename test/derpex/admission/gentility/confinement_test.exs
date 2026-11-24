@@ -23,7 +23,7 @@ defmodule Derpex.Admission.Gentility.ConfinementTest do
                Confinement.parse("10.0.0.0/8=platform|machine|user|runtime|computer@r-1")
     end
 
-    # The AM's item 3: one refused shape per test case, and the bound accepted.
+    # One refused shape per test case, and the bound accepted.
     test "a runner id of 1 to 55 lowercase letters, digits and hyphens is accepted" do
       id = String.duplicate("a", 54) <> "9"
       assert byte_size(id) == 55
@@ -33,7 +33,7 @@ defmodule Derpex.Admission.Gentility.ConfinementTest do
     end
 
     for {shape, id} <- [
-          uppercase: "Ryzen",
+          uppercase: "Host1",
           underscore: "ry_zen",
           dot: "ry.zen",
           space: "ry zen",
@@ -52,12 +52,12 @@ defmodule Derpex.Admission.Gentility.ConfinementTest do
     # so what is left is a fragment that is not a kind, and is refused.
     test "a runner id with a pipe is refused" do
       assert {:error, {_entry, :invalid_kind}} =
-               Confinement.parse("203.0.113.7/32=computer@ry|zen")
+               Confinement.parse("203.0.113.7/32=computer@ho|st1")
     end
 
     test "a runner id with a semicolon is refused" do
-      assert {:error, {"zen", :invalid_entry}} =
-               Confinement.parse("203.0.113.7/32=computer@ry;zen")
+      assert {:error, {"st1", :invalid_entry}} =
+               Confinement.parse("203.0.113.7/32=computer@ho;st1")
     end
 
     test "refuses malformed entries" do
@@ -82,19 +82,19 @@ defmodule Derpex.Admission.Gentility.ConfinementTest do
     end
   end
 
-  describe "check/3 (D2)" do
+  describe "check/3" do
     setup do
-      {:ok, rules} = Confinement.parse("203.0.113.7/32=computer@ryzen|platform")
+      {:ok, rules} = Confinement.parse("203.0.113.7/32=computer@host1|platform")
       {:ok, rules: rules}
     end
 
     test "from a confined source, a listed kind passes", %{rules: rules} do
-      assert Confinement.check(rules, @host, "computer@ryzen") == :ok
+      assert Confinement.check(rules, @host, "computer@host1") == :ok
       assert Confinement.check(rules, @host, "platform") == :ok
     end
 
     test "the kind is compared whole, never split or prefixed", %{rules: rules} do
-      for kind <- ["computer@ryz", "computer@ryzen2", "computer@", "computer", "machine", "user"] do
+      for kind <- ["computer@host", "computer@host12", "computer@", "computer", "machine", "user"] do
         assert Confinement.check(rules, @host, kind) == {:error, :confined_source},
                "#{kind} passed"
       end
