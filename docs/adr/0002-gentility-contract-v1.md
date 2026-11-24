@@ -260,6 +260,12 @@ address, so the second binds on a host running more than 10 computers; its
 computers are then all in within (C − 10) / 2 seconds. Those computers also
 share one bucket, so a job in one guest that floods the relay can hold it
 empty, and another computer's first connect on that host waits behind it.
+Gentility's computer hosts close this in front of the relay (D3, designed in
+gentility-core #1325). Jobs cannot reach the relay at all. A guest with root is
+held to 3 new connections at once, then one every 10 s, keyed by its own
+address. With up to 10 guests a host, that is 1 a second in total, under the
+bucket's 2. If this lane's per-source rate or burst changes, that limit is
+re-sized with it.
 
 **Telling a cold start from a flood.** Both show the unknown lane shedding
 `authorize_total{lane="unknown",reason="overloaded"}`. The answers the lane
