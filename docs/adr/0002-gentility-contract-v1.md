@@ -117,6 +117,11 @@ as a bearer:
   length as an unsigned 16-bit big-endian integer, and the next cursor. A page
   with no cursor ends the pass.
 
+The relay starts with the cursor `""`, and Gentility reads `""` as the start of
+its revocation window. After any error on the feed (a 409, any other status,
+or a failed call) the relay drops its cursor and reconciles from `""` again.
+So a row committed while the relay was away is never skipped.
+
 The relay sends no source address, and logs none.
 
 ### Usage is discarded
@@ -204,6 +209,12 @@ words, so they change only with a new contract version:
 A relay older than v0.2.0 has no `lane`; Gentility counts its series as
 `known`.
 
+The exporter's lines are fixed by the test "exports fixed-cardinality
+admission metrics through operations" in
+`test/derpex/admission/gentility_test.exs`. Gentility's cron test copies its
+`authorize_total` lines, so a change there shows up as a broken test on both
+sides.
+
 **Clock skew.** A lease whose `issued_ms` is more than
 `DERPEX_GENTILITY_MAX_FUTURE_SKEW_MS` (30 s) ahead of the relay's clock fails
 verification (`lease_not_yet_valid`). It is counted as
@@ -246,7 +257,9 @@ known lane. Renewals were never in the unknown lane.
 reconnecting at once, or above 10 computers behind one address. Below both,
 every node is admitted on its first try. Computers on one host share its
 address, so the second binds on a host running more than 10 computers; its
-computers are then all in within (C − 10) / 2 seconds.
+computers are then all in within (C − 10) / 2 seconds. Those computers also
+share one bucket, so a job in one guest that floods the relay can hold it
+empty, and another computer's first connect on that host waits behind it.
 
 **Telling a cold start from a flood.** Both show the unknown lane shedding
 `authorize_total{lane="unknown",reason="overloaded"}`. The answers the lane
