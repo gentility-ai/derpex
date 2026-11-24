@@ -292,10 +292,11 @@ set — no node, organization, or source identity ever reaches a label:
   `connection_limit`, `other`). `lane` is `known` or `unknown`. A rising
   `cached` share means Gentility is unreachable and the relay is running on
   cached leases. A lease issued more than `DERPEX_GENTILITY_MAX_FUTURE_SKEW_MS`
-  ahead of the relay's clock counts as `invalid_record`. In the unknown lane,
-  `overloaded` with more
-  `live` answers than `no_cached_lease` ones is a cold start; otherwise it is a
-  flood.
+  ahead of the relay's clock counts as `invalid_record`. `no_cached_lease`
+  means Gentility gave no usable record and nothing is cached, whatever the
+  cause. In the unknown lane, `overloaded` with more `live` answers than
+  `no_cached_lease` ones is a cold start; otherwise it is a flood, or a cold
+  relay whose Gentility is not answering.
 - `derpex_gentility_close_peer_total{cause,outcome}` — `cause` is `expiry`,
   `revocation`, `eviction`, or `key_rotation`; `outcome` is `closed`, or
   `would_close` under observe.

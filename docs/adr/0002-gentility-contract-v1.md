@@ -201,8 +201,10 @@ words, so they change only with a new contract version:
   - `lane`: `known`, `unknown`;
   - `outcome`: `live`, `cached`, `denied`, and under observe `would_deny`;
   - `reason`: `ok` on an admission; on a refusal, `overloaded` (lane shed),
-    `no_cached_lease` (Gentility does not know the key, and nothing is
-    cached), and the rest of the fixed set.
+    `no_cached_lease` (Gentility gave no usable record, and nothing is
+    cached), and the rest of the fixed set. `no_cached_lease` does not say
+    why: a 404 for a key Gentility does not know, a timeout, a 5xx and a
+    refused token all count here.
 - `derpex_gentility_events_connected`, `derpex_gentility_nearest_lease_expiry_seconds`
   and `derpex_gentility_cache_entries`, unlabelled.
 
@@ -262,12 +264,13 @@ share one bucket, so one guest that floods the relay with made-up keys can
 hold it empty, and another computer's first connect on that host waits behind
 it. A computer that holds a cached lease takes the known lane and never waits
 behind the flood.
-Gentility's computer hosts close this in front of the relay (D3, designed in
-gentility-core #1325). Jobs cannot reach the relay at all. A guest with root is
-held to 3 new connections at once, then one every 10 s, keyed by its own
-address. With up to 10 guests a host, that is 1 a second in total, under the
-bucket's 2. If this lane's per-source rate or burst changes, that limit is
-re-sized with it.
+
+Gentility's computer hosts are designed to limit this in front of the relay
+(D3, gentility-core #1325); this relay does not depend on it. In that design
+jobs cannot reach the relay, and a guest with root is held to 3 new
+connections at once, then one every 10 s, keyed by its own address. With up to
+10 guests a host that is 1 a second in total, under the bucket's 2. If this
+lane's per-source rate or burst changes, that limit is re-sized with it.
 
 **Telling a cold start from a flood.** Both show the unknown lane shedding
 `authorize_total{lane="unknown",reason="overloaded"}`. The answers the lane
@@ -278,3 +281,8 @@ the same minute, `live` answers outnumber `no_cached_lease` ones:
   It clears by itself as the lane admits them.
 - In a flood they are mostly `outcome="denied",reason="no_cached_lease"`:
   Gentility answers 404 for keys it does not know.
+
+These labels cannot tell a flood from a cold relay whose Gentility is not
+answering: both are `no_cached_lease` with few `live`. An alert on them says
+"no usable record", not "unknown keys", and is read beside
+`events_connected`.
