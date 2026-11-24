@@ -258,8 +258,10 @@ reconnecting at once, or above 10 computers behind one address. Below both,
 every node is admitted on its first try. Computers on one host share its
 address, so the second binds on a host running more than 10 computers; its
 computers are then all in within (C − 10) / 2 seconds. Those computers also
-share one bucket, so a job in one guest that floods the relay can hold it
-empty, and another computer's first connect on that host waits behind it.
+share one bucket, so one guest that floods the relay with made-up keys can
+hold it empty, and another computer's first connect on that host waits behind
+it. A computer that holds a cached lease takes the known lane and never waits
+behind the flood.
 Gentility's computer hosts close this in front of the relay (D3, designed in
 gentility-core #1325). Jobs cannot reach the relay at all. A guest with root is
 held to 3 new connections at once, then one every 10 s, keyed by its own
