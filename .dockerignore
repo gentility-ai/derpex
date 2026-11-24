@@ -9,3 +9,4 @@ interop
 test
 PLAN-FEEDBACK.md
 erl_crash.dump
+.private-journal

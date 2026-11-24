@@ -1,6 +1,8 @@
 defmodule Derpex.Identity do
   @moduledoc "Persistent, atomically created DERP server identity."
 
+  import Bitwise, only: [band: 2]
+
   alias Derpex.AtomicFile
   alias Derpex.Crypto
 
@@ -15,7 +17,7 @@ defmodule Derpex.Identity do
 
     case read_key(path) do
       {:ok, private_key} ->
-        with :ok <- File.chmod(path, @file_mode), do: {:ok, private_key}
+        with :ok <- restrict(path), do: {:ok, private_key}
 
       {:error, :enoent} ->
         create_with_lock(path, @lock_attempts)
@@ -31,6 +33,18 @@ defmodule Derpex.Identity do
     with {:ok, private_key} <- load_or_create(path),
          {:ok, public_key} <- Crypto.public_key(private_key) do
       {:ok, {public_key, private_key}}
+    end
+  end
+
+  # Tightens a key found loosened, and leaves one that is already 0600 alone:
+  # `File.chmod/2` resets the mtime to now (Erlang's `write_file_info` fills the
+  # times it is not given), so re-asserting the mode on every boot made a stable
+  # identity look rewritten by each restart.
+  defp restrict(path) do
+    case File.stat(path) do
+      {:ok, %File.Stat{mode: mode}} when band(mode, 0o777) == @file_mode -> :ok
+      {:ok, _stat} -> File.chmod(path, @file_mode)
+      {:error, reason} -> {:error, reason}
     end
   end
 

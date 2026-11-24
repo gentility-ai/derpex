@@ -26,6 +26,32 @@ defmodule Derpex.IdentityTest do
   end
 
   @tag :tmp_dir
+  test "loading an identity leaves its mtime the day it was made", %{tmp_dir: tmp_dir} do
+    # `File.chmod/2` resets the mtime to now — Erlang's `write_file_info` fills
+    # the times it is not given — so re-asserting 0600 on every boot made the
+    # key look rewritten by each restart, which is the one thing an operator
+    # checks when asking whether a relay's identity is stable.
+    path = Path.join(tmp_dir, "derpex.key")
+    assert {:ok, private_key} = Identity.load_or_create(path)
+
+    made = 1_700_000_000
+    File.touch!(path, made)
+
+    assert {:ok, ^private_key} = Identity.load_or_create(path)
+    assert File.stat!(path, time: :posix).mtime == made
+  end
+
+  @tag :tmp_dir
+  test "an identity found loosened is tightened again", %{tmp_dir: tmp_dir} do
+    path = Path.join(tmp_dir, "derpex.key")
+    assert {:ok, private_key} = Identity.load_or_create(path)
+    File.chmod!(path, 0o644)
+
+    assert {:ok, ^private_key} = Identity.load_or_create(path)
+    assert Bitwise.band(File.stat!(path).mode, 0o777) == 0o600
+  end
+
+  @tag :tmp_dir
   test "concurrent creators converge on one persistent key", %{tmp_dir: tmp_dir} do
     path = Path.join(tmp_dir, "derpex.key")
 
