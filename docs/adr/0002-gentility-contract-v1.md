@@ -118,9 +118,12 @@ as a bearer:
   with no cursor ends the pass.
 
 The relay starts with the cursor `""`, and Gentility reads `""` as the start of
-its revocation window. After any error on the feed (a 409, any other status,
-or a failed call) the relay drops its cursor and reconciles from `""` again.
-So a row committed while the relay was away is never skipped.
+its revocation window. After an error answer on the feed (a 409, any other
+status, or a request that failed) the relay drops its cursor and reconciles
+from `""` again. A call it kills at its own deadline, or whose worker exits,
+keeps the cursor, and the pass starts from there. A pass returns every live row
+past the cursor it starts from, so a row committed while the relay was away is
+not skipped.
 
 The relay sends no source address, and logs none.
 
